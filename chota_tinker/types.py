@@ -35,3 +35,10 @@ class SamplingResult:
     """Result of sampling from the model."""
     sequences: list[Sequence] = field(default_factory=list)
 
+
+@dataclass
+class LossOutput:
+    """Output from forward_backward."""
+    loss: float
+    num_tokens: int
+
