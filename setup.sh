@@ -8,3 +8,5 @@ pip install tinker
 # for prime RL stuff
 # pip install prime-cli
 pip install verifiers
+pip install math-verify
+
