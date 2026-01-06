@@ -1,5 +1,6 @@
 """Sampling client using vLLM for fast inference."""
 
+import requests
 from vllm import LLM
 from vllm import SamplingParams as VLLMSamplingParams
 
@@ -107,4 +108,84 @@ class SamplingClient:
             results.append(SamplingResult(sequences=sequences))
 
         return results
+
+
+class ServerSamplingClient:
+    """Sampling client that connects to a running vLLM server."""
+
+    def __init__(self, base_url: str = "http://localhost:8000"):
+        """
+        Connect to a vLLM server.
+
+        Start server with: vllm serve <model_name> --port 8000
+
+        Args:
+            base_url: URL of the vLLM server
+        """
+        self.base_url = base_url.rstrip("/")
+
+    def sample(
+        self,
+        prompt: ModelInput,
+        sampling_params: SamplingParams,
+        num_samples: int = 1,
+    ) -> SamplingResult:
+        """Sample from the model via the server."""
+        response = requests.post(
+            f"{self.base_url}/v1/completions",
+            json={
+                "prompt": prompt.token_ids,
+                "max_tokens": sampling_params.max_tokens,
+                "temperature": sampling_params.temperature,
+                "top_p": sampling_params.top_p,
+                "n": num_samples,
+                "stop": sampling_params.stop,
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        sequences = []
+        for choice in data["choices"]:
+            seq = Sequence(
+                tokens=choice.get("logprobs", {}).get("tokens", []),
+                text=choice["text"],
+            )
+            sequences.append(seq)
+
+        return SamplingResult(sequences=sequences)
+
+    def sample_batch(
+        self,
+        prompts: list[ModelInput],
+        sampling_params: SamplingParams,
+        num_samples: int = 1,
+    ) -> list[SamplingResult]:
+        """Sample from the model for multiple prompts."""
+        # vLLM server supports batch via list of prompts
+        response = requests.post(
+            f"{self.base_url}/v1/completions",
+            json={
+                "prompt": [p.token_ids for p in prompts],
+                "max_tokens": sampling_params.max_tokens,
+                "temperature": sampling_params.temperature,
+                "top_p": sampling_params.top_p,
+                "n": num_samples,
+                "stop": sampling_params.stop,
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        # Group choices by prompt index
+        results = [[] for _ in prompts]
+        for choice in data["choices"]:
+            idx = choice["index"] // num_samples
+            seq = Sequence(
+                tokens=choice.get("logprobs", {}).get("tokens", []),
+                text=choice["text"],
+            )
+            results[idx].append(seq)
+
+        return [SamplingResult(sequences=seqs) for seqs in results]
 
