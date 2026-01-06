@@ -41,4 +41,7 @@ class LossOutput:
     """Output from forward_backward."""
     loss: float
     num_tokens: int
+    # RL-specific (optional)
+    policy_loss: float | None = None
+    kl: float | None = None
 
