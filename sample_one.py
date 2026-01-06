@@ -1,15 +1,19 @@
-import tinker
-from tinker import types # Convert examples into the format expected by the training client
+"""
+Sample one problem from the prompt.txt file using chota-tinker.
+
+Start vLLM server first:
+    vllm serve Qwen/Qwen3-4B-Instruct-2507 --port 8000
+"""
+
+from chota_tinker import ServerSamplingClient, SamplingParams, ModelInput
 from transformers import AutoTokenizer
 
-service_client = tinker.ServiceClient()
-
 # model_name = "meta-llama/Llama-3.2-3B"
-model_name = "Qwen/Qwen3-4B-Instruct-2507" # this does not have thinking :(
+model_name = "Qwen/Qwen3-4B-Instruct-2507"
 # model_name = "openai/gpt-oss-20b"
 
-# Create a sampling client directly from the base model
-sampling_client = service_client.create_sampling_client(base_model=model_name)
+# Connect to vLLM server
+sampling_client = ServerSamplingClient("http://localhost:8000")
 
 # Get the tokenizer from transformers
 tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -22,18 +26,26 @@ with open("prompt.txt", "r") as f:
 messages = [
     {"role": "user", "content": _prompt}
 ]
-prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
+prompt_text = tokenizer.apply_chat_template(
+    messages, tokenize=False, add_generation_prompt=True
+)
 input_ids = tokenizer(prompt_text)["input_ids"]
 
-input_ids = types.ModelInput.from_ints(input_ids)
-params = types.SamplingParams(max_tokens=500, temperature=0.6)
-
 # Sample from the model
-future = sampling_client.sample(input_ids, sampling_params=params, num_samples=1)
-result = future.result()
+result = sampling_client.sample(
+    ModelInput.from_ints(input_ids),
+    SamplingParams(max_tokens=500, temperature=0.6),
+    num_samples=1,
+)
 
-response = tokenizer.decode(result.sequences[0].tokens)
+response = tokenizer.decode(result.sequences[0].tokens, skip_special_tokens=True)
 
-# print prompt and response
+# Print prompt and response
+print("=" * 50)
+print("PROMPT:")
+print("=" * 50)
 print(prompt_text)
+print("\n" + "=" * 50)
+print("RESPONSE:")
+print("=" * 50)
 print(response)
