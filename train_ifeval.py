@@ -21,7 +21,7 @@ from chota_tinker import (
 
 def main():
     # Config
-    model_name = "Qwen/Qwen3-4B"
+    model_name = "Qwen/Qwen3-0.6B-Instruct"
     batch_size = 4
     num_samples = 4
     max_steps = 100
