@@ -147,8 +147,9 @@ class ServerSamplingClient:
 
         sequences = []
         for choice in data["choices"]:
+            logprobs = choice.get("logprobs") or {}
             seq = Sequence(
-                tokens=choice.get("logprobs", {}).get("tokens", []),
+                tokens=logprobs.get("tokens", []),
                 text=choice["text"],
             )
             sequences.append(seq)

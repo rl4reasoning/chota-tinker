@@ -2,15 +2,19 @@
 Sample one problem from the prompt.txt file using chota-tinker.
 
 Start vLLM server first:
-    vllm serve Qwen/Qwen3-4B-Instruct-2507 --port 8000
+    vllm serve Qwen/Qwen3-1.7B --port 8000 --gpu-memory-utilization 0.6
+
+Shut down vLLM server:
+    Ctrl+C in the terminal running the server
 """
 
 from chota_tinker import ServerSamplingClient, SamplingParams, ModelInput
 from transformers import AutoTokenizer
 
-# model_name = "meta-llama/Llama-3.2-3B"
-model_name = "Qwen/Qwen3-4B-Instruct-2507"
+# model_name = "meta-llama/Llama-3.2-1B"
+# model_name = "Qwen/Qwen3-4B-Instruct-2507"
 # model_name = "openai/gpt-oss-20b"
+model_name = "Qwen/Qwen3-1.7B"
 
 # Connect to vLLM server
 sampling_client = ServerSamplingClient("http://localhost:8000")
@@ -38,14 +42,7 @@ result = sampling_client.sample(
     num_samples=1,
 )
 
-response = tokenizer.decode(result.sequences[0].tokens, skip_special_tokens=True)
+response = result.sequences[0].text
 
 # Print prompt and response
-print("=" * 50)
-print("PROMPT:")
-print("=" * 50)
-print(prompt_text)
-print("\n" + "=" * 50)
-print("RESPONSE:")
-print("=" * 50)
-print(response)
+print(prompt_text + response)
