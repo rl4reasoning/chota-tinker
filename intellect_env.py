@@ -28,6 +28,8 @@ class IntellectCodeEnv(Env):
         max_tests: int = 12,
         sandbox_type: str = "none",
         seed: int = 0,
+        dataset_name: str = "PrimeIntellect/INTELLECT-3-RL",
+        problem_index: Optional[int] = None,
     ):
         super().__init__()
         self.system_prompt = system_prompt
@@ -35,21 +37,37 @@ class IntellectCodeEnv(Env):
         self.max_tests = max_tests
         self.sandbox_type = sandbox_type
         self.seed = seed
+        self.dataset_name = dataset_name
+        self.problem_index = problem_index
         
-        self.dataset = load_dataset(
-            "PrimeIntellect/INTELLECT-3-RL", config, split=split, streaming=True
-        )
-        self.dataset_iter = iter(self.dataset)
+        # Custom datasets (bicycleman15/*) don't use config parameter
+        if dataset_name.startswith("bicycleman15/"):
+            self.dataset = load_dataset(dataset_name, split=split)
+        else:
+            self.dataset = load_dataset(dataset_name, config, split=split)
+        
+        # If problem_index specified, use that; otherwise iterate through dataset
+        if problem_index is not None:
+            self._use_fixed_index = True
+            if problem_index < 0 or problem_index >= len(self.dataset):
+                raise ValueError(f"problem_index {problem_index} out of range [0, {len(self.dataset)})")
+        else:
+            self._use_fixed_index = False
+            self.dataset_iter = iter(self.dataset)
         
         self.current_turn = 0
         self.question = ""
         self.tests = {}
         self.history = []
+        self.has_interacted = False  # Track if model has interacted at least once
 
     def reset(self, seed: Optional[int] = None) -> Tuple[str, dict[str, Any]]:
         super().reset(seed)
         
-        data = next(self.dataset_iter)
+        if self._use_fixed_index:
+            data = self.dataset[self.problem_index]
+        else:
+            data = next(self.dataset_iter)
         self.question = data["question"]
         
         info = json.loads(data["info"])
@@ -58,6 +76,7 @@ class IntellectCodeEnv(Env):
         
         self.current_turn = 0
         self.history = []
+        self.has_interacted = False
         
         obs = self._build_observation(self.question)
         return obs, {}
@@ -79,6 +98,7 @@ class IntellectCodeEnv(Env):
                 output = f"Error: failed to execute code - {str(e)}"
             
             self.history.append({"code": python_code, "output": output})
+            self.has_interacted = True  # Mark that interaction occurred
             obs = f"<output>\n{output}</output>"
             
             if self.current_turn >= self.max_turns:
@@ -89,6 +109,13 @@ class IntellectCodeEnv(Env):
         # check for final answer (only if no <interact> tag)
         answer_code = self._extract_answer_code(action)
         if answer_code:
+            # Require at least one interaction before final answer
+            if not self.has_interacted:
+                obs = "<output>You must interact at least once before submitting your final answer. Use <interact> ... your code here ... </interact> to test your code first. Remember to pass in the inputs yourself.</output>"
+                if self.current_turn >= self.max_turns:
+                    return obs, 0.0, True, True, {"truncated": True}
+                return obs, -0.1, False, False, {}
+            
             reward = self._evaluate(answer_code)
             return "", reward, True, False, {"final": True}
         
@@ -162,7 +189,14 @@ class IntellectCodeEnv(Env):
             if expected_clean.startswith('"') and expected_clean.endswith('"'):
                 expected_clean = expected_clean[1:-1]
             
-            if success and stdout.strip() == expected_clean:
+            # Normalize output for comparison
+            actual = stdout.strip()
+            
+            # Handle boolean case-insensitivity (Python "True"/"False" vs JSON "true"/"false")
+            if actual.lower() in ("true", "false") and expected_clean.lower() in ("true", "false"):
+                if success and actual.lower() == expected_clean.lower():
+                    passed += 1
+            elif success and actual == expected_clean:
                 passed += 1
         
         return passed / len(tests["inputs"])

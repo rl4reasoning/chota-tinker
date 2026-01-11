@@ -4,7 +4,7 @@ Code environment demo using GEM with LLM agent.
 Uses tinker API for sampling.
 
 Usage:
-    python gem_math_demo.py --model Qwen/Qwen3-4B-Instruct-2507
+    python gem_math_demo.py --model Qwen/Qwen3-4B-Instruct-2507 --difficulty easy_medium --problem_index 0
 
 possible models:
 deepseek-ai/DeepSeek-V3.1
@@ -85,6 +85,15 @@ async def run_episode(env, tokenizer, client, sampling_params, max_steps: int = 
     return total_reward
 
 
+# Dataset mapping for difficulty levels
+DATASET_MAP = {
+    "original": "PrimeIntellect/INTELLECT-3-RL",
+    "easy_medium": "bicycleman15/intellect_3_code_easy_medium",
+    "hard": "bicycleman15/intellect_3_code_hard",
+    "very_hard": "bicycleman15/intellect_3_code_very_hard",
+}
+
+
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen3-4B-Thinking-2507")
@@ -92,6 +101,11 @@ async def main():
     parser.add_argument("--max_steps", type=int, default=5)
     parser.add_argument("--max_tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--difficulty", type=str, default="original",
+                        choices=["original", "easy_medium", "hard", "very_hard"],
+                        help="Problem difficulty: easy_medium (0.3-1.0), hard (0.1-0.3), very_hard (0.0-0.1), or original (all)")
+    parser.add_argument("--problem_index", type=int, default=None,
+                        help="Specific problem index to use (if not set, iterates through dataset)")
     args = parser.parse_args()
     
     service_client = tinker.ServiceClient()
@@ -105,7 +119,12 @@ async def main():
         stop=["</interact>"],
     )
     
-    env = IntellectCodeEnv(system_prompt="", max_turns=args.max_steps)
+    dataset_name = DATASET_MAP[args.difficulty]
+    print(f"Using dataset: {dataset_name} (difficulty: {args.difficulty})")
+    if args.problem_index is not None:
+        print(f"Using problem index: {args.problem_index}")
+    print()
+    env = IntellectCodeEnv(system_prompt="", max_turns=args.max_steps, dataset_name=dataset_name, problem_index=args.problem_index)
     
     rewards = []
     for ep in range(args.num_episodes):
