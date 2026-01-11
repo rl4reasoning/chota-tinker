@@ -4,9 +4,14 @@ Code environment demo using GEM with LLM agent.
 Uses tinker API for sampling.
 
 Usage:
-    python gem_math_demo.py --model meta-llama/Llama-3.1-8B-Instruct
-# deepseek-ai/DeepSeek-V3.1
+    python gem_math_demo.py --model Qwen/Qwen3-4B-Instruct-2507
+
+possible models:
+deepseek-ai/DeepSeek-V3.1
 """
+
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import argparse
 import asyncio
@@ -26,7 +31,8 @@ Once you are done, wrap the final code in ```python``` code blocks.
 When returning the final code, there is no need to hardcode inputs, you will take inputs from stdin.
 
 Please first think about the problem before you output <interact></interact> or ```python``` code blocks.
-You must interact atleast once before you submit the final code.
+
+NOTE: You must interact atleast once successfully before you submit the final code!
 """
 
 
