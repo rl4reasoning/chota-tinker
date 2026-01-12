@@ -1,13 +1,12 @@
-"""Collect multi-turn trajectories and save as HuggingFace dataset.
+"""Collect single-turn trajectories and save as HuggingFace dataset.
 
 Usage:
-    python collect_trajectories.py \
+    python collect_trajectories_single_turn.py \
     --dataset bicycleman15/intellect_3_code_easy_medium \
     --model Qwen/Qwen3-4B-Instruct-2507 \
     --num-problems 20 \
     --num-samples 8 \
-    --push-to-hub bicycleman15/qwen3_4b_instruct_easy_medium
-
+    --push-to-hub bicycleman15/qwen3_4b_instruct_easy_medium_single_turn
 """
 
 import os
@@ -29,12 +28,12 @@ from intellect_env import IntellectCodeEnv
 from utils.pass_at_k import compute_pass_at_k
 
 
-def render_trajectory(messages: list[dict], interactions: list[dict], question: str, reward: float, num_turns: int, terminated: bool, truncated: bool) -> str:
+def render_trajectory(messages: list[dict], question: str, reward: float, terminated: bool) -> str:
     """Render a trajectory as a formatted string."""
     lines = []
     lines.append("=" * 80)
     lines.append(f"Question: {question[:50]}..." if len(question) > 50 else f"Question: {question}")
-    lines.append(f"Reward: {reward:.2f} | Turns: {num_turns} | Terminated: {terminated} | Truncated: {truncated}")
+    lines.append(f"Reward: {reward:.2f} | Terminated: {terminated}")
     lines.append("=" * 80)
     
     for msg in messages:
@@ -42,28 +41,14 @@ def render_trajectory(messages: list[dict], interactions: list[dict], question: 
         content = msg['content']
         lines.append(f"\n[{role}]\n{content}")
     
-    if interactions:
-        lines.append(f"\n{'─' * 80}")
-        lines.append(f"Code Interactions ({len(interactions)}):")
-        for i, inter in enumerate(interactions):
-            lines.append(f"  [{i+1}] Code:\n{inter['code']}")
-            lines.append(f"  Output:\n{inter['output']}")
-    
     return "\n".join(lines)
 
 
 SYSTEM_PROMPT = """You are a helpful coding assistant.
-You are allowed to interact with the Python interpreter.
-You can wrap your code in <interact></interact>, and I will run it for you and give you the output.
-Make sure that you define the inputs (or hardcode inputs) yourself when you give me <interact></interact> block.
-You can use the output to refine your code.
+Solve the given programming problem and provide your solution.
 
-Once you are done, wrap the final code in ```python``` code blocks. 
-When returning the final code, there is no need to hardcode inputs, you will take inputs from stdin.
-
-Please first think about the problem before you output <interact></interact> or ```python``` code blocks.
-
-NOTE: You must interact atleast once successfully before you submit the final code!
+First, think about the problem step by step.
+Then, provide your final solution wrapped in ```python``` code blocks.
 """
 
 
@@ -88,10 +73,6 @@ async def get_llm_action(
     )
     response = tokenizer.decode(result.sequences[0].tokens, skip_special_tokens=True)
     
-    # If stopped by </interact>, append it back so regex can match
-    if "<interact>" in response and "</interact>" not in response:
-        response += "</interact>"
-    
     return response
 
 
@@ -101,49 +82,32 @@ async def do_single_rollout(
     tokenizer: AutoTokenizer,
     client: tinker.SamplingClient,
     sampling_params: types.SamplingParams,
-    max_turns: int = 5,
 ) -> dict[str, Any]:
-    """Run a single multi-turn rollout for a problem."""
+    """Run a single-turn rollout for a problem."""
     env = IntellectCodeEnv(
         system_prompt="",  # We add system prompt to history instead
         dataset_name=dataset_name,
         problem_index=problem_index,
-        max_turns=max_turns,
+        max_turns=1,  # Single turn only
     )
     
     obs, info = env.reset()
     history = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": obs}]
-    total_reward = 0.0
-    interactions = []
     
-    for step in range(max_turns):
-        action = await get_llm_action(obs, history, tokenizer, client, sampling_params)
-        
-        history.append({"role": "user", "content": obs})
-        history.append({"role": "assistant", "content": action})
-        messages.append({"role": "assistant", "content": action})
-        
-        obs, reward, terminated, truncated, info = env.step(action)
-        total_reward += reward
-        
-        if env.history and len(env.history) > len(interactions):
-            interactions = env.history.copy()
-        
-        if obs:
-            messages.append({"role": "user", "content": obs})
-        
-        if terminated or truncated:
-            break
+    # Single turn: get response and evaluate
+    action = await get_llm_action(obs, history, tokenizer, client, sampling_params)
+    messages.append({"role": "assistant", "content": action})
+    
+    # Step to get reward (will evaluate the code)
+    _, reward, terminated, truncated, info = env.step(action)
     
     return {
         "question": env.question,
         "messages": messages,
-        "num_turns": env.current_turn,
-        "final_reward": total_reward,
+        "final_reward": reward,
         "terminated": terminated,
         "truncated": truncated,
-        "interactions": interactions,
         "tests": env.tests,
     }
 
@@ -155,7 +119,6 @@ async def collect_trajectories_for_problem(
     client: tinker.SamplingClient,
     sampling_params: types.SamplingParams,
     num_samples: int = 8,
-    max_turns: int = 5,
 ) -> list[dict[str, Any]]:
     """Collect multiple trajectories for a single problem using parallel rollouts."""
     trajectories = await asyncio.gather(*[
@@ -165,7 +128,6 @@ async def collect_trajectories_for_problem(
             tokenizer=tokenizer,
             client=client,
             sampling_params=sampling_params,
-            max_turns=max_turns,
         )
         for _ in range(num_samples)
     ])
@@ -173,35 +135,17 @@ async def collect_trajectories_for_problem(
     return list(trajectories)
 
 
-async def gather_with_progress(coroutines: list, desc: str) -> list:
-    """Run coroutines concurrently with a progress bar."""
-    pbar = tqdm(total=len(coroutines), desc=desc)
-    
-    async def track(coro):
-        result = await coro
-        pbar.update(1)
-        return result
-    
-    try:
-        results = await asyncio.gather(*[track(coro) for coro in coroutines])
-    finally:
-        pbar.close()
-    
-    return results
-
-
 async def main(args):
     print(f"=" * 60)
-    print(f"Collecting trajectories")
+    print(f"Collecting single-turn trajectories")
     print(f"  Dataset: {args.dataset}")
     print(f"  Model: {args.model}")
     print(f"  Problems: {args.num_problems}")
     print(f"  Samples per problem: {args.num_samples}")
-    print(f"  Max turns: {args.max_turns}")
     print(f"  Output: {args.output_dir}")
     print(f"=" * 60)
     
-    # Initialize tinker client (from eval.py and gem_math_demo.py)
+    # Initialize tinker client
     print("\nInitializing tinker client...")
     service_client = tinker.ServiceClient()
     sampling_client = service_client.create_sampling_client(base_model=args.model)
@@ -211,12 +155,11 @@ async def main(args):
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         top_p=0.95,
-        stop=["</interact>"],
     )
     
     print(f"\nCollecting trajectories for {args.num_problems} problems...")
     
-    # Process problems sequentially (8 parallel rollouts per problem)
+    # Process problems sequentially (parallel rollouts per problem)
     all_trajectories = []
     for i in tqdm(range(args.num_problems), desc="Problems"):
         problem_trajectories = await collect_trajectories_for_problem(
@@ -226,7 +169,6 @@ async def main(args):
             client=sampling_client,
             sampling_params=sampling_params,
             num_samples=args.num_samples,
-            max_turns=args.max_turns,
         )
         all_trajectories.append(problem_trajectories)
     
@@ -246,16 +188,14 @@ async def main(args):
                 "trajectory_id": traj_idx,
                 "question": traj["question"],
                 "messages": json.dumps(traj["messages"]),
-                "num_turns": traj["num_turns"],
                 "final_reward": traj["final_reward"],
                 "terminated": traj["terminated"],
                 "truncated": traj["truncated"],
-                "interactions": json.dumps(traj["interactions"]),
                 "tests": json.dumps(traj["tests"]),
                 "is_successful": is_successful,
                 "rendered": render_trajectory(
-                    traj["messages"], traj["interactions"], traj["question"],
-                    traj["final_reward"], traj["num_turns"], traj["terminated"], traj["truncated"]
+                    traj["messages"], traj["question"],
+                    traj["final_reward"], traj["terminated"]
                 ),
             })
         
@@ -281,7 +221,6 @@ async def main(args):
         "model": args.model,
         "num_problems": args.num_problems,
         "num_samples": args.num_samples,
-        "max_turns": args.max_turns,
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "timestamp": datetime.now().isoformat(),
@@ -289,6 +228,7 @@ async def main(args):
         "pass_at_2": pass_at_2,
         "pass_at_4": pass_at_4,
         "pass_at_8": pass_at_8,
+        "mode": "single_turn",
     }
     
     os.makedirs(args.output_dir, exist_ok=True)
@@ -321,17 +261,16 @@ async def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Collect multi-turn trajectories for code problems")
+    parser = argparse.ArgumentParser(description="Collect single-turn trajectories for code problems")
     parser.add_argument("--dataset", type=str, default="bicycleman15/intellect_3_code_easy_medium",
                         choices=["bicycleman15/intellect_3_code_easy_medium", "bicycleman15/intellect_3_code_hard",
                                  "bicycleman15/intellect_3_code_very_hard", "PrimeIntellect/INTELLECT-3-RL"])
     parser.add_argument("--num-problems", type=int, default=20)
     parser.add_argument("--num-samples", type=int, default=8)
-    parser.add_argument("--max-turns", type=int, default=5)
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
-    parser.add_argument("--output-dir", type=str, default="artifacts/trajectories")
+    parser.add_argument("--output-dir", type=str, default="artifacts/trajectories_single_turn")
     parser.add_argument("--push-to-hub", type=str, default=None, help="HF repo to push to (e.g. username/repo-name)")
     
     args = parser.parse_args()
