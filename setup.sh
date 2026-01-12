@@ -12,3 +12,5 @@ pip install vllm --extra-index-url https://download.pytorch.org/whl/cu129
 # pip install verifiers
 # pip install math-verify
 
+# export TINKER_API_KEY="tml-xUnO6eCIzrJex0Ge9C5ji3frSTRivhhj3Bi1yAVhEcOgw6Pe6YdLTQzPwfn1toHTnAAAA"
+

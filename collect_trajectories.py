@@ -2,10 +2,10 @@
 
 Usage:
     python collect_trajectories.py \
-    --dataset bicycleman15/intellect_3_code_easy_medium \
+    --dataset bicycleman15/intellect_3_code_hard \
     --model Qwen/Qwen3-4B-Instruct-2507 \
     --num-problems 20 \
-    --push-to-hub bicycleman15/qwen3_4b_instruct_easy_medium
+    --push-to-hub bicycleman15/qwen3_4b_instruct_hard
 """
 
 import os
@@ -214,21 +214,19 @@ async def main(args):
     
     print(f"\nCollecting trajectories for {args.num_problems} problems...")
     
-    all_trajectories = await gather_with_progress(
-        [
-            collect_trajectories_for_problem(
-                problem_index=i,
-                dataset_name=args.dataset,
-                tokenizer=tokenizer,
-                client=sampling_client,
-                sampling_params=sampling_params,
-                num_samples=args.num_samples,
-                max_turns=args.max_turns,
-            )
-            for i in range(args.num_problems)
-        ],
-        desc="Problems",
-    )
+    # Process problems sequentially (8 parallel rollouts per problem)
+    all_trajectories = []
+    for i in tqdm(range(args.num_problems), desc="Problems"):
+        problem_trajectories = await collect_trajectories_for_problem(
+            problem_index=i,
+            dataset_name=args.dataset,
+            tokenizer=tokenizer,
+            client=sampling_client,
+            sampling_params=sampling_params,
+            num_samples=args.num_samples,
+            max_turns=args.max_turns,
+        )
+        all_trajectories.append(problem_trajectories)
     
     # Flatten into rows (one per trajectory)
     rows = []
