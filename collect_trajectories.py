@@ -1,7 +1,11 @@
 """Collect multi-turn trajectories and save as HuggingFace dataset.
 
 Usage:
-    python collect_trajectories.py --dataset bicycleman15/intellect_3_code_easy_medium --num-problems 20
+    python collect_trajectories.py \
+    --dataset bicycleman15/intellect_3_code_easy_medium \
+    --model Qwen/Qwen3-4B-Instruct-2507 \
+    --num-problems 20 \
+    --push-to-hub bicycleman15/qwen3_4b_instruct_easy_medium
 """
 
 import os
@@ -327,7 +331,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
-    parser.add_argument("--output-dir", type=str, default="trajectories")
+    parser.add_argument("--output-dir", type=str, default="artifacts/trajectories")
     parser.add_argument("--push-to-hub", type=str, default=None, help="HF repo to push to (e.g. username/repo-name)")
     
     args = parser.parse_args()
