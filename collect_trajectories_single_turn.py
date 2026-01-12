@@ -92,6 +92,8 @@ async def do_single_rollout(
     )
     
     obs, info = env.reset()
+    # Single-turn mode: allow immediate final answer without requiring <interact>
+    env.has_interacted = True
     history = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": obs}]
     
