@@ -114,7 +114,7 @@ class IntellectCodeEnv(Env):
                 obs = "<output>You must interact at least once before submitting your final answer. Use <interact> ... your code here ... </interact> to test your code first. Remember to pass in the inputs yourself.</output>"
                 if self.current_turn >= self.max_turns:
                     return obs, 0.0, True, True, {"truncated": True}
-                return obs, -0.1, False, False, {}
+                return obs, 0.0, False, False, {}
             
             reward = self._evaluate(answer_code)
             return "", reward, True, False, {"final": True}
@@ -125,7 +125,7 @@ class IntellectCodeEnv(Env):
         if self.current_turn >= self.max_turns:
             return obs, 0.0, True, True, {"truncated": True}
         
-        return obs, -0.1, False, False, {}
+        return obs, 0.0, False, False, {}
 
     def _build_observation(self, content: str) -> str:
         if self.system_prompt:
