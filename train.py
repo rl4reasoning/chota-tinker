@@ -1,16 +1,20 @@
 """
 Minimal RL training script on IFEval dataset.
 
-Start vLLM server first:
-    vllm serve Qwen/Qwen3-4B --port 8000
+Uses in-process vLLM with sleep/wake cycles for GPU memory management
+and weight synchronization after each training step.
 """
 
+import gc
+import time
+
+import torch
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
 from chota_tinker import (
     TrainingClient,
-    ServerSamplingClient,
+    SamplingClient,
     SamplingParams,
     ModelInput,
     prepare_rl_batch,
@@ -21,31 +25,35 @@ from ifeval import IFEvalDataset
 
 def main():
     # Config
-    model_name = "Qwen/Qwen3-0.6B-Instruct"
+    model_name = "Qwen/Qwen2.5-0.5B-Instruct"
     batch_size = 4
-    num_samples = 4
+    num_samples = 4  # GRPO: multiple samples per prompt for advantage estimation
     max_steps = 100
     max_tokens = 256
-    
-    print(f"Loading tokenizer: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    print("Loading dataset: google/IFEval")
-    dataset = IFEvalDataset(tokenizer)
     
     print("Initializing training client...")
     trainer = TrainingClient(
         model_name=model_name,
-        lora_rank=16,
-        learning_rate=1e-5,
-        kl_coef=0.01,
+        lora_rank=None,  # Full model for now (LoRA sync later)
+        learning_rate=1e-6,
+        kl_coef=0.001,
         compile_model=False,
     )
     
-    print("Connecting to vLLM server...")
-    sampler = ServerSamplingClient("http://localhost:8000")
+    # Use tokenizer from trainer for consistency
+    tokenizer = trainer.tokenizer
+    
+    print("Loading dataset: google/IFEval")
+    dataset = IFEvalDataset(tokenizer)
+    
+    print("Initializing vLLM sampling engine...")
+    sampler = SamplingClient(
+        model_name,
+        gpu_memory_utilization=0.35,  # Leave room for training
+        enable_prefix_caching=True,
+        dtype=torch.bfloat16,
+        max_model_len=1024 + max_tokens,  # prompt + response
+    )
     
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
@@ -57,23 +65,25 @@ def main():
     pbar = tqdm(total=max_steps, desc="Training")
     
     for step in range(max_steps):
+        # ─── Sampling Phase ───────────────────────────────────────────
+        # Wake up vLLM for inference
+        sampler.wake_up()
+        
         # Get batch
         batch = dataset.get_batch(batch_size)
         prompts = dataset.format_prompts(batch)
         
         # Sample completions
-        try:
-            results = sampler.sample_batch(
-                [ModelInput.from_ints(tokenizer(p)["input_ids"]) for p in prompts],
-                sampling_params,
-                num_samples=num_samples,
-            )
-        except Exception as e:
-            print(f"\nSampling error: {e}")
-            print(f"Make sure vLLM server is running: vllm serve {model_name} --port 8000")
-            break
+        results = sampler.sample_batch(
+            [ModelInput.from_ints(tokenizer(p)["input_ids"]) for p in prompts],
+            sampling_params,
+            num_samples=num_samples,
+        )
         
-        # Compute rewards
+        # Put vLLM to sleep to free GPU memory for training
+        sampler.sleep()
+        
+        # ─── Reward Computation ───────────────────────────────────────
         rewards = dataset.compute_rewards(batch, results)
         avg_reward = sum(r for pr in rewards for r in pr) / (batch_size * num_samples)
         
@@ -82,7 +92,8 @@ def main():
             prompts, results, tokenizer
         )
         
-        # Forward-backward
+        # ─── Training Phase ───────────────────────────────────────────
+        # Forward-backward (on-policy: weights match sampling model)
         loss_out = trainer.forward_backward(
             input_ids=input_ids,
             prompt_lens=prompt_lens,
@@ -93,6 +104,15 @@ def main():
         
         # Optimizer step
         trainer.optim_step()
+        
+        # ─── Weight Sync ──────────────────────────────────────────────
+        # Wake up vLLM and sync updated weights for next iteration
+        sampler.wake_up()
+        sampler.load_weights(trainer.get_state_dict())
+        
+        # Clear memory
+        gc.collect()
+        torch.cuda.empty_cache()
         
         pbar.update(1)
         pbar.set_postfix({

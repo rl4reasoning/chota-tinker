@@ -1,7 +1,7 @@
 """Training client for fine-tuning LLMs."""
 
 import torch
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import Callable, Literal
 
 from .types import LossOutput
@@ -33,10 +33,15 @@ class TrainingClient:
         self.kl_coef = kl_coef
         self.torch_dtype = torch_dtype
 
-        # Load model with flash attention
+        # Load tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # Load model with SDPA
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",  # Use PyTorch's native SDPA
             torch_dtype=torch_dtype,
         ).to(device)
 
@@ -53,7 +58,7 @@ class TrainingClient:
         if kl_coef > 0:
             self.ref_model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                attn_implementation="flash_attention_2",
+                attn_implementation="sdpa",
                 torch_dtype=torch_dtype,
             ).to(device)
             self.ref_model.eval()
@@ -203,3 +208,24 @@ class TrainingClient:
             checkpoint = torch.load(path, weights_only=False)
             self.model.load_state_dict(checkpoint["model"])
             self.optimizer.load_state_dict(checkpoint["optimizer"])
+
+    def get_state_dict(self) -> dict:
+        """
+        Get model state dict for syncing to inference engine.
+        
+        Returns:
+            Model state dict (handles compiled models and LoRA)
+        """
+        model = self.model
+        # Handle torch.compile wrapper
+        if hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        # Handle LoRA - merge and return full weights
+        if self.lora_rank is not None:
+            # For LoRA, we need merged weights for vLLM
+            model = model.merge_and_unload()
+            state_dict = model.state_dict()
+            # Re-apply LoRA after getting merged weights
+            self._apply_lora(self.lora_rank)
+            return state_dict
+        return model.state_dict()

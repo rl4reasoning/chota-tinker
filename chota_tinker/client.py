@@ -1,6 +1,10 @@
 """Sampling client using vLLM for fast inference."""
 
+import gc
+import time
+
 import requests
+import torch
 from vllm import LLM
 from vllm import SamplingParams as VLLMSamplingParams
 from vllm.inputs import TokensPrompt
@@ -9,7 +13,7 @@ from .types import ModelInput, SamplingParams, SamplingResult, Sequence
 
 
 class SamplingClient:
-    """Minimal sampling client wrapping vLLM."""
+    """Minimal sampling client wrapping vLLM with sleep/wake support."""
 
     def __init__(self, model_name: str, **vllm_kwargs):
         """
@@ -23,6 +27,8 @@ class SamplingClient:
         self.model_name = model_name
         # Enable prefix caching by default for multi-turn efficiency
         vllm_kwargs.setdefault("enable_prefix_caching", True)
+        # Enable sleep mode for memory management during training
+        vllm_kwargs.setdefault("enable_sleep_mode", True)
         self.llm = LLM(model=model_name, **vllm_kwargs)
 
     def sample(
@@ -111,6 +117,58 @@ class SamplingClient:
             results.append(SamplingResult(sequences=sequences))
 
         return results
+
+    def sleep(self, level: int = 1):
+        """
+        Put vLLM to sleep to free GPU memory for training.
+        
+        Args:
+            level: Sleep level (1 = offload KV cache, higher = more aggressive)
+        """
+        self.llm.sleep(level=level)
+        gc.collect()
+        torch.cuda.empty_cache()
+        time.sleep(0.5)  # Allow memory to settle
+
+    def wake_up(self):
+        """Wake up vLLM from sleep for inference."""
+        self.llm.wake_up()
+
+    def load_weights(self, state_dict: dict, checkpoint_dir: str = "/tmp/vllm_weight_sync"):
+        """
+        Load new weights into the vLLM model.
+        
+        For vLLM V1 with sleep mode, this uses apply_model to access the
+        internal model's load_weights method.
+        
+        Args:
+            state_dict: Model state dict from training model
+            checkpoint_dir: Not used (kept for API compatibility)
+        """
+        # Convert state_dict items to a list for pickling (needed for multiprocess)
+        weights_list = list(state_dict.items())
+        
+        def _load_weights(model):
+            """Load weights into the model (runs in worker process)."""
+            model.load_weights(weights_list)
+        
+        # Use apply_model to access model in V1 engine (works across processes)
+        try:
+            self.llm.llm_engine.apply_model(_load_weights)
+        except AttributeError:
+            # Fallback for older vLLM versions with model_executor
+            try:
+                model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                model.load_weights(weights_list)
+            except AttributeError:
+                try:
+                    model = self.llm.llm_engine.model_executor.driver_worker.model_runner.get_model()
+                    model.load_weights(weights_list)
+                except AttributeError:
+                    raise RuntimeError(
+                        "Could not access vLLM internal model. "
+                        "This may be due to vLLM version incompatibility."
+                    )
 
 
 class ServerSamplingClient:
