@@ -13,7 +13,6 @@ from .losses import (
     cross_entropy_loss,
 )
 from .rl_utils import prepare_rl_batch, flatten_rewards
-# from .datasets import IFEvalDataset
 
 __all__ = [
     # Sampling
@@ -37,7 +36,5 @@ __all__ = [
     # RL Utils
     "prepare_rl_batch",
     "flatten_rewards",
-    # Datasets
-    # "IFEvalDataset",
 ]
 
