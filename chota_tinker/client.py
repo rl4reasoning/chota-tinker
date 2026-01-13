@@ -3,6 +3,7 @@
 import requests
 from vllm import LLM
 from vllm import SamplingParams as VLLMSamplingParams
+from vllm.inputs import TokensPrompt
 
 from .types import ModelInput, SamplingParams, SamplingResult, Sequence
 
@@ -20,6 +21,8 @@ class SamplingClient:
                 e.g. tensor_parallel_size, gpu_memory_utilization, etc.
         """
         self.model_name = model_name
+        # Enable prefix caching by default for multi-turn efficiency
+        vllm_kwargs.setdefault("enable_prefix_caching", True)
         self.llm = LLM(model=model_name, **vllm_kwargs)
 
     def sample(
@@ -51,7 +54,7 @@ class SamplingClient:
 
         # Generate using vLLM
         outputs = self.llm.generate(
-            prompt_token_ids=[prompt.token_ids],
+            prompts=[TokensPrompt(prompt_token_ids=prompt.token_ids)],
             sampling_params=vllm_params,
         )
 
@@ -94,7 +97,7 @@ class SamplingClient:
 
         # Generate using vLLM (batched)
         outputs = self.llm.generate(
-            prompt_token_ids=[p.token_ids for p in prompts],
+            prompts=[TokensPrompt(prompt_token_ids=p.token_ids) for p in prompts],
             sampling_params=vllm_params,
         )
 

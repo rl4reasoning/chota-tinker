@@ -4,8 +4,11 @@ Usage:
     python collect_trajectories.py \
     --dataset bicycleman15/intellect_3_code_easy_medium \
     --model Qwen/Qwen3-4B-Instruct-2507 \
+    --backend vllm \
     --num-problems 20 \
-    --num-samples 8 \
+    --num-samples 8
+    
+     \
     --push-to-hub bicycleman15/qwen3_4b_instruct_easy_medium
 
 """
@@ -16,17 +19,30 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
 import asyncio
 import json
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
-import tinker
-from tinker import types
 from datasets import Dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
 from intellect_env import IntellectCodeEnv
 from utils.pass_at_k import compute_pass_at_k
+
+# Backend imports (conditional)
+try:
+    import tinker
+    from tinker import types as tinker_types
+    TINKER_AVAILABLE = True
+except ImportError:
+    TINKER_AVAILABLE = False
+
+try:
+    from chota_tinker import SamplingClient, ServerSamplingClient, SamplingParams, ModelInput
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
 
 
 def render_trajectory(messages: list[dict], interactions: list[dict], question: str, reward: float, num_turns: int, terminated: bool, truncated: bool) -> str:
@@ -67,168 +83,223 @@ NOTE: You must interact atleast once successfully before you submit the final co
 """
 
 
-async def get_llm_action(
-    obs: str,
-    history: list[dict],
-    tokenizer: AutoTokenizer,
-    client: tinker.SamplingClient,
-    sampling_params: types.SamplingParams,
-) -> str:
-    """Get LLM action given observation and history."""
-    messages = history + [{"role": "user", "content": obs}]
+@dataclass
+class RolloutState:
+    """Track state of a single rollout for batched processing."""
+    problem_index: int
+    sample_index: int
+    env: IntellectCodeEnv
+    history: list[dict] = field(default_factory=list)
+    messages: list[dict] = field(default_factory=list)
+    interactions: list[dict] = field(default_factory=list)
+    total_reward: float = 0.0
+    obs: str = ""
+    done: bool = False
+    terminated: bool = False
+    truncated: bool = False
+
+
+def create_sampling_client(args):
+    """Create sampling client based on backend choice."""
+    if args.backend == "tinker":
+        if not TINKER_AVAILABLE:
+            raise ImportError("tinker not installed. Install it or use --backend vllm")
+        service_client = tinker.ServiceClient()
+        return service_client.create_sampling_client(base_model=args.model)
+    else:  # vllm
+        if not VLLM_AVAILABLE:
+            raise ImportError("chota_tinker not installed. Install it or use --backend tinker")
+        if args.vllm_server_url:
+            return ServerSamplingClient(args.vllm_server_url)
+        else:
+            return SamplingClient(args.model, gpu_memory_utilization=args.gpu_memory_utilization)
+
+
+def create_sampling_params(args, backend: str):
+    """Create sampling params for the chosen backend."""
+    if backend == "tinker":
+        return tinker_types.SamplingParams(
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_p=0.95,
+            stop=["</interact>"],
+        )
+    else:
+        return SamplingParams(
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_p=0.95,
+            stop=["</interact>"],
+        )
+
+
+def build_prompt(state: RolloutState, tokenizer) -> list[int]:
+    """Build tokenized prompt from rollout state."""
+    messages = state.history + [{"role": "user", "content": state.obs}]
     prompt_text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    
-    input_ids = tokenizer(prompt_text)["input_ids"]
-    result = await client.sample_async(
-        prompt=types.ModelInput.from_ints(input_ids),
-        sampling_params=sampling_params,
-        num_samples=1,
-    )
-    response = tokenizer.decode(result.sequences[0].tokens, skip_special_tokens=True)
-    
-    # If stopped by </interact>, append it back so regex can match
+    return tokenizer(prompt_text)["input_ids"]
+
+
+def postprocess_response(response: str) -> str:
+    """Postprocess LLM response."""
     if "<interact>" in response and "</interact>" not in response:
         response += "</interact>"
-    
     return response
 
 
-async def do_single_rollout(
-    problem_index: int,
-    dataset_name: str,
-    tokenizer: AutoTokenizer,
-    client: tinker.SamplingClient,
-    sampling_params: types.SamplingParams,
-    max_turns: int = 5,
-) -> dict[str, Any]:
-    """Run a single multi-turn rollout for a problem."""
-    env = IntellectCodeEnv(
-        system_prompt="",  # We add system prompt to history instead
-        dataset_name=dataset_name,
-        problem_index=problem_index,
-        max_turns=max_turns,
-    )
-    
-    obs, info = env.reset()
-    history = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": obs}]
-    total_reward = 0.0
-    interactions = []
-    
-    for step in range(max_turns):
-        action = await get_llm_action(obs, history, tokenizer, client, sampling_params)
-        
-        history.append({"role": "user", "content": obs})
-        history.append({"role": "assistant", "content": action})
-        messages.append({"role": "assistant", "content": action})
-        
-        obs, reward, terminated, truncated, info = env.step(action)
-        total_reward += reward
-        
-        if env.history and len(env.history) > len(interactions):
-            interactions = env.history.copy()
-        
-        if obs:
-            messages.append({"role": "user", "content": obs})
-        
-        if terminated or truncated:
-            break
-    
-    return {
-        "question": env.question,
-        "messages": messages,
-        "num_turns": env.current_turn,
-        "final_reward": total_reward,
-        "terminated": terminated,
-        "truncated": truncated,
-        "interactions": interactions,
-        "tests": env.tests,
-    }
-
-
-async def collect_trajectories_for_problem(
-    problem_index: int,
-    dataset_name: str,
-    tokenizer: AutoTokenizer,
-    client: tinker.SamplingClient,
-    sampling_params: types.SamplingParams,
-    num_samples: int = 8,
-    max_turns: int = 5,
-) -> list[dict[str, Any]]:
-    """Collect multiple trajectories for a single problem using parallel rollouts."""
-    trajectories = await asyncio.gather(*[
-        do_single_rollout(
-            problem_index=problem_index,
-            dataset_name=dataset_name,
-            tokenizer=tokenizer,
-            client=client,
+async def sample_batch_tinker(client, prompts: list[list[int]], sampling_params) -> list[str]:
+    """Batch sample using tinker (via async gather)."""
+    async def sample_one(input_ids):
+        result = await client.sample_async(
+            prompt=tinker_types.ModelInput.from_ints(input_ids),
             sampling_params=sampling_params,
-            max_turns=max_turns,
+            num_samples=1,
         )
-        for _ in range(num_samples)
-    ])
+        return result.sequences[0].tokens
     
-    return list(trajectories)
-
-
-async def gather_with_progress(coroutines: list, desc: str) -> list:
-    """Run coroutines concurrently with a progress bar."""
-    pbar = tqdm(total=len(coroutines), desc=desc)
-    
-    async def track(coro):
-        result = await coro
-        pbar.update(1)
-        return result
-    
-    try:
-        results = await asyncio.gather(*[track(coro) for coro in coroutines])
-    finally:
-        pbar.close()
-    
+    results = await asyncio.gather(*[sample_one(p) for p in prompts])
     return results
 
 
-async def main(args):
+def sample_batch_vllm(client, prompts: list[list[int]], sampling_params) -> list[str]:
+    """Batch sample using vLLM."""
+    model_inputs = [ModelInput.from_ints(p) for p in prompts]
+    results = client.sample_batch(model_inputs, sampling_params, num_samples=1)
+    return [r.sequences[0].text for r in results]
+
+
+def run_batched_rollouts(
+    args,
+    client,
+    tokenizer,
+    sampling_params,
+) -> list[list[dict[str, Any]]]:
+    """Run batched rollouts across all problems and samples."""
+    # Initialize all rollout states
+    active_states: list[RolloutState] = []
+    for problem_idx in range(args.num_problems):
+        for sample_idx in range(args.num_samples):
+            env = IntellectCodeEnv(
+                system_prompt="",
+                dataset_name=args.dataset,
+                problem_index=problem_idx,
+                max_turns=args.max_turns,
+            )
+            obs, info = env.reset()
+            state = RolloutState(
+                problem_index=problem_idx,
+                sample_index=sample_idx,
+                env=env,
+                history=[{"role": "system", "content": SYSTEM_PROMPT}],
+                messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": obs}],
+                obs=obs,
+            )
+            active_states.append(state)
+    
+    completed_states: list[RolloutState] = []
+    problems_completed = set()
+    
+    pbar = tqdm(total=args.num_problems, desc="Problems completed")
+    
+    while active_states:
+        # Build prompts for all active states
+        prompts = [build_prompt(s, tokenizer) for s in active_states]
+        
+        # Batch sample
+        if args.backend == "tinker":
+            token_results = asyncio.run(sample_batch_tinker(client, prompts, sampling_params))
+            responses = [tokenizer.decode(tokens, skip_special_tokens=True) for tokens in token_results]
+        else:
+            responses = sample_batch_vllm(client, prompts, sampling_params)
+        
+        # Process responses and step environments
+        still_active = []
+        for state, response in zip(active_states, responses):
+            response = postprocess_response(response)
+            
+            # Update history and messages
+            state.history.append({"role": "user", "content": state.obs})
+            state.history.append({"role": "assistant", "content": response})
+            state.messages.append({"role": "assistant", "content": response})
+            
+            # Step environment
+            obs, reward, terminated, truncated, info = state.env.step(response)
+            state.total_reward += reward
+            state.terminated = terminated
+            state.truncated = truncated
+            
+            # Update interactions
+            if state.env.history and len(state.env.history) > len(state.interactions):
+                state.interactions = state.env.history.copy()
+            
+            if obs:
+                state.messages.append({"role": "user", "content": obs})
+            
+            if terminated or truncated:
+                state.done = True
+                completed_states.append(state)
+                
+                # Check if all samples for this problem are done
+                problem_samples_done = sum(
+                    1 for s in completed_states if s.problem_index == state.problem_index
+                )
+                if problem_samples_done == args.num_samples and state.problem_index not in problems_completed:
+                    problems_completed.add(state.problem_index)
+                    pbar.update(1)
+            else:
+                state.obs = obs
+                still_active.append(state)
+        
+        active_states = still_active
+    
+    pbar.close()
+    
+    # Organize results by problem
+    all_trajectories: list[list[dict]] = [[] for _ in range(args.num_problems)]
+    for state in completed_states:
+        traj = {
+            "question": state.env.question,
+            "messages": state.messages,
+            "num_turns": state.env.current_turn,
+            "final_reward": state.total_reward,
+            "terminated": state.terminated,
+            "truncated": state.truncated,
+            "interactions": state.interactions,
+            "tests": state.env.tests,
+        }
+        all_trajectories[state.problem_index].append(traj)
+    
+    return all_trajectories
+
+def main(args):
     print(f"=" * 60)
     print(f"Collecting trajectories")
     print(f"  Dataset: {args.dataset}")
     print(f"  Model: {args.model}")
+    print(f"  Backend: {args.backend}")
     print(f"  Problems: {args.num_problems}")
     print(f"  Samples per problem: {args.num_samples}")
     print(f"  Max turns: {args.max_turns}")
     print(f"  Output: {args.output_dir}")
     print(f"=" * 60)
     
-    # Initialize tinker client (from eval.py and gem_math_demo.py)
-    print("\nInitializing tinker client...")
-    service_client = tinker.ServiceClient()
-    sampling_client = service_client.create_sampling_client(base_model=args.model)
+    # Initialize client based on backend
+    print(f"\nInitializing {args.backend} client...")
+    sampling_client = create_sampling_client(args)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    sampling_params = create_sampling_params(args, args.backend)
     
-    sampling_params = types.SamplingParams(
-        max_tokens=args.max_tokens,
-        temperature=args.temperature,
-        top_p=0.95,
-        stop=["</interact>"],
+    print(f"\nCollecting trajectories for {args.num_problems} problems (batched)...")
+    
+    # Run batched rollouts
+    all_trajectories = run_batched_rollouts(
+        args=args,
+        client=sampling_client,
+        tokenizer=tokenizer,
+        sampling_params=sampling_params,
     )
-    
-    print(f"\nCollecting trajectories for {args.num_problems} problems...")
-    
-    # Process problems sequentially (8 parallel rollouts per problem)
-    all_trajectories = []
-    for i in tqdm(range(args.num_problems), desc="Problems"):
-        problem_trajectories = await collect_trajectories_for_problem(
-            problem_index=i,
-            dataset_name=args.dataset,
-            tokenizer=tokenizer,
-            client=sampling_client,
-            sampling_params=sampling_params,
-            num_samples=args.num_samples,
-            max_turns=args.max_turns,
-        )
-        all_trajectories.append(problem_trajectories)
     
     # Flatten into rows (one per trajectory)
     rows = []
@@ -333,6 +404,13 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
     parser.add_argument("--output-dir", type=str, default="artifacts/trajectories")
     parser.add_argument("--push-to-hub", type=str, default=None, help="HF repo to push to (e.g. username/repo-name)")
+    # Backend options
+    parser.add_argument("--backend", type=str, default="vllm", choices=["tinker", "vllm"],
+                        help="Inference backend: 'tinker' or 'vllm' (default: vllm)")
+    parser.add_argument("--vllm-server-url", type=str, default=None,
+                        help="URL for vLLM server (e.g. http://localhost:8000). If not set, uses local vLLM.")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
+                        help="GPU memory utilization for local vLLM (default: 0.9)")
     
     args = parser.parse_args()
-    asyncio.run(main(args))
+    main(args)
