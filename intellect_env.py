@@ -30,6 +30,7 @@ class IntellectCodeEnv(Env):
         seed: int = 0,
         dataset_name: str = "PrimeIntellect/INTELLECT-3-RL",
         problem_index: Optional[int] = None,
+        dataset: Optional[Dataset] = None,
     ):
         super().__init__()
         self.system_prompt = system_prompt
@@ -40,8 +41,10 @@ class IntellectCodeEnv(Env):
         self.dataset_name = dataset_name
         self.problem_index = problem_index
         
-        # Custom datasets (bicycleman15/*) don't use config parameter
-        if dataset_name.startswith("bicycleman15/"):
+        # Use pre-loaded dataset if provided, otherwise load it
+        if dataset is not None:
+            self.dataset = dataset
+        elif dataset_name.startswith("bicycleman15/"):
             self.dataset = load_dataset(dataset_name, split=split)
         else:
             self.dataset = load_dataset(dataset_name, config, split=split)

@@ -2,11 +2,11 @@
 
 Usage:
     python collect_trajectories.py \
-    --dataset bicycleman15/intellect_3_code_easy_medium \
+    --dataset bicycleman15/intellect_3_code_very_hard \
     --model Qwen/Qwen3-4B-Instruct-2507 \
     --backend vllm \
-    --num-problems 20 \
-    --num-samples 8
+    --num-problems 30 \
+    --num-samples 32
     
      \
     --push-to-hub bicycleman15/qwen3_4b_instruct_easy_medium
@@ -177,6 +177,16 @@ def run_batched_rollouts(
     sampling_params,
 ) -> list[list[dict[str, Any]]]:
     """Run batched rollouts across all problems and samples."""
+    # Load dataset ONCE before creating environments
+    print(f"Loading dataset {args.dataset}...")
+    if args.dataset.startswith("bicycleman15/"):
+        from datasets import load_dataset
+        shared_dataset = load_dataset(args.dataset, split="train")
+    else:
+        from datasets import load_dataset
+        shared_dataset = load_dataset(args.dataset, "code", split="train")
+    print(f"Dataset loaded with {len(shared_dataset)} problems.")
+    
     # Initialize all rollout states
     active_states: list[RolloutState] = []
     for problem_idx in range(args.num_problems):
@@ -186,6 +196,7 @@ def run_batched_rollouts(
                 dataset_name=args.dataset,
                 problem_index=problem_idx,
                 max_turns=args.max_turns,
+                dataset=shared_dataset,  # Pass pre-loaded dataset
             )
             obs, info = env.reset()
             state = RolloutState(

@@ -4,6 +4,7 @@ Usage:
     python collect_trajectories_single_turn.py \
     --dataset bicycleman15/intellect_3_code_easy_medium \
     --model Qwen/Qwen3-4B-Instruct-2507 \
+    --backend vllm \
     --num-problems 20 \
     --num-samples 8 \
     --push-to-hub bicycleman15/qwen3_4b_instruct_easy_medium_single_turn
@@ -18,14 +19,26 @@ import json
 from datetime import datetime
 from typing import Any
 
-import tinker
-from tinker import types
 from datasets import Dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
 from intellect_env import IntellectCodeEnv
 from utils.pass_at_k import compute_pass_at_k
+
+# Backend imports (conditional)
+try:
+    import tinker
+    from tinker import types as tinker_types
+    TINKER_AVAILABLE = True
+except ImportError:
+    TINKER_AVAILABLE = False
+
+try:
+    from chota_tinker import SamplingClient, ServerSamplingClient, SamplingParams, ModelInput
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
 
 
 def render_trajectory(messages: list[dict], question: str, reward: float, terminated: bool) -> str:
@@ -52,127 +65,168 @@ Then, provide your final solution wrapped in ```python``` code blocks.
 """
 
 
-async def get_llm_action(
-    obs: str,
-    history: list[dict],
-    tokenizer: AutoTokenizer,
-    client: tinker.SamplingClient,
-    sampling_params: types.SamplingParams,
-) -> str:
-    """Get LLM action given observation and history."""
-    messages = history + [{"role": "user", "content": obs}]
+def create_sampling_client(args):
+    """Create sampling client based on backend choice."""
+    if args.backend == "tinker":
+        if not TINKER_AVAILABLE:
+            raise ImportError("tinker not installed. Install it or use --backend vllm")
+        service_client = tinker.ServiceClient()
+        return service_client.create_sampling_client(base_model=args.model)
+    else:  # vllm
+        if not VLLM_AVAILABLE:
+            raise ImportError("chota_tinker not installed. Install it or use --backend tinker")
+        if args.vllm_server_url:
+            return ServerSamplingClient(args.vllm_server_url)
+        else:
+            return SamplingClient(args.model, gpu_memory_utilization=args.gpu_memory_utilization)
+
+
+def create_sampling_params(args, backend: str):
+    """Create sampling params for the chosen backend."""
+    if backend == "tinker":
+        return tinker_types.SamplingParams(
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_p=0.95,
+        )
+    else:
+        return SamplingParams(
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_p=0.95,
+        )
+
+
+def build_prompt(messages: list[dict], tokenizer) -> list[int]:
+    """Build tokenized prompt from messages."""
     prompt_text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    
-    input_ids = tokenizer(prompt_text)["input_ids"]
-    result = await client.sample_async(
-        prompt=types.ModelInput.from_ints(input_ids),
-        sampling_params=sampling_params,
-        num_samples=1,
-    )
-    response = tokenizer.decode(result.sequences[0].tokens, skip_special_tokens=True)
-    
-    return response
+    return tokenizer(prompt_text)["input_ids"]
 
 
-async def do_single_rollout(
-    problem_index: int,
-    dataset_name: str,
-    tokenizer: AutoTokenizer,
-    client: tinker.SamplingClient,
-    sampling_params: types.SamplingParams,
-) -> dict[str, Any]:
-    """Run a single-turn rollout for a problem."""
-    env = IntellectCodeEnv(
-        system_prompt="",  # We add system prompt to history instead
-        dataset_name=dataset_name,
-        problem_index=problem_index,
-        max_turns=1,  # Single turn only
-    )
-    
-    obs, info = env.reset()
-    # Single-turn mode: allow immediate final answer without requiring <interact>
-    env.has_interacted = True
-    history = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": obs}]
-    
-    # Single turn: get response and evaluate
-    action = await get_llm_action(obs, history, tokenizer, client, sampling_params)
-    messages.append({"role": "assistant", "content": action})
-    
-    # Step to get reward (will evaluate the code)
-    _, reward, terminated, truncated, info = env.step(action)
-    
-    return {
-        "question": env.question,
-        "messages": messages,
-        "final_reward": reward,
-        "terminated": terminated,
-        "truncated": truncated,
-        "tests": env.tests,
-    }
-
-
-async def collect_trajectories_for_problem(
-    problem_index: int,
-    dataset_name: str,
-    tokenizer: AutoTokenizer,
-    client: tinker.SamplingClient,
-    sampling_params: types.SamplingParams,
-    num_samples: int = 8,
-) -> list[dict[str, Any]]:
-    """Collect multiple trajectories for a single problem using parallel rollouts."""
-    trajectories = await asyncio.gather(*[
-        do_single_rollout(
-            problem_index=problem_index,
-            dataset_name=dataset_name,
-            tokenizer=tokenizer,
-            client=client,
+async def sample_batch_tinker(client, prompts: list[list[int]], sampling_params, tokenizer) -> list[str]:
+    """Batch sample using tinker (via async gather)."""
+    async def sample_one(input_ids):
+        result = await client.sample_async(
+            prompt=tinker_types.ModelInput.from_ints(input_ids),
             sampling_params=sampling_params,
+            num_samples=1,
         )
-        for _ in range(num_samples)
-    ])
+        return tokenizer.decode(result.sequences[0].tokens, skip_special_tokens=True)
     
-    return list(trajectories)
+    results = await asyncio.gather(*[sample_one(p) for p in prompts])
+    return results
 
 
-async def main(args):
+def sample_batch_vllm(client, prompts: list[list[int]], sampling_params) -> list[str]:
+    """Batch sample using vLLM."""
+    model_inputs = [ModelInput.from_ints(p) for p in prompts]
+    results = client.sample_batch(model_inputs, sampling_params, num_samples=1)
+    return [r.sequences[0].text for r in results]
+
+
+def run_batched_rollouts(
+    args,
+    client,
+    tokenizer,
+    sampling_params,
+) -> list[list[dict[str, Any]]]:
+    """Run batched single-turn rollouts across all problems and samples."""
+    # Load dataset ONCE before creating environments
+    print(f"Loading dataset {args.dataset}...")
+    if args.dataset.startswith("bicycleman15/"):
+        from datasets import load_dataset
+        shared_dataset = load_dataset(args.dataset, split="train")
+    else:
+        from datasets import load_dataset
+        shared_dataset = load_dataset(args.dataset, "code", split="train")
+    print(f"Dataset loaded with {len(shared_dataset)} problems.")
+    
+    # Initialize all environments and build prompts
+    envs = []
+    all_messages = []
+    prompts = []
+    
+    print(f"Initializing {args.num_problems * args.num_samples} rollouts...")
+    for problem_idx in range(args.num_problems):
+        for sample_idx in range(args.num_samples):
+            env = IntellectCodeEnv(
+                system_prompt="",
+                dataset_name=args.dataset,
+                problem_index=problem_idx,
+                max_turns=1,
+                dataset=shared_dataset,
+            )
+            obs, info = env.reset()
+            env.has_interacted = True  # Single-turn mode
+            
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": obs}
+            ]
+            prompt = build_prompt(messages, tokenizer)
+            
+            envs.append((problem_idx, sample_idx, env, messages))
+            all_messages.append(messages)
+            prompts.append(prompt)
+    
+    # Batch sample all responses at once
+    print(f"Sampling {len(prompts)} responses...")
+    if args.backend == "tinker":
+        responses = asyncio.run(sample_batch_tinker(client, prompts, sampling_params, tokenizer))
+    else:
+        responses = sample_batch_vllm(client, prompts, sampling_params)
+    
+    # Process responses and collect results
+    print(f"Evaluating responses...")
+    all_trajectories: list[list[dict]] = [[] for _ in range(args.num_problems)]
+    
+    for (problem_idx, sample_idx, env, messages), response in tqdm(zip(envs, responses), total=len(envs), desc="Evaluating"):
+        messages.append({"role": "assistant", "content": response})
+        
+        # Step to get reward (will evaluate the code)
+        _, reward, terminated, truncated, info = env.step(response)
+        
+        traj = {
+            "question": env.question,
+            "messages": messages,
+            "final_reward": reward,
+            "terminated": terminated,
+            "truncated": truncated,
+            "tests": env.tests,
+        }
+        all_trajectories[problem_idx].append(traj)
+    
+    return all_trajectories
+
+
+def main(args):
     print(f"=" * 60)
     print(f"Collecting single-turn trajectories")
     print(f"  Dataset: {args.dataset}")
     print(f"  Model: {args.model}")
+    print(f"  Backend: {args.backend}")
     print(f"  Problems: {args.num_problems}")
     print(f"  Samples per problem: {args.num_samples}")
     print(f"  Output: {args.output_dir}")
     print(f"=" * 60)
     
-    # Initialize tinker client
-    print("\nInitializing tinker client...")
-    service_client = tinker.ServiceClient()
-    sampling_client = service_client.create_sampling_client(base_model=args.model)
+    # Initialize client based on backend
+    print(f"\nInitializing {args.backend} client...")
+    sampling_client = create_sampling_client(args)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    sampling_params = create_sampling_params(args, args.backend)
     
-    sampling_params = types.SamplingParams(
-        max_tokens=args.max_tokens,
-        temperature=args.temperature,
-        top_p=0.95,
+    print(f"\nCollecting trajectories for {args.num_problems} problems (batched)...")
+    
+    # Run batched rollouts
+    all_trajectories = run_batched_rollouts(
+        args=args,
+        client=sampling_client,
+        tokenizer=tokenizer,
+        sampling_params=sampling_params,
     )
-    
-    print(f"\nCollecting trajectories for {args.num_problems} problems...")
-    
-    # Process problems sequentially (parallel rollouts per problem)
-    all_trajectories = []
-    for i in tqdm(range(args.num_problems), desc="Problems"):
-        problem_trajectories = await collect_trajectories_for_problem(
-            problem_index=i,
-            dataset_name=args.dataset,
-            tokenizer=tokenizer,
-            client=sampling_client,
-            sampling_params=sampling_params,
-            num_samples=args.num_samples,
-        )
-        all_trajectories.append(problem_trajectories)
     
     # Flatten into rows (one per trajectory)
     rows = []
@@ -274,6 +328,13 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
     parser.add_argument("--output-dir", type=str, default="artifacts/trajectories_single_turn")
     parser.add_argument("--push-to-hub", type=str, default=None, help="HF repo to push to (e.g. username/repo-name)")
+    # Backend options
+    parser.add_argument("--backend", type=str, default="vllm", choices=["tinker", "vllm"],
+                        help="Inference backend: 'tinker' or 'vllm' (default: vllm)")
+    parser.add_argument("--vllm-server-url", type=str, default=None,
+                        help="URL for vLLM server (e.g. http://localhost:8000). If not set, uses local vLLM.")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
+                        help="GPU memory utilization for local vLLM (default: 0.9)")
     
     args = parser.parse_args()
-    asyncio.run(main(args))
+    main(args)
