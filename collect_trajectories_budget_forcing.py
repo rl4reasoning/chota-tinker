@@ -1,0 +1,462 @@
+"""Collect trajectories with s1 budget forcing and save as HuggingFace dataset.
+
+Implements the "budget forcing" technique from:
+    s1: Simple test-time scaling (https://arxiv.org/abs/2501.19393)
+
+When the model tries to end generation (hits EOS), we forcefully append "Wait"
+to make it continue reasoning. This often leads the model to double-check
+and fix incorrect reasoning steps.
+
+Usage:
+    python collect_trajectories_budget_forcing.py \
+        --dataset bicycleman15/intellect_3_code_very_hard \
+        --model Qwen/Qwen3-4B-Instruct-2507 \
+        --backend vllm \
+        --num-problems 30 \
+        --num-samples 32 \
+        --num-ignores 5 \
+        --push-to-hub bicycleman15/qwen3_4b_very_hard_s1_x5
+"""
+
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import argparse
+import asyncio
+import json
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+
+from datasets import Dataset
+from transformers import AutoTokenizer
+from tqdm import tqdm
+
+from intellect_env import IntellectCodeEnv
+from utils.pass_at_k import compute_pass_at_k
+
+# Backend imports (conditional)
+try:
+    import tinker
+    from tinker import types as tinker_types
+    TINKER_AVAILABLE = True
+except ImportError:
+    TINKER_AVAILABLE = False
+
+try:
+    from chota_tinker import SamplingClient, ServerSamplingClient, SamplingParams, ModelInput
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
+
+
+# The magic word that extends thinking (from s1 paper)
+WAIT_TOKEN = "Wait"
+
+
+def render_trajectory(messages: list[dict], question: str, reward: float, 
+                      terminated: bool, num_extensions: int) -> str:
+    """Render a trajectory as a formatted string."""
+    lines = []
+    lines.append("=" * 80)
+    lines.append(f"Question: {question[:50]}..." if len(question) > 50 else f"Question: {question}")
+    lines.append(f"Reward: {reward:.2f} | Terminated: {terminated} | Extensions: {num_extensions}")
+    lines.append("=" * 80)
+    
+    for msg in messages:
+        role = msg['role'].upper()
+        content = msg['content']
+        lines.append(f"\n[{role}]\n{content}")
+    
+    return "\n".join(lines)
+
+
+SYSTEM_PROMPT = """You are a helpful coding assistant.
+Solve the given programming problem and provide your solution.
+
+First, think about the problem step by step.
+Then, provide your final solution wrapped in ```python``` code blocks.
+"""
+
+
+@dataclass
+class BudgetForcingState:
+    """Track state of a single rollout with budget forcing."""
+    problem_index: int
+    sample_index: int
+    env: IntellectCodeEnv
+    prompt_text: str  # Current accumulated prompt
+    full_response: str = ""  # Accumulated response
+    total_tokens: int = 0
+    current_extension: int = 0  # Which extension we're on (0 = first gen)
+    done: bool = False
+    # Final results
+    messages: list[dict] = field(default_factory=list)
+    reward: float = 0.0
+    terminated: bool = False
+    truncated: bool = False
+
+
+def create_sampling_client(args):
+    """Create sampling client based on backend choice."""
+    if args.backend == "tinker":
+        if not TINKER_AVAILABLE:
+            raise ImportError("tinker not installed. Install it or use --backend vllm")
+        service_client = tinker.ServiceClient()
+        return service_client.create_sampling_client(base_model=args.model)
+    else:  # vllm
+        if not VLLM_AVAILABLE:
+            raise ImportError("chota_tinker not installed. Install it or use --backend tinker")
+        if args.vllm_server_url:
+            return ServerSamplingClient(args.vllm_server_url)
+        else:
+            return SamplingClient(
+                args.model,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+                max_model_len=args.max_model_len,
+            )
+
+
+def create_sampling_params(args, backend: str, max_tokens: int):
+    """Create sampling params for the chosen backend."""
+    if backend == "tinker":
+        return tinker_types.SamplingParams(
+            max_tokens=max_tokens,
+            temperature=args.temperature,
+            top_p=0.95,
+        )
+    else:
+        return SamplingParams(
+            max_tokens=max_tokens,
+            temperature=args.temperature,
+            top_p=0.95,
+        )
+
+
+async def sample_batch_tinker(client, prompts: list[list[int]], sampling_params, tokenizer) -> list[tuple[str, int]]:
+    """Batch sample using tinker (via async gather). Returns (text, num_tokens) pairs."""
+    async def sample_one(input_ids):
+        result = await client.sample_async(
+            prompt=tinker_types.ModelInput.from_ints(input_ids),
+            sampling_params=sampling_params,
+            num_samples=1,
+        )
+        tokens = result.sequences[0].tokens
+        text = tokenizer.decode(tokens, skip_special_tokens=True)
+        return (text, len(tokens))
+    
+    results = await asyncio.gather(*[sample_one(p) for p in prompts])
+    return results
+
+
+def sample_batch_vllm(client, prompts: list[list[int]], sampling_params) -> list[tuple[str, int]]:
+    """Batch sample using vLLM. Returns (text, num_tokens) pairs."""
+    model_inputs = [ModelInput.from_ints(p) for p in prompts]
+    results = client.sample_batch(model_inputs, sampling_params, num_samples=1)
+    return [(r.sequences[0].text, len(r.sequences[0].tokens)) for r in results]
+
+
+def run_batched_rollouts_with_budget_forcing(
+    args,
+    client,
+    tokenizer,
+) -> list[list[dict[str, Any]]]:
+    """Run batched single-turn rollouts with budget forcing."""
+    # Load dataset ONCE before creating environments
+    print(f"Loading dataset {args.dataset}...")
+    if args.dataset.startswith("bicycleman15/"):
+        from datasets import load_dataset
+        shared_dataset = load_dataset(args.dataset, split="train")
+    else:
+        from datasets import load_dataset
+        shared_dataset = load_dataset(args.dataset, "code", split="train")
+    print(f"Dataset loaded with {len(shared_dataset)} problems.")
+    
+    # Initialize all states
+    active_states: list[BudgetForcingState] = []
+    
+    print(f"Initializing {args.num_problems * args.num_samples} rollouts...")
+    for problem_idx in range(args.num_problems):
+        for sample_idx in range(args.num_samples):
+            env = IntellectCodeEnv(
+                system_prompt="",
+                dataset_name=args.dataset,
+                problem_index=problem_idx,
+                max_turns=1,
+                dataset=shared_dataset,
+            )
+            obs, info = env.reset()
+            env.has_interacted = True  # Single-turn mode
+            
+            # Build initial prompt
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": obs}
+            ]
+            prompt_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            
+            state = BudgetForcingState(
+                problem_index=problem_idx,
+                sample_index=sample_idx,
+                env=env,
+                prompt_text=prompt_text,
+                messages=messages.copy(),
+            )
+            active_states.append(state)
+    
+    completed_states: list[BudgetForcingState] = []
+    num_ignores = args.num_ignores
+    max_tokens = args.max_tokens
+    
+    # Process in rounds: each round handles one generation step for all active states
+    for extension_round in range(num_ignores + 1):  # +1 for final generation
+        if not active_states:
+            break
+            
+        is_final_round = (extension_round == num_ignores)
+        round_name = "final" if is_final_round else f"extension {extension_round + 1}/{num_ignores}"
+        print(f"\n[Round {extension_round + 1}] Generating {round_name} for {len(active_states)} active states...")
+        
+        # Build prompts and calculate remaining tokens for each state
+        prompts = []
+        valid_states = []
+        
+        for state in active_states:
+            remaining_tokens = max_tokens - state.total_tokens
+            if remaining_tokens <= 0:
+                # Out of tokens, mark as done
+                state.done = True
+                completed_states.append(state)
+                continue
+            
+            input_ids = tokenizer(state.prompt_text)["input_ids"]
+            prompts.append((input_ids, remaining_tokens))
+            valid_states.append(state)
+        
+        if not valid_states:
+            break
+        
+        # Create sampling params with max of remaining tokens
+        # For batched inference, we use the maximum remaining tokens
+        # (individual sequences will stop at EOS anyway)
+        max_remaining = max(rt for _, rt in prompts)
+        sampling_params = create_sampling_params(args, args.backend, max_remaining)
+        
+        # Batch sample
+        prompt_ids = [p[0] for p in prompts]
+        if args.backend == "tinker":
+            results = asyncio.run(sample_batch_tinker(client, prompt_ids, sampling_params, tokenizer))
+        else:
+            results = sample_batch_vllm(client, prompt_ids, sampling_params)
+        
+        # Process results
+        still_active = []
+        for state, (generated_text, num_tokens) in zip(valid_states, results):
+            state.total_tokens += num_tokens
+            state.current_extension = extension_round
+            
+            if is_final_round:
+                # Final generation - append and finish
+                state.full_response += generated_text
+                state.done = True
+                completed_states.append(state)
+            else:
+                # Force continuation by appending "Wait"
+                state.full_response += generated_text + " " + WAIT_TOKEN
+                state.prompt_text += generated_text + " " + WAIT_TOKEN
+                still_active.append(state)
+        
+        active_states = still_active
+        print(f"  Generated. {len(completed_states)} completed, {len(active_states)} continuing.")
+    
+    # Handle any remaining active states (shouldn't happen but just in case)
+    for state in active_states:
+        state.done = True
+        completed_states.append(state)
+    
+    # Evaluate all completed states
+    print(f"\nEvaluating {len(completed_states)} trajectories...")
+    for state in tqdm(completed_states, desc="Evaluating"):
+        # Add assistant response to messages
+        state.messages.append({"role": "assistant", "content": state.full_response})
+        
+        # Step environment to get reward
+        _, reward, terminated, truncated, info = state.env.step(state.full_response)
+        state.reward = reward
+        state.terminated = terminated
+        state.truncated = truncated
+    
+    # Organize results by problem
+    all_trajectories: list[list[dict]] = [[] for _ in range(args.num_problems)]
+    for state in completed_states:
+        traj = {
+            "question": state.env.question,
+            "messages": state.messages,
+            "final_reward": state.reward,
+            "terminated": state.terminated,
+            "truncated": state.truncated,
+            "tests": state.env.tests,
+            "num_extensions": state.current_extension,  # How many "Wait" tokens were appended
+            "total_tokens": state.total_tokens,
+        }
+        all_trajectories[state.problem_index].append(traj)
+    
+    return all_trajectories
+
+
+def main(args):
+    print(f"=" * 60)
+    print(f"Collecting trajectories with s1 Budget Forcing")
+    print(f"  Dataset: {args.dataset}")
+    print(f"  Model: {args.model}")
+    print(f"  Backend: {args.backend}")
+    print(f"  Problems: {args.num_problems}")
+    print(f"  Samples per problem: {args.num_samples}")
+    print(f"  Num ignores (Wait extensions): {args.num_ignores}")
+    print(f"  Max tokens: {args.max_tokens}")
+    print(f"  Output: {args.output_dir}")
+    print(f"=" * 60)
+    
+    # Initialize client based on backend
+    print(f"\nInitializing {args.backend} client...")
+    sampling_client = create_sampling_client(args)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    
+    print(f"\nCollecting trajectories for {args.num_problems} problems with budget forcing...")
+    
+    # Run batched rollouts with budget forcing
+    all_trajectories = run_batched_rollouts_with_budget_forcing(
+        args=args,
+        client=sampling_client,
+        tokenizer=tokenizer,
+    )
+    
+    # Flatten into rows (one per trajectory)
+    rows = []
+    all_results = []
+    
+    for problem_idx, problem_trajectories in enumerate(all_trajectories):
+        problem_results = []
+        
+        for traj_idx, traj in enumerate(problem_trajectories):
+            is_successful = traj["final_reward"] > 0
+            problem_results.append(is_successful)
+            
+            rows.append({
+                "problem_id": problem_idx,
+                "trajectory_id": traj_idx,
+                "question": traj["question"],
+                "messages": json.dumps(traj["messages"]),
+                "final_reward": traj["final_reward"],
+                "terminated": traj["terminated"],
+                "truncated": traj["truncated"],
+                "tests": json.dumps(traj["tests"]),
+                "is_successful": is_successful,
+                "num_extensions": traj["num_extensions"],
+                "total_tokens": traj["total_tokens"],
+                "rendered": render_trajectory(
+                    traj["messages"], traj["question"],
+                    traj["final_reward"], traj["terminated"],
+                    traj["num_extensions"]
+                ),
+            })
+        
+        all_results.append(problem_results)
+    
+    pass_at_1 = compute_pass_at_k(all_results, k=1)
+    pass_at_2 = compute_pass_at_k(all_results, k=2)
+    pass_at_4 = compute_pass_at_k(all_results, k=4)
+    pass_at_8 = compute_pass_at_k(all_results, k=min(8, args.num_samples))
+    
+    # Compute average tokens used
+    avg_tokens = sum(r["total_tokens"] for r in rows) / len(rows) if rows else 0
+    
+    print(f"\n{'=' * 60}")
+    print(f"Results:")
+    print(f"  Total trajectories: {len(rows)}")
+    print(f"  Avg tokens per trajectory: {avg_tokens:.1f}")
+    print(f"  pass@1: {pass_at_1:.4f}")
+    print(f"  pass@2: {pass_at_2:.4f}")
+    print(f"  pass@4: {pass_at_4:.4f}")
+    print(f"  pass@8: {pass_at_8:.4f}")
+    print(f"{'=' * 60}")
+    
+    dataset = Dataset.from_list(rows)
+    metadata = {
+        "dataset": args.dataset,
+        "model": args.model,
+        "num_problems": args.num_problems,
+        "num_samples": args.num_samples,
+        "num_ignores": args.num_ignores,
+        "max_tokens": args.max_tokens,
+        "temperature": args.temperature,
+        "timestamp": datetime.now().isoformat(),
+        "pass_at_1": pass_at_1,
+        "pass_at_2": pass_at_2,
+        "pass_at_4": pass_at_4,
+        "pass_at_8": pass_at_8,
+        "avg_tokens": avg_tokens,
+        "mode": "budget_forcing",
+        "method": "s1",
+    }
+    
+    os.makedirs(args.output_dir, exist_ok=True)
+    dataset.save_to_disk(args.output_dir)
+    
+    metadata_path = os.path.join(args.output_dir, "metadata.json")
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    
+    print(f"\nSaved dataset to: {args.output_dir}")
+    print(f"Saved metadata to: {metadata_path}")
+    
+    summary_path = os.path.join(args.output_dir, "summary.json")
+    summary = {
+        **metadata,
+        "num_successful_trajectories": sum(1 for r in rows if r["is_successful"]),
+        "problems_solved": sum(1 for pr in all_results if any(pr)),
+    }
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    
+    print(f"Saved summary to: {summary_path}")
+    
+    if args.push_to_hub:
+        print(f"\nPushing to HuggingFace Hub: {args.push_to_hub}")
+        dataset.push_to_hub(args.push_to_hub, private=False)
+        print(f"Successfully pushed to: https://huggingface.co/datasets/{args.push_to_hub}")
+    
+    return dataset, metadata
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Collect trajectories with s1 budget forcing")
+    parser.add_argument("--dataset", type=str, default="bicycleman15/intellect_3_code_easy_medium",
+                        choices=["bicycleman15/intellect_3_code_easy_medium", "bicycleman15/intellect_3_code_hard",
+                                 "bicycleman15/intellect_3_code_very_hard", "PrimeIntellect/INTELLECT-3-RL"])
+    parser.add_argument("--num-problems", type=int, default=20)
+    parser.add_argument("--num-samples", type=int, default=8)
+    parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
+    parser.add_argument("--output-dir", type=str, default="artifacts/trajectories_budget_forcing")
+    parser.add_argument("--push-to-hub", type=str, default=None, help="HF repo to push to (e.g. username/repo-name)")
+    
+    # Budget forcing specific
+    parser.add_argument("--num-ignores", type=int, default=1,
+                        help="Number of times to append 'Wait' when model hits EOS (default: 1)")
+    
+    # Backend options
+    parser.add_argument("--backend", type=str, default="vllm", choices=["tinker", "vllm"],
+                        help="Inference backend: 'tinker' or 'vllm' (default: vllm)")
+    parser.add_argument("--vllm-server-url", type=str, default=None,
+                        help="URL for vLLM server (e.g. http://localhost:8000). If not set, uses local vLLM.")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
+                        help="GPU memory utilization for local vLLM (default: 0.5)")
+    parser.add_argument("--max-model-len", type=int, default=32768,
+                        help="Maximum model context length for vLLM (default: None, uses model default)")
+    
+    args = parser.parse_args()
+    main(args)
