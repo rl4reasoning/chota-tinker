@@ -14,7 +14,7 @@ Usage:
         --backend vllm \
         --num-problems 30 \
         --num-samples 32 \
-        --num-ignores 5 \
+        --num-attempts 5 \
         --push-to-hub bicycleman15/qwen3_4b_very_hard_s1_x5
 """
 
@@ -207,53 +207,33 @@ def run_batched_rollouts_with_budget_forcing(
             active_states.append(state)
     
     completed_states: list[BudgetForcingState] = []
-    num_ignores = args.num_ignores
+    num_attempts = args.num_attempts
+    num_ignores = num_attempts - 1  # Number of "Wait" injections
     max_tokens = args.max_tokens
     
     # Process in rounds: each round handles one generation step for all active states
-    for extension_round in range(num_ignores + 1):  # +1 for final generation
+    for extension_round in range(num_attempts):
         if not active_states:
             break
             
-        is_final_round = (extension_round == num_ignores)
-        round_name = "final" if is_final_round else f"extension {extension_round + 1}/{num_ignores}"
-        print(f"\n[Round {extension_round + 1}] Generating {round_name} for {len(active_states)} active states...")
+        is_final_round = (extension_round == num_attempts - 1)
+        print(f"\n[Round {extension_round + 1}/{num_attempts}] Generating for {len(active_states)} active states...")
         
-        # Build prompts and calculate remaining tokens for each state
-        prompts = []
-        valid_states = []
+        # Build prompts for all active states
+        prompts = [tokenizer(state.prompt_text)["input_ids"] for state in active_states]
         
-        for state in active_states:
-            remaining_tokens = max_tokens - state.total_tokens
-            if remaining_tokens <= 0:
-                # Out of tokens, mark as done
-                state.done = True
-                completed_states.append(state)
-                continue
-            
-            input_ids = tokenizer(state.prompt_text)["input_ids"]
-            prompts.append((input_ids, remaining_tokens))
-            valid_states.append(state)
-        
-        if not valid_states:
-            break
-        
-        # Create sampling params with max of remaining tokens
-        # For batched inference, we use the maximum remaining tokens
-        # (individual sequences will stop at EOS anyway)
-        max_remaining = max(rt for _, rt in prompts)
-        sampling_params = create_sampling_params(args, args.backend, max_remaining)
+        # Each extension gets max_tokens (same semantics as collect_trajectories.py)
+        sampling_params = create_sampling_params(args, args.backend, max_tokens)
         
         # Batch sample
-        prompt_ids = [p[0] for p in prompts]
         if args.backend == "tinker":
-            results = asyncio.run(sample_batch_tinker(client, prompt_ids, sampling_params, tokenizer))
+            results = asyncio.run(sample_batch_tinker(client, prompts, sampling_params, tokenizer))
         else:
-            results = sample_batch_vllm(client, prompt_ids, sampling_params)
+            results = sample_batch_vllm(client, prompts, sampling_params)
         
         # Process results
         still_active = []
-        for state, (generated_text, num_tokens) in zip(valid_states, results):
+        for state, (generated_text, num_tokens) in zip(active_states, results):
             state.total_tokens += num_tokens
             state.current_extension = extension_round
             
@@ -314,7 +294,7 @@ def main(args):
     print(f"  Backend: {args.backend}")
     print(f"  Problems: {args.num_problems}")
     print(f"  Samples per problem: {args.num_samples}")
-    print(f"  Num ignores (Wait extensions): {args.num_ignores}")
+    print(f"  Num attempts: {args.num_attempts}")
     print(f"  Max tokens: {args.max_tokens}")
     print(f"  Output: {args.output_dir}")
     print(f"=" * 60)
@@ -389,7 +369,7 @@ def main(args):
         "model": args.model,
         "num_problems": args.num_problems,
         "num_samples": args.num_samples,
-        "num_ignores": args.num_ignores,
+        "num_attempts": args.num_attempts,
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "timestamp": datetime.now().isoformat(),
@@ -445,8 +425,8 @@ if __name__ == "__main__":
     parser.add_argument("--push-to-hub", type=str, default=None, help="HF repo to push to (e.g. username/repo-name)")
     
     # Budget forcing specific
-    parser.add_argument("--num-ignores", type=int, default=1,
-                        help="Number of times to append 'Wait' when model hits EOS (default: 1)")
+    parser.add_argument("--num-attempts", type=int, default=2,
+                        help="Total number of generation rounds (comparable to --max-turns in collect_trajectories.py)")
     
     # Backend options
     parser.add_argument("--backend", type=str, default="vllm", choices=["tinker", "vllm"],

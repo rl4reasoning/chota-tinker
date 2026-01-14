@@ -13,7 +13,7 @@ Usage:
         --model Qwen/Qwen3-4B-Instruct-2507 \
         --difficulty easy_medium \
         --problem_index 0 \
-        --num_ignores 2 \
+        --num_attempts 3 \
         --max_tokens 4096
 """
 
@@ -45,7 +45,7 @@ async def get_llm_action_with_budget_forcing(
     tokenizer,
     client,
     sampling_params: types.SamplingParams,
-    num_ignores: int = 1,
+    num_attempts: int = 2,
     verbose: bool = True,
 ) -> str:
     """
@@ -54,7 +54,7 @@ async def get_llm_action_with_budget_forcing(
     Budget forcing works by:
     1. Generate until the model hits EOS/stop token
     2. Append "Wait" to force the model to continue
-    3. Repeat up to `num_ignores` times
+    3. Repeat for num_attempts total rounds
     4. On the final generation, let the model finish naturally
     
     Args:
@@ -63,7 +63,7 @@ async def get_llm_action_with_budget_forcing(
         tokenizer: The tokenizer
         client: The sampling client
         sampling_params: Base sampling parameters
-        num_ignores: Number of times to ignore EOS and append "Wait"
+        num_attempts: Total number of generation rounds (comparable to max_turns)
         verbose: Whether to print progress
         
     Returns:
@@ -76,8 +76,10 @@ async def get_llm_action_with_budget_forcing(
         messages, tokenize=False, add_generation_prompt=True
     )
     
+    num_ignores = num_attempts - 1  # Number of "Wait" injections
+    
     if verbose:
-        print(f"[budget forcing] Will force {num_ignores} extension(s) with '{WAIT_TOKEN}'")
+        print(f"[budget forcing] {num_attempts} generation round(s), {num_ignores} forced extension(s) with '{WAIT_TOKEN}'")
     
     # Track total tokens and full response
     total_tokens = 0
@@ -85,7 +87,7 @@ async def get_llm_action_with_budget_forcing(
     full_response = ""
     
     # Generate with budget forcing - append "Wait" when model tries to stop
-    for ignore_idx in range(num_ignores + 1):  # +1 for final generation
+    for attempt_idx in range(num_attempts):
         remaining_tokens = max_total_tokens - total_tokens
         
         if remaining_tokens <= 0:
@@ -115,10 +117,10 @@ async def get_llm_action_with_budget_forcing(
         total_tokens += generated_tokens
         
         if verbose:
-            print(f"[budget forcing] Generation {ignore_idx + 1}: {generated_tokens} tokens")
+            print(f"[budget forcing] Generation {attempt_idx + 1}/{num_attempts}: {generated_tokens} tokens")
         
         # Check if we should force continuation
-        is_last_iteration = (ignore_idx == num_ignores)
+        is_last_iteration = (attempt_idx == num_attempts - 1)
         
         if is_last_iteration:
             # Final generation - just append and finish
@@ -145,7 +147,7 @@ async def run_single_turn_with_budget_forcing(
     tokenizer,
     client,
     sampling_params,
-    num_ignores: int = 1,
+    num_attempts: int = 2,
 ):
     """Run exactly one assistant response with budget forcing and evaluate it."""
     obs, info = env.reset()
@@ -162,7 +164,7 @@ async def run_single_turn_with_budget_forcing(
         tokenizer=tokenizer,
         client=client,
         sampling_params=sampling_params,
-        num_ignores=num_ignores,
+        num_attempts=num_attempts,
     )
     print(f"[assistant]\n{action}\n")
 
@@ -196,8 +198,8 @@ async def main():
                         help="Specific problem index to use")
     
     # Budget forcing specific arguments
-    parser.add_argument("--num_ignores", type=int, default=1,
-                        help="Number of times to append 'Wait' when model hits EOS")
+    parser.add_argument("--num_attempts", type=int, default=2,
+                        help="Total number of generation rounds (comparable to max_turns)")
     
     args = parser.parse_args()
 
@@ -213,7 +215,7 @@ async def main():
 
     dataset_name = DATASET_MAP[args.difficulty]
     print(f"Using dataset: {dataset_name} (difficulty: {args.difficulty})")
-    print(f"Budget forcing: {args.num_ignores} forced extension(s) with 'Wait'")
+    print(f"Budget forcing: {args.num_attempts} generation round(s)")
     if args.problem_index is not None:
         print(f"Using problem index: {args.problem_index}")
     print()
@@ -230,7 +232,7 @@ async def main():
         tokenizer=tokenizer,
         client=client,
         sampling_params=sampling_params,
-        num_ignores=args.num_ignores,
+        num_attempts=args.num_attempts,
     )
     print(f"Final reward: {reward:.3f}")
 
