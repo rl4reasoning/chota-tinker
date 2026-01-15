@@ -5,6 +5,8 @@ Custom GEM environment for INTELLECT-3-RL dataset with multi-turn Python REPL.
 import json
 import re
 import random
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Optional, Tuple
 from datasets import Dataset, load_dataset
 from gem.core import Env
@@ -181,6 +183,7 @@ class IntellectCodeEnv(Env):
             tests=self.tests,
             max_tests=self.max_tests,
             timeout_s=timeout_s,
+            require_solution_class=True,
         )
 
     def _evaluate(self, code: str) -> float:
@@ -237,6 +240,34 @@ class IntellectCodeEnv(Env):
             return "```python\nprint('hello')\n```"
 
 
+def _run_python_batch_item(item: tuple[str, str]) -> tuple[bool, str, str]:
+    """Helper function to run Python code in a worker process (must be at module level for pickling)."""
+    code, sandbox_type = item
+    return run_python(code, sandbox_type)
+
+
+def _run_python_batch(
+    codes_and_sandboxes: list[tuple[str, str]],
+    max_workers: int,
+    batch_size: int,
+) -> list[tuple[bool, str, str]]:
+    """Batch execute Python code in parallel."""
+    if not codes_and_sandboxes:
+        return []
+    
+    if max_workers <= 1 and batch_size <= 1:
+        return [run_python(code, sandbox_type) for code, sandbox_type in codes_and_sandboxes]
+    
+    if batch_size <= 0:
+        batch_size = 1
+    
+    mp_context = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_context) as executor:
+        results = list(executor.map(_run_python_batch_item, codes_and_sandboxes))
+    
+    return results
+
+
 def step_batch(
     envs: list[IntellectCodeEnv],
     actions: list[str],
@@ -251,13 +282,18 @@ def step_batch(
     results: list[Optional[Tuple[str, float, bool, bool, dict[str, Any]]]] = [None] * len(envs)
     eval_tasks: list[EvalTask] = []
     eval_indices: list[int] = []
+    
+    # Collect interaction tasks for parallel execution
+    interact_tasks: list[tuple[int, str]] = []
+    interact_indices: list[int] = []
 
     for idx, (env, action) in enumerate(zip(envs, actions)):
         env.current_turn += 1
 
         python_code = env._extract_interact_code(action)
         if python_code:
-            results[idx] = env._handle_interact(python_code)
+            interact_tasks.append((idx, python_code))
+            interact_indices.append(idx)
             continue
 
         answer_code = env._extract_answer_code(action)
@@ -271,12 +307,41 @@ def step_batch(
                     tests=env.tests,
                     max_tests=env.max_tests,
                     timeout_s=eval_timeout_s,
+                    require_solution_class=True,
                 )
             )
             eval_indices.append(idx)
             continue
 
         results[idx] = env._handle_invalid()
+
+    # Batch execute interactions in parallel
+    if interact_tasks:
+        codes_and_sandboxes = [
+            (python_code, envs[idx].sandbox_type)
+            for idx, python_code in interact_tasks
+        ]
+        interact_results = _run_python_batch(
+            codes_and_sandboxes,
+            max_workers=eval_workers,
+            batch_size=eval_batch_size,
+        )
+        
+        for (idx, python_code), (success, stdout, stderr) in zip(interact_tasks, interact_results):
+            env = envs[idx]
+            if success:
+                output = stdout if stdout else "(no output during interaction -- did you forget to print? did you enclose the code correctly in <interact></interact>?)"
+            else:
+                output = f"Error:\n{stderr}" if stderr else "Error: execution failed."
+            
+            env.history.append({"code": python_code, "output": output})
+            env.has_interacted = True
+            obs = f"<output>\n{output}</output>"
+            
+            if env.current_turn >= env.max_turns:
+                results[idx] = (obs, 0.0, True, True, {"truncated": True})
+            else:
+                results[idx] = (obs, 0.0, False, False, {})
 
     if eval_tasks:
         if eval_workers <= 1 and eval_batch_size <= 1:

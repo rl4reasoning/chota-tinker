@@ -189,6 +189,7 @@ def run_batched_rollouts(
             tests=env.tests,
             max_tests=env.max_tests,
             timeout_s=args.eval_timeout_s,
+            require_solution_class=True,
         )
         for (problem_idx, sample_idx, env, messages), response in zip(envs, responses)
     ]

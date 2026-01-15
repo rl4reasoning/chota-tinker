@@ -19,6 +19,8 @@ class EvalTask:
     tests: dict[str, Any]
     max_tests: int
     timeout_s: Optional[float]
+    max_timeout_records: int = 0
+    require_solution_class: bool = True
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,8 @@ class EvalResult:
     reward: float
     terminated: bool
     truncated: bool
+    timeout_count: int = 0
+    timeout_indices: tuple[int, ...] = ()
 
 
 @contextlib.contextmanager
@@ -123,8 +127,10 @@ def _build_multi_test_harness(
     outputs: list[str],
     fn_name: Optional[str],
     timeout_s: Optional[float],
+    timeout_record_limit: int,
 ) -> str:
     safe_timeout = timeout_s if timeout_s and timeout_s > 0 else None
+    safe_timeout_records = max(timeout_record_limit, 0)
     return f"""
 import contextlib
 import io
@@ -137,18 +143,24 @@ _inputs = {repr(inputs)}
 _expected = {repr(outputs)}
 _fn_name = {repr(fn_name)}
 _timeout_s = {repr(safe_timeout)}
+_timeout_record_limit = {repr(safe_timeout_records)}
+
+class _TimeoutException(Exception):
+    pass
 
 def _run_with_timeout(func, timeout_s):
     if not timeout_s:
-        return True, func()
+        return True, func(), False
     def _handler(signum, frame):
-        raise TimeoutError("Execution timed out")
+        raise _TimeoutException("Execution timed out")
     old_handler = signal.signal(signal.SIGALRM, _handler)
     signal.setitimer(signal.ITIMER_REAL, timeout_s)
     try:
-        return True, func()
+        return True, func(), False
+    except _TimeoutException:
+        return False, None, True
     except Exception:
-        return False, None
+        return False, None, False
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, old_handler)
@@ -177,7 +189,9 @@ def _run_solution_case():
         return None
     passed = 0
     total = len(_inputs)
-    for input_expr, expected in zip(_inputs, _expected):
+    timeout_count = 0
+    timeout_indices = []
+    for idx, (input_expr, expected) in enumerate(zip(_inputs, _expected)):
         def _call():
             local = {{}}
             exec("_input = " + input_expr, {{}}, local)
@@ -187,17 +201,23 @@ def _run_solution_case():
                 _result = getattr(sol, _fn_name)(_input)
                 print(_result)
             return buf.getvalue().strip()
-        ok, actual = _run_with_timeout(_call, _timeout_s)
+        ok, actual, timed_out = _run_with_timeout(_call, _timeout_s)
+        if timed_out:
+            timeout_count += 1
+            if len(timeout_indices) < _timeout_record_limit:
+                timeout_indices.append(idx)
         expected_clean = _normalize_expected(expected)
         if ok and _compare(actual, expected_clean):
             passed += 1
-    return {{"passed": passed, "total": total}}
+    return {{"passed": passed, "total": total, "timeouts": timeout_count, "timeout_indices": timeout_indices}}
 
 def _run_script_case():
     compiled = compile(_code, "<solution>", "exec")
     passed = 0
     total = len(_inputs)
-    for inp, expected in zip(_inputs, _expected):
+    timeout_count = 0
+    timeout_indices = []
+    for idx, (inp, expected) in enumerate(zip(_inputs, _expected)):
         def _call():
             stdout_buffer = io.StringIO()
             stderr_buffer = io.StringIO()
@@ -214,36 +234,59 @@ def _run_script_case():
                 sys.stdin = old_stdin
                 sys.stdout = old_stdout
                 sys.stderr = old_stderr
-        ok, actual = _run_with_timeout(_call, _timeout_s)
+        ok, actual, timed_out = _run_with_timeout(_call, _timeout_s)
+        if timed_out:
+            timeout_count += 1
+            if len(timeout_indices) < _timeout_record_limit:
+                timeout_indices.append(idx)
         expected_clean = _normalize_expected(expected)
         if ok and _compare(actual, expected_clean):
             passed += 1
-    return {{"passed": passed, "total": total}}
+    return {{"passed": passed, "total": total, "timeouts": timeout_count, "timeout_indices": timeout_indices}}
 
 _result = None
+# Auto-detect: if fn_name exists and code has Solution class, use Solution execution
+# Otherwise, fall back to stdin-based execution
 if _fn_name and "class Solution" in _code:
     _result = _run_solution_case()
 if _result is None:
+    # No fn_name or no Solution class, use stdin-based execution
     _result = _run_script_case()
 print(json.dumps(_result))
 """
 
 
-def _parse_harness_output(stdout: str) -> float:
+def _parse_harness_output(stdout: str) -> tuple[float, int, tuple[int, ...]]:
     if not stdout:
-        return 0.0
+        return 0.0, 0, ()
     try:
         payload = json.loads(stdout.strip().splitlines()[-1])
         total = int(payload.get("total", 0))
+        timeout_count = int(payload.get("timeouts", 0) or 0)
+        raw_indices = payload.get("timeout_indices") or []
+        timeout_indices: list[int] = []
+        for idx in raw_indices:
+            try:
+                timeout_indices.append(int(idx))
+            except (TypeError, ValueError):
+                continue
+        timeout_indices_tuple = tuple(timeout_indices)
         if total <= 0:
-            return 0.0
+            return 0.0, timeout_count, timeout_indices_tuple
         passed = int(payload.get("passed", 0))
-        return passed / total
+        return passed / total, timeout_count, timeout_indices_tuple
     except (ValueError, TypeError, json.JSONDecodeError):
-        return 0.0
+        return 0.0, 0, ()
 
 
-def _evaluate_code(code: str, tests: dict[str, Any], max_tests: int, timeout_s: Optional[float]) -> float:
+def _evaluate_code(
+    code: str,
+    tests: dict[str, Any],
+    max_tests: int,
+    timeout_s: Optional[float],
+    timeout_record_limit: int,
+    require_solution_class: bool,
+) -> tuple[float, int, tuple[int, ...]]:
     inputs, outputs = _select_tests(tests, max_tests)
     normalized_inputs = [_normalize_io(inp) for inp in inputs]
     normalized_outputs = [_normalize_io(expected) for expected in outputs]
@@ -254,23 +297,66 @@ def _evaluate_code(code: str, tests: dict[str, Any], max_tests: int, timeout_s: 
         outputs=[str(exp) if exp is not None else "" for exp in normalized_outputs],
         fn_name=tests.get("fn_name", None),
         timeout_s=timeout_s,
+        timeout_record_limit=timeout_record_limit,
     )
     success, stdout, _ = _exec_code(harness, None, None)
     if not success:
-        return 0.0
+        return 0.0, 0, ()
     return _parse_harness_output(stdout)
 
 
 def evaluate_task(task: EvalTask) -> EvalResult:
     if _extract_interact_code(task.response):
-        return EvalResult(reward=0.0, terminated=True, truncated=True)
+        return EvalResult(
+            reward=0.0,
+            terminated=True,
+            truncated=True,
+            timeout_count=0,
+            timeout_indices=(),
+        )
 
     answer_code = _extract_answer_code(task.response)
     if not answer_code:
-        return EvalResult(reward=0.0, terminated=True, truncated=True)
+        return EvalResult(
+            reward=0.0,
+            terminated=True,
+            truncated=True,
+            timeout_count=0,
+            timeout_indices=(),
+        )
 
-    reward = _evaluate_code(answer_code, task.tests, task.max_tests, task.timeout_s)
-    return EvalResult(reward=reward, terminated=True, truncated=False)
+    # If require_solution_class is True and problem has fn_name, enforce Solution class requirement
+    if task.require_solution_class:
+        fn_name = None
+        if isinstance(task.tests, dict):
+            fn_name = task.tests.get("fn_name")
+        # Only invalidate if problem expects Solution class (has fn_name) but code doesn't have it
+        if fn_name and "class Solution" not in answer_code:
+            return EvalResult(
+                reward=0.0,
+                terminated=True,
+                truncated=True,
+                timeout_count=0,
+                timeout_indices=(),
+                invalidated=True,
+            )
+        # If no fn_name, allow stdin-based execution even with require_solution_class=True
+
+    reward, timeout_count, timeout_indices = _evaluate_code(
+        answer_code,
+        task.tests,
+        task.max_tests,
+        task.timeout_s,
+        task.max_timeout_records,
+        task.require_solution_class,
+    )
+    return EvalResult(
+        reward=reward,
+        terminated=True,
+        truncated=False,
+        timeout_count=timeout_count,
+        timeout_indices=timeout_indices,
+    )
 
 
 def _evaluate_task_batch(tasks: list[EvalTask]) -> list[EvalResult]:
