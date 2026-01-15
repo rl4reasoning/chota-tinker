@@ -24,6 +24,7 @@ from transformers import AutoTokenizer
 from tqdm import tqdm
 
 from intellect_env import IntellectCodeEnv
+from utils.fast_eval import EvalTask, evaluate_tasks
 from utils.pass_at_k import compute_pass_at_k
 
 # Backend imports (conditional)
@@ -181,19 +182,31 @@ def run_batched_rollouts(
     # Process responses and collect results
     print(f"Evaluating responses...")
     all_trajectories: list[list[dict]] = [[] for _ in range(args.num_problems)]
-    
-    for (problem_idx, sample_idx, env, messages), response in tqdm(zip(envs, responses), total=len(envs), desc="Evaluating"):
+
+    eval_tasks = [
+        EvalTask(
+            response=response,
+            tests=env.tests,
+            max_tests=env.max_tests,
+            timeout_s=args.eval_timeout_s,
+        )
+        for (problem_idx, sample_idx, env, messages), response in zip(envs, responses)
+    ]
+    eval_results = evaluate_tasks(
+        eval_tasks,
+        max_workers=args.eval_workers,
+        show_progress=True,
+    )
+
+    for (problem_idx, sample_idx, env, messages), response, eval_result in zip(envs, responses, eval_results):
         messages.append({"role": "assistant", "content": response})
-        
-        # Step to get reward (will evaluate the code)
-        _, reward, terminated, truncated, info = env.step(response)
-        
+
         traj = {
             "question": env.question,
             "messages": messages,
-            "final_reward": reward,
-            "terminated": terminated,
-            "truncated": truncated,
+            "final_reward": eval_result.reward,
+            "terminated": eval_result.terminated,
+            "truncated": eval_result.truncated,
             "tests": env.tests,
         }
         all_trajectories[problem_idx].append(traj)
@@ -335,6 +348,10 @@ if __name__ == "__main__":
                         help="URL for vLLM server (e.g. http://localhost:8000). If not set, uses local vLLM.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
                         help="GPU memory utilization for local vLLM (default: 0.9)")
+    parser.add_argument("--eval-workers", type=int, default=max(1, min(32, os.cpu_count() or 1)),
+                        help="Number of parallel evaluator workers (default: min(32, cpu_count))")
+    parser.add_argument("--eval-timeout-s", type=float, default=5.0,
+                        help="Per-test timeout in seconds for fast evaluation (default: 5.0)")
     
     args = parser.parse_args()
     main(args)
