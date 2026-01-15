@@ -32,7 +32,7 @@ from datasets import Dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
-from intellect_env import IntellectCodeEnv
+from intellect_env import IntellectCodeEnv, step_batch
 from utils.pass_at_k import compute_pass_at_k
 
 # Backend imports (conditional)
@@ -258,15 +258,31 @@ def run_batched_rollouts_with_budget_forcing(
     
     # Evaluate all completed states
     print(f"\nEvaluating {len(completed_states)} trajectories...")
-    for state in tqdm(completed_states, desc="Evaluating"):
-        # Add assistant response to messages
-        state.messages.append({"role": "assistant", "content": state.full_response})
-        
-        # Step environment to get reward
-        _, reward, terminated, truncated, info = state.env.step(state.full_response)
-        state.reward = reward
-        state.terminated = terminated
-        state.truncated = truncated
+    if args.fast_eval:
+        results = step_batch(
+            [state.env for state in completed_states],
+            [state.full_response for state in completed_states],
+            eval_workers=args.eval_workers,
+            eval_batch_size=args.eval_batch_size,
+            eval_timeout_s=args.eval_timeout_s,
+            show_progress=True,
+        )
+        for state, (_obs, reward, terminated, truncated, info) in zip(completed_states, results):
+            # Add assistant response to messages
+            state.messages.append({"role": "assistant", "content": state.full_response})
+            state.reward = reward
+            state.terminated = terminated
+            state.truncated = truncated
+    else:
+        for state in tqdm(completed_states, desc="Evaluating"):
+            # Add assistant response to messages
+            state.messages.append({"role": "assistant", "content": state.full_response})
+            
+            # Step environment to get reward
+            _, reward, terminated, truncated, info = state.env.step(state.full_response)
+            state.reward = reward
+            state.terminated = terminated
+            state.truncated = truncated
     
     # Organize results by problem
     all_trajectories: list[list[dict]] = [[] for _ in range(args.num_problems)]
@@ -437,6 +453,14 @@ if __name__ == "__main__":
                         help="GPU memory utilization for local vLLM (default: 0.5)")
     parser.add_argument("--max-model-len", type=int, default=32768,
                         help="Maximum model context length for vLLM (default: None, uses model default)")
+    parser.add_argument("--fast-eval", action="store_true",
+                        help="Use parallel fast eval for final answers")
+    parser.add_argument("--eval-workers", type=int, default=max(1, min(32, os.cpu_count() or 1)),
+                        help="Number of parallel evaluator workers (default: min(32, cpu_count))")
+    parser.add_argument("--eval-batch-size", type=int, default=8,
+                        help="Number of responses per evaluator task (default: 8)")
+    parser.add_argument("--eval-timeout-s", type=float, default=5.0,
+                        help="Per-test timeout in seconds for fast evaluation (default: 5.0)")
     
     args = parser.parse_args()
     main(args)

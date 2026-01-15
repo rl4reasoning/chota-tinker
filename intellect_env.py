@@ -9,6 +9,7 @@ from typing import Any, Optional, Tuple
 from datasets import Dataset, load_dataset
 from gem.core import Env
 from gem.utils.sandbox import run_python
+from utils.fast_eval import EvalTask, evaluate_task, evaluate_tasks
 
 
 class IntellectCodeEnv(Env):
@@ -90,52 +91,23 @@ class IntellectCodeEnv(Env):
         # check for interactive python code FIRST (takes priority over final answer)
         python_code = self._extract_interact_code(action)
         if python_code:
-            try:
-                success, stdout, stderr = run_python(python_code, self.sandbox_type)
-                if success:
-                    output = stdout if stdout else "(no output during interaction -- did you forget to print? did you enclose the code correctly in <interact></interact>?)"
-                else:
-                    output = f"Error:\n{stderr}" if stderr else "Error: execution failed."
-            except Exception as e:
-                success = False
-                output = f"Error: failed to execute code - {str(e)}"
-            
-            self.history.append({"code": python_code, "output": output})
-            self.has_interacted = True  # Mark that interaction occurred
-            obs = f"<output>\n{output}</output>"
-            
-            if self.current_turn >= self.max_turns:
-                return obs, 0.0, True, True, {"truncated": True}
-            
-            return obs, 0.0, False, False, {}
+            return self._handle_interact(python_code)
         
         # check for final answer (only if no <interact> tag)
         answer_code = self._extract_answer_code(action)
         if answer_code:
-            # Require at least one interaction before final answer
-            if not self.has_interacted:
-                obs = "<output>You must interact at least once before submitting your final answer. Use <interact> ... your code here ... </interact> to test your code first. Remember to pass in the inputs yourself.</output>"
-                if self.current_turn >= self.max_turns:
-                    return obs, 0.0, True, True, {"truncated": True}
-                return obs, 0.0, False, False, {}
-            
-            reward = self._evaluate(answer_code)
-            return "", reward, True, False, {"final": True}
+            return self._handle_final(answer_code)
         
         # no valid code found
-        obs = "<output>No valid code block found. Use <interact></interact> or ```python```.</output>"
-        
-        if self.current_turn >= self.max_turns:
-            return obs, 0.0, True, True, {"truncated": True}
-        
-        return obs, 0.0, False, False, {}
+        return self._handle_invalid()
 
     def _build_observation(self, content: str) -> str:
         if self.system_prompt:
             return f"{self.system_prompt}\n\n{content}"
         return content
 
-    def _extract_interact_code(self, text: str) -> Optional[str]:
+    @staticmethod
+    def _extract_interact_code(text: str) -> Optional[str]:
         # match <interact>...</interact> for interactive execution
         pattern = r"<interact>(.*?)</interact>"
         matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
@@ -149,13 +121,67 @@ class IntellectCodeEnv(Env):
             return content
         return None
 
-    def _extract_answer_code(self, text: str) -> Optional[str]:
+    @staticmethod
+    def _extract_answer_code(text: str) -> Optional[str]:
         # match ```python for final answer
         pattern = r"```python\n?(.*?)```"
         matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
         if matches:
             return matches[-1].strip()
         return None
+
+    def _handle_interact(self, python_code: str) -> Tuple[str, float, bool, bool, dict[str, Any]]:
+        try:
+            success, stdout, stderr = run_python(python_code, self.sandbox_type)
+            if success:
+                output = stdout if stdout else "(no output during interaction -- did you forget to print? did you enclose the code correctly in <interact></interact>?)"
+            else:
+                output = f"Error:\n{stderr}" if stderr else "Error: execution failed."
+        except Exception as e:
+            output = f"Error: failed to execute code - {str(e)}"
+
+        self.history.append({"code": python_code, "output": output})
+        self.has_interacted = True  # Mark that interaction occurred
+        obs = f"<output>\n{output}</output>"
+
+        if self.current_turn >= self.max_turns:
+            return obs, 0.0, True, True, {"truncated": True}
+
+        return obs, 0.0, False, False, {}
+
+    def _handle_requires_interaction(self) -> Tuple[str, float, bool, bool, dict[str, Any]]:
+        obs = "<output>You must interact at least once before submitting your final answer. Use <interact> ... your code here ... </interact> to test your code first. Remember to pass in the inputs yourself.</output>"
+        if self.current_turn >= self.max_turns:
+            return obs, 0.0, True, True, {"truncated": True}
+        return obs, 0.0, False, False, {}
+
+    def _handle_invalid(self) -> Tuple[str, float, bool, bool, dict[str, Any]]:
+        obs = "<output>No valid code block found. Use <interact></interact> or ```python```.</output>"
+        if self.current_turn >= self.max_turns:
+            return obs, 0.0, True, True, {"truncated": True}
+        return obs, 0.0, False, False, {}
+
+    def _handle_final(self, answer_code: str) -> Tuple[str, float, bool, bool, dict[str, Any]]:
+        # Require at least one interaction before final answer
+        if not self.has_interacted:
+            return self._handle_requires_interaction()
+
+        reward = self._evaluate(answer_code)
+        return "", reward, True, False, {"final": True}
+
+    def build_eval_task(self, action: str, timeout_s: Optional[float]) -> Optional[EvalTask]:
+        if self._extract_interact_code(action):
+            return None
+        if not self._extract_answer_code(action):
+            return None
+        if not self.has_interacted:
+            return None
+        return EvalTask(
+            response=action,
+            tests=self.tests,
+            max_tests=self.max_tests,
+            timeout_s=timeout_s,
+        )
 
     def _evaluate(self, code: str) -> float:
         tests = self.tests
@@ -209,4 +235,65 @@ class IntellectCodeEnv(Env):
             return "<interact>\nprint('hello')\n</interact>"
         else:
             return "```python\nprint('hello')\n```"
+
+
+def step_batch(
+    envs: list[IntellectCodeEnv],
+    actions: list[str],
+    eval_workers: int,
+    eval_batch_size: int,
+    eval_timeout_s: Optional[float],
+    show_progress: bool = False,
+) -> list[Tuple[str, float, bool, bool, dict[str, Any]]]:
+    if len(envs) != len(actions):
+        raise ValueError("envs and actions must be the same length")
+
+    results: list[Optional[Tuple[str, float, bool, bool, dict[str, Any]]]] = [None] * len(envs)
+    eval_tasks: list[EvalTask] = []
+    eval_indices: list[int] = []
+
+    for idx, (env, action) in enumerate(zip(envs, actions)):
+        env.current_turn += 1
+
+        python_code = env._extract_interact_code(action)
+        if python_code:
+            results[idx] = env._handle_interact(python_code)
+            continue
+
+        answer_code = env._extract_answer_code(action)
+        if answer_code:
+            if not env.has_interacted:
+                results[idx] = env._handle_requires_interaction()
+                continue
+            eval_tasks.append(
+                EvalTask(
+                    response=action,
+                    tests=env.tests,
+                    max_tests=env.max_tests,
+                    timeout_s=eval_timeout_s,
+                )
+            )
+            eval_indices.append(idx)
+            continue
+
+        results[idx] = env._handle_invalid()
+
+    if eval_tasks:
+        if eval_workers <= 1 and eval_batch_size <= 1:
+            eval_results = [evaluate_task(task) for task in eval_tasks]
+        else:
+            eval_results = evaluate_tasks(
+                eval_tasks,
+                max_workers=eval_workers,
+                batch_size=eval_batch_size,
+                show_progress=show_progress,
+            )
+        for idx, eval_result in zip(eval_indices, eval_results):
+            results[idx] = ("", eval_result.reward, True, eval_result.truncated, {"final": True})
+
+    for result in results:
+        if result is None:
+            raise RuntimeError("Missing batch step result")
+
+    return results
 
