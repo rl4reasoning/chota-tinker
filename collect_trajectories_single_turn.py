@@ -195,6 +195,7 @@ def run_batched_rollouts(
     eval_results = evaluate_tasks(
         eval_tasks,
         max_workers=args.eval_workers,
+        batch_size=args.eval_batch_size,
         show_progress=True,
     )
 
@@ -350,6 +351,8 @@ if __name__ == "__main__":
                         help="GPU memory utilization for local vLLM (default: 0.9)")
     parser.add_argument("--eval-workers", type=int, default=max(1, min(32, os.cpu_count() or 1)),
                         help="Number of parallel evaluator workers (default: min(32, cpu_count))")
+    parser.add_argument("--eval-batch-size", type=int, default=8,
+                        help="Number of responses per evaluator task (default: 8)")
     parser.add_argument("--eval-timeout-s", type=float, default=5.0,
                         help="Per-test timeout in seconds for fast evaluation (default: 5.0)")
     
