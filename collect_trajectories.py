@@ -6,9 +6,7 @@ Usage:
     --model Qwen/Qwen3-4B-Instruct-2507 \
     --backend vllm \
     --num-problems 30 \
-    --num-samples 32
-    
-     \
+    --num-samples 32 \
     --push-to-hub bicycleman15/qwen3_4b_instruct_easy_medium
 
 """

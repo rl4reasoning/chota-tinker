@@ -1,0 +1,44 @@
+[project]
+name = "chota-tinker"
+version = "0.1.0"
+description = "Minimal Tinker-like training API in PyTorch for RL research"
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    # Core ML (torch needs special install for CUDA, see README)
+    "transformers[hf_xet]==4.54.0",
+    "datasets",
+    "peft",
+    "accelerate",
+    "numpy<2.0.0",
+    "pyarrow>=19.0.1",
+    
+    # Inference
+    "vllm>=0.8.4",
+    
+    # Utilities
+    "math-verify",
+    "tqdm",
+    "requests",
+    
+    # GEM environment for agentic LLMs
+    "gem-llm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "ipython"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["chota_tinker", "utils"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]

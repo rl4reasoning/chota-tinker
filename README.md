@@ -11,6 +11,18 @@ why another RL lib?
 > [!TIP]
 > "chota" stands for mini in Hindi 😄
 
+# Installation
+
+```bash
+# Load modules (for Compute Canada clusters)
+module load cuda/12.6 httpproxy gcc arrow/19.0.1 python/3.12 opencv/4.11
+
+# Create venv and install
+export UV_CACHE_DIR=$SCRATCH/.uv_cache
+uv venv --python=3.12 && source .venv/bin/activate
+uv pip install -e .
+```
+
 
 ## TODOs
 - [x] see if training works or not
