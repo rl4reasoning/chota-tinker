@@ -4,7 +4,7 @@
 #SBATCH --output=/scratch/jp7467/slurm_logs/%j_%x.out
 #SBATCH --error=/scratch/jp7467/slurm_logs/%j_%x.err
 #SBATCH --export=ALL
-#SBATCH --time=4:00:00
+#SBATCH --time=12:00:00
 #SBATCH --gres=gpu:h200:1
 #SBATCH --account=torch_pr_235_cds
 #SBATCH --mem=100G
@@ -19,14 +19,18 @@ source ~/.bashrc
 conda activate
 conda activate ct
 
-python collect_trajectories_budget_forcing.py \
+python collect_trajectories_single_turn.py \
         --dataset bicycleman15/intellect_3_code_very_hard \
         --model Qwen/Qwen3-4B-Instruct-2507 \
         --backend vllm \
-        --num-problems 30 \
-        --num-samples 32 \
-        --num-ignores 5 \
-        --push-to-hub bicycleman15/qwen3_4b_very_hard_s1_x5_4K_32K
+        --num-problems 100 \
+        --num-samples 160 \
+        \
+        --fast-eval \
+        --eval-workers 16 \
+        --eval-batch-size 8 \
+        --eval-timeout-s 1.0 \
+        --push-to-hub bicycleman15/1k_160_single_turn
 
 ################################################
 

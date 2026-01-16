@@ -145,7 +145,7 @@ class IntellectCodeEnv(Env):
         config: str = "code",
         split: str = "train",
         max_turns: int = 5,
-        max_tests: int = 12,
+        max_tests: int = 15,
         interaction_timeout_s: Optional[float] = None,
         sandbox_type: str = "none",
         seed: int = 0,
@@ -371,23 +371,37 @@ def _run_python_batch(
     max_workers: int,
     batch_size: int,
     executor: Optional[ProcessPoolExecutor] = None,
+    show_progress: bool = False,
+    progress_desc: str = "Interactions",
 ) -> list[tuple[bool, str, str]]:
     """Batch execute interaction code in parallel (no sandbox)."""
     if not codes_and_timeouts:
         return []
     
     if executor is not None:
-        return list(executor.map(_run_python_batch_item, codes_and_timeouts))
+        results_iter = executor.map(_run_python_batch_item, codes_and_timeouts)
+        if show_progress:
+            from tqdm import tqdm
+            results_iter = tqdm(results_iter, total=len(codes_and_timeouts), desc=progress_desc)
+        return list(results_iter)
 
     if max_workers <= 1 and batch_size <= 1:
-        return [_exec_interaction_code(code, timeout_s) for code, timeout_s in codes_and_timeouts]
+        results_iter = (_exec_interaction_code(code, timeout_s) for code, timeout_s in codes_and_timeouts)
+        if show_progress:
+            from tqdm import tqdm
+            results_iter = tqdm(results_iter, total=len(codes_and_timeouts), desc=progress_desc)
+        return list(results_iter)
     
     if batch_size <= 0:
         batch_size = 1
     
     mp_context = mp.get_context("spawn")
     with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_context) as executor:
-        results = list(executor.map(_run_python_batch_item, codes_and_sandboxes))
+        results_iter = executor.map(_run_python_batch_item, codes_and_timeouts)
+        if show_progress:
+            from tqdm import tqdm
+            results_iter = tqdm(results_iter, total=len(codes_and_timeouts), desc=progress_desc)
+        results = list(results_iter)
     
     return results
 
@@ -450,6 +464,7 @@ def step_batch(
             (python_code, interact_timeout_s)
             for idx, python_code in interact_tasks
         ]
+        interaction_show_progress = show_progress and len(codes_and_timeouts) > 1
         if len(codes_and_timeouts) == 1:
             interact_results = [_exec_interaction_code(codes_and_timeouts[0][0], codes_and_timeouts[0][1])]
         else:
@@ -461,6 +476,8 @@ def step_batch(
                 max_workers=eval_workers,
                 batch_size=eval_batch_size,
                 executor=interaction_executor,
+                show_progress=interaction_show_progress,
+                progress_desc="Interactions",
             )
         
         for (idx, python_code), (success, stdout, stderr) in zip(interact_tasks, interact_results):

@@ -1,12 +1,18 @@
 """Collect single-turn trajectories and save as HuggingFace dataset.
 
 Usage:
+
     python collect_trajectories_single_turn.py \
-    --dataset bicycleman15/intellect_3_code_easy_medium \
+    --dataset bicycleman15/intellect_3_code_very_hard \
     --model Qwen/Qwen3-4B-Instruct-2507 \
     --backend vllm \
-    --num-problems 20 \
-    --num-samples 8 \
+    --num-problems 1 \
+    --num-samples 32 \
+    \
+    --fast-eval \
+    --eval-workers 16 \
+    --eval-batch-size 8 \
+    --eval-timeout-s 1.0 \
     --push-to-hub bicycleman15/qwen3_4b_instruct_easy_medium_single_turn
 """
 
@@ -348,13 +354,13 @@ if __name__ == "__main__":
                         help="Inference backend: 'tinker' or 'vllm' (default: vllm)")
     parser.add_argument("--vllm-server-url", type=str, default=None,
                         help="URL for vLLM server (e.g. http://localhost:8000). If not set, uses local vLLM.")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8,
                         help="GPU memory utilization for local vLLM (default: 0.9)")
-    parser.add_argument("--eval-workers", type=int, default=max(1, min(32, os.cpu_count() or 1)),
+    parser.add_argument("--eval-workers", type=int, default=16,
                         help="Number of parallel evaluator workers (default: min(32, cpu_count))")
     parser.add_argument("--eval-batch-size", type=int, default=8,
                         help="Number of responses per evaluator task (default: 8)")
-    parser.add_argument("--eval-timeout-s", type=float, default=5.0,
+    parser.add_argument("--eval-timeout-s", type=float, default=1,
                         help="Per-test timeout in seconds for fast evaluation (default: 5.0)")
     
     args = parser.parse_args()

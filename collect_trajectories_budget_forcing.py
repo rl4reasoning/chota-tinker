@@ -12,9 +12,14 @@ Usage:
         --dataset bicycleman15/intellect_3_code_very_hard \
         --model Qwen/Qwen3-4B-Instruct-2507 \
         --backend vllm \
-        --num-problems 30 \
+        --num-problems 2 \
         --num-samples 32 \
         --num-attempts 5 \
+        \
+        --fast-eval \
+        --eval-workers 16 \
+        --eval-batch-size 8 \
+        --eval-timeout-s 1.0 \
         --push-to-hub bicycleman15/qwen3_4b_very_hard_s1_x5
 """
 
@@ -459,7 +464,7 @@ if __name__ == "__main__":
                         help="Number of parallel evaluator workers (default: min(32, cpu_count))")
     parser.add_argument("--eval-batch-size", type=int, default=8,
                         help="Number of responses per evaluator task (default: 8)")
-    parser.add_argument("--eval-timeout-s", type=float, default=5.0,
+    parser.add_argument("--eval-timeout-s", type=float, default=1,
                         help="Per-test timeout in seconds for fast evaluation (default: 5.0)")
     
     args = parser.parse_args()
