@@ -1,12 +1,18 @@
 """Collect single-turn trajectories and save as HuggingFace dataset.
 
 Usage:
+
     python collect_trajectories_single_turn.py \
-    --dataset bicycleman15/intellect_3_code_easy_medium \
+    --dataset bicycleman15/intellect_3_code_very_hard \
     --model Qwen/Qwen3-4B-Instruct-2507 \
     --backend vllm \
-    --num-problems 20 \
-    --num-samples 8 \
+    --num-problems 1 \
+    --num-samples 32 \
+    \
+    --fast-eval \
+    --eval-workers 16 \
+    --eval-batch-size 8 \
+    --eval-timeout-s 1.0 \
     --push-to-hub bicycleman15/qwen3_4b_instruct_easy_medium_single_turn
 """
 
@@ -24,6 +30,7 @@ from transformers import AutoTokenizer
 from tqdm import tqdm
 
 from intellect_env import IntellectCodeEnv
+from utils.fast_eval import EvalTask, evaluate_tasks
 from utils.pass_at_k import compute_pass_at_k
 
 # Backend imports (conditional)
@@ -181,19 +188,33 @@ def run_batched_rollouts(
     # Process responses and collect results
     print(f"Evaluating responses...")
     all_trajectories: list[list[dict]] = [[] for _ in range(args.num_problems)]
-    
-    for (problem_idx, sample_idx, env, messages), response in tqdm(zip(envs, responses), total=len(envs), desc="Evaluating"):
+
+    eval_tasks = [
+        EvalTask(
+            response=response,
+            tests=env.tests,
+            max_tests=env.max_tests,
+            timeout_s=args.eval_timeout_s,
+            require_solution_class=True,
+        )
+        for (problem_idx, sample_idx, env, messages), response in zip(envs, responses)
+    ]
+    eval_results = evaluate_tasks(
+        eval_tasks,
+        max_workers=args.eval_workers,
+        batch_size=args.eval_batch_size,
+        show_progress=True,
+    )
+
+    for (problem_idx, sample_idx, env, messages), response, eval_result in zip(envs, responses, eval_results):
         messages.append({"role": "assistant", "content": response})
-        
-        # Step to get reward (will evaluate the code)
-        _, reward, terminated, truncated, info = env.step(response)
-        
+
         traj = {
             "question": env.question,
             "messages": messages,
-            "final_reward": reward,
-            "terminated": terminated,
-            "truncated": truncated,
+            "final_reward": eval_result.reward,
+            "terminated": eval_result.terminated,
+            "truncated": eval_result.truncated,
             "tests": env.tests,
         }
         all_trajectories[problem_idx].append(traj)
@@ -333,8 +354,14 @@ if __name__ == "__main__":
                         help="Inference backend: 'tinker' or 'vllm' (default: vllm)")
     parser.add_argument("--vllm-server-url", type=str, default=None,
                         help="URL for vLLM server (e.g. http://localhost:8000). If not set, uses local vLLM.")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8,
                         help="GPU memory utilization for local vLLM (default: 0.9)")
+    parser.add_argument("--eval-workers", type=int, default=16,
+                        help="Number of parallel evaluator workers (default: min(32, cpu_count))")
+    parser.add_argument("--eval-batch-size", type=int, default=8,
+                        help="Number of responses per evaluator task (default: 8)")
+    parser.add_argument("--eval-timeout-s", type=float, default=1,
+                        help="Per-test timeout in seconds for fast evaluation (default: 5.0)")
     
     args = parser.parse_args()
     main(args)

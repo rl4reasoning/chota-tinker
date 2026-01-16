@@ -216,6 +216,7 @@ private_stuff.sh
 
 idle.py
 
+local_artifacts/
 artifacts/
 
 tmp*/
