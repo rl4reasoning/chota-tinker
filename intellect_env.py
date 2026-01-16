@@ -2,16 +2,133 @@
 Custom GEM environment for INTELLECT-3-RL dataset with multi-turn Python REPL.
 """
 
+import atexit
+import contextlib
+import io
 import json
+import os
 import re
 import random
+import signal
 import multiprocessing as mp
+import traceback
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Optional, Tuple
 from datasets import Dataset, load_dataset
 from gem.core import Env
 from gem.utils.sandbox import run_python
 from utils.fast_eval import EvalTask, evaluate_task, evaluate_tasks
+
+
+@contextlib.contextmanager
+def _time_limit(seconds: Optional[float]):
+    if not seconds or seconds <= 0:
+        yield
+        return
+
+    def _handler(signum, frame):
+        raise TimeoutError("Execution timed out")
+
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
+def _exec_interaction_code(code: str, timeout_s: Optional[float]) -> tuple[bool, str, str]:
+    """Execute interaction code in-process (no sandbox)."""
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    original_os_exit = os._exit
+
+    def _safe_os_exit(exit_code: int = 0):
+        raise SystemExit(exit_code)
+
+    os._exit = _safe_os_exit
+    try:
+        with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
+            with _time_limit(timeout_s):
+                exec(code, {"__name__": "__main__"})
+        return True, stdout_buffer.getvalue(), stderr_buffer.getvalue()
+    except SystemExit as exc:
+        if exc.code in (None, 0):
+            return True, stdout_buffer.getvalue(), stderr_buffer.getvalue()
+        stderr_buffer.write(f"SystemExit: {exc}\n")
+        return False, stdout_buffer.getvalue(), stderr_buffer.getvalue()
+    except Exception:
+        tb_lines = traceback.format_exc().splitlines()
+        filtered_lines: list[str] = []
+        skip_next = False
+        for line in tb_lines:
+            if skip_next:
+                if line.startswith("    ") and not line.lstrip().startswith("File "):
+                    skip_next = False
+                    continue
+                skip_next = False
+            if "intellect_env.py" in line:
+                skip_next = True
+                continue
+            filtered_lines.append(line)
+        stderr_buffer.write("\n".join(filtered_lines) + "\n")
+        return False, stdout_buffer.getvalue(), stderr_buffer.getvalue()
+    finally:
+        os._exit = original_os_exit
+
+
+_INTERACTION_EXECUTOR: Optional[ProcessPoolExecutor] = None
+_INTERACTION_EXECUTOR_WORKERS: Optional[int] = None
+_EVAL_EXECUTOR: Optional[ProcessPoolExecutor] = None
+_EVAL_EXECUTOR_WORKERS: Optional[int] = None
+
+
+def _shutdown_persistent_executors() -> None:
+    global _INTERACTION_EXECUTOR, _INTERACTION_EXECUTOR_WORKERS
+    global _EVAL_EXECUTOR, _EVAL_EXECUTOR_WORKERS
+    if _INTERACTION_EXECUTOR is not None:
+        _INTERACTION_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        _INTERACTION_EXECUTOR = None
+        _INTERACTION_EXECUTOR_WORKERS = None
+    if _EVAL_EXECUTOR is not None:
+        _EVAL_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        _EVAL_EXECUTOR = None
+        _EVAL_EXECUTOR_WORKERS = None
+
+
+atexit.register(_shutdown_persistent_executors)
+
+
+def _get_persistent_executor(kind: str, max_workers: int) -> ProcessPoolExecutor:
+    global _INTERACTION_EXECUTOR, _INTERACTION_EXECUTOR_WORKERS
+    global _EVAL_EXECUTOR, _EVAL_EXECUTOR_WORKERS
+
+    if kind == "interaction":
+        if _INTERACTION_EXECUTOR is not None and _INTERACTION_EXECUTOR_WORKERS == max_workers:
+            return _INTERACTION_EXECUTOR
+        if _INTERACTION_EXECUTOR is not None:
+            _INTERACTION_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        mp_context = mp.get_context("spawn")
+        _INTERACTION_EXECUTOR = ProcessPoolExecutor(
+            max_workers=max_workers, mp_context=mp_context
+        )
+        _INTERACTION_EXECUTOR_WORKERS = max_workers
+        return _INTERACTION_EXECUTOR
+
+    if kind == "eval":
+        if _EVAL_EXECUTOR is not None and _EVAL_EXECUTOR_WORKERS == max_workers:
+            return _EVAL_EXECUTOR
+        if _EVAL_EXECUTOR is not None:
+            _EVAL_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        mp_context = mp.get_context("spawn")
+        _EVAL_EXECUTOR = ProcessPoolExecutor(
+            max_workers=max_workers, mp_context=mp_context
+        )
+        _EVAL_EXECUTOR_WORKERS = max_workers
+        return _EVAL_EXECUTOR
+
+    raise ValueError(f"Unknown executor kind: {kind}")
 
 
 class IntellectCodeEnv(Env):
@@ -29,6 +146,7 @@ class IntellectCodeEnv(Env):
         split: str = "train",
         max_turns: int = 5,
         max_tests: int = 12,
+        interaction_timeout_s: Optional[float] = None,
         sandbox_type: str = "none",
         seed: int = 0,
         dataset_name: str = "PrimeIntellect/INTELLECT-3-RL",
@@ -39,6 +157,7 @@ class IntellectCodeEnv(Env):
         self.system_prompt = system_prompt
         self.max_turns = max_turns
         self.max_tests = max_tests
+        self.interaction_timeout_s = interaction_timeout_s
         self.sandbox_type = sandbox_type
         self.seed = seed
         self.dataset_name = dataset_name
@@ -134,7 +253,9 @@ class IntellectCodeEnv(Env):
 
     def _handle_interact(self, python_code: str) -> Tuple[str, float, bool, bool, dict[str, Any]]:
         try:
-            success, stdout, stderr = run_python(python_code, self.sandbox_type)
+            success, stdout, stderr = _exec_interaction_code(
+                python_code, self.interaction_timeout_s
+            )
             if success:
                 output = stdout if stdout else "(no output during interaction -- did you forget to print? did you enclose the code correctly in <interact></interact>?)"
             else:
@@ -168,6 +289,10 @@ class IntellectCodeEnv(Env):
         if not self.has_interacted:
             return self._handle_requires_interaction()
 
+        # Enforce Solution-only when fn_name exists (align with fast_eval)
+        if self.fn_name and "class Solution" not in answer_code:
+            return "", 0.0, True, True, {"final": True, "invalidated": True}
+
         reward = self._evaluate(answer_code)
         return "", reward, True, False, {"final": True}
 
@@ -191,14 +316,9 @@ class IntellectCodeEnv(Env):
         
         total_tests = len(tests["inputs"])
         if total_tests > self.max_tests:
-            indices = sorted(
-                range(total_tests),
-                key=lambda i: len(tests["inputs"][i]),
-                reverse=True,
-            )[:self.max_tests]
             tests = {
-                "inputs": [tests["inputs"][i] for i in indices],
-                "outputs": [tests["outputs"][i] for i in indices],
+                "inputs": list(tests["inputs"][:self.max_tests]),
+                "outputs": list(tests["outputs"][:self.max_tests]),
             }
         
         passed = 0
@@ -240,23 +360,27 @@ class IntellectCodeEnv(Env):
             return "```python\nprint('hello')\n```"
 
 
-def _run_python_batch_item(item: tuple[str, str]) -> tuple[bool, str, str]:
-    """Helper function to run Python code in a worker process (must be at module level for pickling)."""
-    code, sandbox_type = item
-    return run_python(code, sandbox_type)
+def _run_python_batch_item(item: tuple[str, Optional[float]]) -> tuple[bool, str, str]:
+    """Helper function to run interaction code in a worker process (must be at module level for pickling)."""
+    code, timeout_s = item
+    return _exec_interaction_code(code, timeout_s)
 
 
 def _run_python_batch(
-    codes_and_sandboxes: list[tuple[str, str]],
+    codes_and_timeouts: list[tuple[str, Optional[float]]],
     max_workers: int,
     batch_size: int,
+    executor: Optional[ProcessPoolExecutor] = None,
 ) -> list[tuple[bool, str, str]]:
-    """Batch execute Python code in parallel."""
-    if not codes_and_sandboxes:
+    """Batch execute interaction code in parallel (no sandbox)."""
+    if not codes_and_timeouts:
         return []
     
+    if executor is not None:
+        return list(executor.map(_run_python_batch_item, codes_and_timeouts))
+
     if max_workers <= 1 and batch_size <= 1:
-        return [run_python(code, sandbox_type) for code, sandbox_type in codes_and_sandboxes]
+        return [_exec_interaction_code(code, timeout_s) for code, timeout_s in codes_and_timeouts]
     
     if batch_size <= 0:
         batch_size = 1
@@ -275,6 +399,8 @@ def step_batch(
     eval_batch_size: int,
     eval_timeout_s: Optional[float],
     show_progress: bool = False,
+    use_persistent_pool: bool = True,
+    interact_timeout_s: Optional[float] = None,
 ) -> list[Tuple[str, float, bool, bool, dict[str, Any]]]:
     if len(envs) != len(actions):
         raise ValueError("envs and actions must be the same length")
@@ -316,16 +442,26 @@ def step_batch(
         results[idx] = env._handle_invalid()
 
     # Batch execute interactions in parallel
+    if interact_timeout_s is None:
+        interact_timeout_s = eval_timeout_s
+
     if interact_tasks:
-        codes_and_sandboxes = [
-            (python_code, envs[idx].sandbox_type)
+        codes_and_timeouts = [
+            (python_code, interact_timeout_s)
             for idx, python_code in interact_tasks
         ]
-        interact_results = _run_python_batch(
-            codes_and_sandboxes,
-            max_workers=eval_workers,
-            batch_size=eval_batch_size,
-        )
+        if len(codes_and_timeouts) == 1:
+            interact_results = [_exec_interaction_code(codes_and_timeouts[0][0], codes_and_timeouts[0][1])]
+        else:
+            interaction_executor = None
+            if use_persistent_pool and eval_workers > 1:
+                interaction_executor = _get_persistent_executor("interaction", eval_workers)
+            interact_results = _run_python_batch(
+                codes_and_timeouts,
+                max_workers=eval_workers,
+                batch_size=eval_batch_size,
+                executor=interaction_executor,
+            )
         
         for (idx, python_code), (success, stdout, stderr) in zip(interact_tasks, interact_results):
             env = envs[idx]
@@ -344,14 +480,20 @@ def step_batch(
                 results[idx] = (obs, 0.0, False, False, {})
 
     if eval_tasks:
-        if eval_workers <= 1 and eval_batch_size <= 1:
+        if len(eval_tasks) == 1:
+            eval_results = [evaluate_task(eval_tasks[0])]
+        elif eval_workers <= 1 and eval_batch_size <= 1:
             eval_results = [evaluate_task(task) for task in eval_tasks]
         else:
+            eval_executor = None
+            if use_persistent_pool and eval_workers > 1:
+                eval_executor = _get_persistent_executor("eval", eval_workers)
             eval_results = evaluate_tasks(
                 eval_tasks,
                 max_workers=eval_workers,
                 batch_size=eval_batch_size,
                 show_progress=show_progress,
+                executor=eval_executor,
             )
         for idx, eval_result in zip(eval_indices, eval_results):
             results[idx] = ("", eval_result.reward, True, eval_result.truncated, {"final": True})

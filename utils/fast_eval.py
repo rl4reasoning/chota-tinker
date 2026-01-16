@@ -30,6 +30,7 @@ class EvalResult:
     truncated: bool
     timeout_count: int = 0
     timeout_indices: tuple[int, ...] = ()
+    invalidated: bool = False
 
 
 @contextlib.contextmanager
@@ -108,13 +109,8 @@ def _extract_answer_code(text: str) -> Optional[str]:
 def _select_tests(tests: dict[str, Any], max_tests: int) -> tuple[list[Any], list[Any]]:
     total_tests = len(tests["inputs"])
     if total_tests > max_tests:
-        indices = sorted(
-            range(total_tests),
-            key=lambda i: len(tests["inputs"][i]),
-            reverse=True,
-        )[:max_tests]
-        inputs = [tests["inputs"][i] for i in indices]
-        outputs = [tests["outputs"][i] for i in indices]
+        inputs = list(tests["inputs"][:max_tests])
+        outputs = list(tests["outputs"][:max_tests])
     else:
         inputs = tests["inputs"]
         outputs = tests["outputs"]
@@ -135,6 +131,7 @@ def _build_multi_test_harness(
 import contextlib
 import io
 import json
+import os
 import signal
 import sys
 
@@ -144,6 +141,11 @@ _expected = {repr(outputs)}
 _fn_name = {repr(fn_name)}
 _timeout_s = {repr(safe_timeout)}
 _timeout_record_limit = {repr(safe_timeout_records)}
+
+_original_os_exit = os._exit
+def _safe_os_exit(code=0):
+    raise SystemExit(code)
+os._exit = _safe_os_exit
 
 class _TimeoutException(Exception):
     pass
@@ -183,10 +185,6 @@ def _run_solution_case():
     sol_cls = global_ns.get("Solution")
     if sol_cls is None:
         return None
-    try:
-        sol = sol_cls()
-    except Exception:
-        return None
     passed = 0
     total = len(_inputs)
     timeout_count = 0
@@ -198,8 +196,12 @@ def _run_solution_case():
             _input = local["_input"]
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
-                _result = getattr(sol, _fn_name)(_input)
-                print(_result)
+                try:
+                    sol = sol_cls()
+                    _result = getattr(sol, _fn_name)(_input)
+                    print(_result)
+                except SystemExit:
+                    pass
             return buf.getvalue().strip()
         ok, actual, timed_out = _run_with_timeout(_call, _timeout_s)
         if timed_out:
@@ -228,7 +230,10 @@ def _run_script_case():
                 sys.stdin = io.StringIO(inp)
                 sys.stdout = stdout_buffer
                 sys.stderr = stderr_buffer
-                exec(compiled, {{"__name__": "__main__"}})
+                try:
+                    exec(compiled, {{"__name__": "__main__"}})
+                except SystemExit:
+                    pass
                 return stdout_buffer.getvalue().strip()
             finally:
                 sys.stdin = old_stdin
@@ -368,6 +373,7 @@ def evaluate_tasks(
     max_workers: int,
     batch_size: int,
     show_progress: bool = False,
+    executor: ProcessPoolExecutor | None = None,
 ) -> list[EvalResult]:
     if not tasks:
         return []
@@ -376,9 +382,9 @@ def evaluate_tasks(
         batch_size = 1
 
     batches = [tasks[i:i + batch_size] for i in range(0, len(tasks), batch_size)]
-    mp_context = mp.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_context) as executor:
-        results_iter = executor.map(_evaluate_task_batch, batches)
+
+    def _run_with_executor(pool: ProcessPoolExecutor) -> list[EvalResult]:
+        results_iter = pool.map(_evaluate_task_batch, batches)
         if not show_progress:
             return [result for batch in results_iter for result in batch]
 
@@ -391,3 +397,10 @@ def evaluate_tasks(
             progress.update(len(batch))
         progress.close()
         return results
+
+    if executor is not None:
+        return _run_with_executor(executor)
+
+    mp_context = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_context) as pool:
+        return _run_with_executor(pool)
