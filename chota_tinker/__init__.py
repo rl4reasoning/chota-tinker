@@ -1,7 +1,7 @@
 """chota-tinker: Minimal Tinker-like training API in PyTorch."""
 
 from .types import ModelInput, SamplingParams, SamplingResult, Sequence, LossOutput
-from .client import SamplingClient, ServerSamplingClient
+from .client import SamplingClient, ServerSamplingClient, MultiServerSamplingClient
 from .training import TrainingClient
 from .losses import (
     compute_logprobs,
@@ -18,6 +18,7 @@ __all__ = [
     # Sampling
     "SamplingClient",
     "ServerSamplingClient",
+    "MultiServerSamplingClient",
     "SamplingParams",
     "ModelInput",
     "SamplingResult",

@@ -21,11 +21,16 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import argparse
 import asyncio
+import atexit
 import json
+import signal
+import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 
+import requests
 from datasets import Dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
@@ -42,7 +47,13 @@ except ImportError:
     TINKER_AVAILABLE = False
 
 try:
-    from chota_tinker import SamplingClient, ServerSamplingClient, SamplingParams, ModelInput
+    from chota_tinker import (
+        SamplingClient,
+        ServerSamplingClient,
+        MultiServerSamplingClient,
+        SamplingParams,
+        ModelInput,
+    )
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
@@ -102,16 +113,137 @@ class RolloutState:
     truncated: bool = False
 
 
+def _parse_csv(value: Optional[str]) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def resolve_vllm_gpu_ids(args) -> list[str]:
+    """Resolve GPU IDs for multi-GPU vLLM servers."""
+    if args.vllm_gpu_ids:
+        return _parse_csv(args.vllm_gpu_ids)
+
+    visible = _parse_csv(os.environ.get("CUDA_VISIBLE_DEVICES"))
+    if visible:
+        return visible
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise ImportError(
+            "torch is required to auto-detect GPUs; please set --vllm-gpu-ids"
+        ) from exc
+
+    count = torch.cuda.device_count()
+    if count <= 0:
+        raise RuntimeError(
+            "No CUDA devices detected; please set --vllm-gpu-ids or CUDA_VISIBLE_DEVICES"
+        )
+    return [str(i) for i in range(count)]
+
+
+def _client_host_for_server(host: str) -> str:
+    if host in {"0.0.0.0", "::"}:
+        return "127.0.0.1"
+    return host
+
+
+def build_vllm_server_urls(args, gpu_ids: list[str]) -> list[str]:
+    host = _client_host_for_server(args.vllm_server_host)
+    return [
+        f"http://{host}:{args.vllm_server_base_port + idx}"
+        for idx in range(len(gpu_ids))
+    ]
+
+
+def launch_vllm_servers(args, gpu_ids: list[str]) -> list[subprocess.Popen]:
+    """Launch one vLLM server per GPU."""
+    processes = []
+    for idx, gpu_id in enumerate(gpu_ids):
+        port = args.vllm_server_base_port + idx
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        cmd = [
+            "vllm",
+            "serve",
+            args.model,
+            "--host",
+            args.vllm_server_host,
+            "--port",
+            str(port),
+            "--gpu-memory-utilization",
+            str(args.gpu_memory_utilization),
+        ]
+        processes.append(subprocess.Popen(cmd, env=env))
+    return processes
+
+
+def wait_for_vllm_servers(urls: list[str], timeout_s: float) -> None:
+    """Wait until all vLLM servers respond to /v1/models."""
+    deadline = time.monotonic() + timeout_s
+    remaining = set(urls)
+    while remaining and time.monotonic() < deadline:
+        for url in list(remaining):
+            try:
+                resp = requests.get(f"{url}/v1/models", timeout=2)
+                if resp.status_code == 200:
+                    remaining.remove(url)
+            except requests.RequestException:
+                pass
+        if remaining:
+            time.sleep(1.0)
+    if remaining:
+        raise RuntimeError(
+            f"Timed out waiting for vLLM servers: {', '.join(sorted(remaining))}"
+        )
+
+
+def shutdown_vllm_servers(processes: list[subprocess.Popen]) -> None:
+    """Terminate vLLM server processes."""
+    for proc in processes:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+    for proc in processes:
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def register_vllm_shutdown(processes: list[subprocess.Popen]) -> None:
+    atexit.register(shutdown_vllm_servers, processes)
+
+    def _handle_signal(signum, _frame):
+        shutdown_vllm_servers(processes)
+        raise KeyboardInterrupt
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, _handle_signal)
+
+
 def create_sampling_client(args):
     """Create sampling client based on backend choice."""
     if args.backend == "tinker":
         if not TINKER_AVAILABLE:
             raise ImportError("tinker not installed. Install it or use --backend vllm")
+        if args.vllm_multi_gpu:
+            raise ValueError("--vllm-multi-gpu requires --backend vllm")
         service_client = tinker.ServiceClient()
         return service_client.create_sampling_client(base_model=args.model)
     else:  # vllm
         if not VLLM_AVAILABLE:
             raise ImportError("chota_tinker not installed. Install it or use --backend tinker")
+        if args.vllm_multi_gpu:
+            if args.vllm_server_url:
+                raise ValueError("--vllm-server-url cannot be used with --vllm-multi-gpu")
+            gpu_ids = resolve_vllm_gpu_ids(args)
+            urls = build_vllm_server_urls(args, gpu_ids)
+            print(f"Launching vLLM servers for GPUs: {', '.join(gpu_ids)}")
+            processes = launch_vllm_servers(args, gpu_ids)
+            register_vllm_shutdown(processes)
+            wait_for_vllm_servers(urls, args.vllm_server_startup_timeout_s)
+            return MultiServerSamplingClient(urls)
         if args.vllm_server_url:
             return ServerSamplingClient(args.vllm_server_url)
         else:
@@ -440,8 +572,18 @@ if __name__ == "__main__":
                         help="Inference backend: 'tinker' or 'vllm' (default: vllm)")
     parser.add_argument("--vllm-server-url", type=str, default=None,
                         help="URL for vLLM server (e.g. http://localhost:8000). If not set, uses local vLLM.")
+    parser.add_argument("--vllm-multi-gpu", action="store_true",
+                        help="Launch one local vLLM server per GPU and shard prompts across them.")
+    parser.add_argument("--vllm-gpu-ids", type=str, default=None,
+                        help="Comma-separated GPU IDs for vLLM servers (default: all visible GPUs).")
+    parser.add_argument("--vllm-server-base-port", type=int, default=8000,
+                        help="Base port for vLLM servers; ports increment per GPU.")
+    parser.add_argument("--vllm-server-host", type=str, default="127.0.0.1",
+                        help="Host to bind vLLM servers (default: 127.0.0.1).")
+    parser.add_argument("--vllm-server-startup-timeout-s", type=float, default=300.0,
+                        help="Seconds to wait for vLLM servers to be ready.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8,
-                        help="GPU memory utilization for local vLLM (default: 0.9)")
+                        help="GPU memory utilization for local vLLM or vLLM servers (default: 0.8)")
     parser.add_argument("--fast-eval", action="store_true",
                         help="Use parallel fast eval for final answers")
     parser.add_argument("--eval-workers", type=int, default=16,

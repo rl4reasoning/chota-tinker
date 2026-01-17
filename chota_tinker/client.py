@@ -2,6 +2,8 @@
 
 import gc
 import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 import requests
 import torch
@@ -10,6 +12,8 @@ from vllm import SamplingParams as VLLMSamplingParams
 from vllm.inputs import TokensPrompt
 
 from .types import ModelInput, SamplingParams, SamplingResult, Sequence
+
+DEFAULT_RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
 class SamplingClient:
@@ -174,7 +178,14 @@ class SamplingClient:
 class ServerSamplingClient:
     """Sampling client that connects to a running vLLM server."""
 
-    def __init__(self, base_url: str = "http://localhost:8000"):
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8000",
+        timeout_s: float = 120.0,
+        max_retries: int = 2,
+        retry_backoff_s: float = 1.0,
+        retry_statuses: Optional[set[int]] = None,
+    ):
         """
         Connect to a vLLM server.
 
@@ -182,8 +193,53 @@ class ServerSamplingClient:
 
         Args:
             base_url: URL of the vLLM server
+            timeout_s: Request timeout in seconds
+            max_retries: Number of retry attempts for transient failures
+            retry_backoff_s: Base backoff in seconds (exponential per attempt)
+            retry_statuses: HTTP statuses to retry
         """
         self.base_url = base_url.rstrip("/")
+        self.timeout_s = timeout_s
+        self.max_retries = max_retries
+        self.retry_backoff_s = retry_backoff_s
+        self.retry_statuses = retry_statuses or DEFAULT_RETRY_STATUSES
+
+    def _post_json(self, path: str, payload: dict) -> dict:
+        last_exc: Optional[BaseException] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = requests.post(
+                    f"{self.base_url}{path}",
+                    json=payload,
+                    timeout=self.timeout_s,
+                )
+                if response.status_code >= 400:
+                    if (
+                        response.status_code in self.retry_statuses
+                        and attempt < self.max_retries
+                    ):
+                        time.sleep(self.retry_backoff_s * (2 ** attempt))
+                        continue
+                    response.raise_for_status()
+
+                try:
+                    return response.json()
+                except ValueError as exc:
+                    last_exc = exc
+                    if attempt < self.max_retries:
+                        time.sleep(self.retry_backoff_s * (2 ** attempt))
+                        continue
+                    break
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt < self.max_retries:
+                    time.sleep(self.retry_backoff_s * (2 ** attempt))
+                    continue
+                break
+
+        raise RuntimeError(
+            f"vLLM request failed after {self.max_retries + 1} attempts: {self.base_url}{path}"
+        ) from last_exc
 
     def sample(
         self,
@@ -192,9 +248,9 @@ class ServerSamplingClient:
         num_samples: int = 1,
     ) -> SamplingResult:
         """Sample from the model via the server."""
-        response = requests.post(
-            f"{self.base_url}/v1/completions",
-            json={
+        data = self._post_json(
+            "/v1/completions",
+            {
                 "prompt": prompt.token_ids,
                 "max_tokens": sampling_params.max_tokens,
                 "temperature": sampling_params.temperature,
@@ -203,8 +259,6 @@ class ServerSamplingClient:
                 "stop": sampling_params.stop,
             },
         )
-        response.raise_for_status()
-        data = response.json()
 
         sequences = []
         for choice in data["choices"]:
@@ -225,9 +279,9 @@ class ServerSamplingClient:
     ) -> list[SamplingResult]:
         """Sample from the model for multiple prompts."""
         # vLLM server supports batch via list of prompts
-        response = requests.post(
-            f"{self.base_url}/v1/completions",
-            json={
+        data = self._post_json(
+            "/v1/completions",
+            {
                 "prompt": [p.token_ids for p in prompts],
                 "max_tokens": sampling_params.max_tokens,
                 "temperature": sampling_params.temperature,
@@ -236,18 +290,90 @@ class ServerSamplingClient:
                 "stop": sampling_params.stop,
             },
         )
-        response.raise_for_status()
-        data = response.json()
 
         # Group choices by prompt index
         results = [[] for _ in prompts]
         for choice in data["choices"]:
             idx = choice["index"] // num_samples
+            logprobs = choice.get("logprobs") or {}
+            if not isinstance(logprobs, dict):
+                logprobs = {}
             seq = Sequence(
-                tokens=choice.get("logprobs", {}).get("tokens", []),
+                tokens=logprobs.get("tokens", []),
                 text=choice["text"],
             )
             results[idx].append(seq)
 
         return [SamplingResult(sequences=seqs) for seqs in results]
+
+
+class MultiServerSamplingClient:
+    """Sampling client that shards requests across multiple vLLM servers."""
+
+    def __init__(self, base_urls: list[str], max_workers: Optional[int] = None):
+        if not base_urls:
+            raise ValueError("base_urls must be a non-empty list")
+        self.clients = [ServerSamplingClient(url) for url in base_urls]
+        self.max_workers = max_workers or len(self.clients)
+        self._rr_index = 0
+
+    def _next_client(self) -> ServerSamplingClient:
+        client = self.clients[self._rr_index]
+        self._rr_index = (self._rr_index + 1) % len(self.clients)
+        return client
+
+    def sample(
+        self,
+        prompt: ModelInput,
+        sampling_params: SamplingParams,
+        num_samples: int = 1,
+    ) -> SamplingResult:
+        """Sample from the next server (round-robin)."""
+        client = self._next_client()
+        return client.sample(prompt, sampling_params, num_samples=num_samples)
+
+    def sample_batch(
+        self,
+        prompts: list[ModelInput],
+        sampling_params: SamplingParams,
+        num_samples: int = 1,
+    ) -> list[SamplingResult]:
+        """Shard prompts across servers and recombine results in order."""
+        if not prompts:
+            return []
+
+        num_clients = len(self.clients)
+        buckets: list[list[ModelInput]] = [[] for _ in range(num_clients)]
+        index_buckets: list[list[int]] = [[] for _ in range(num_clients)]
+
+        for idx, prompt in enumerate(prompts):
+            bucket_idx = idx % num_clients
+            buckets[bucket_idx].append(prompt)
+            index_buckets[bucket_idx].append(idx)
+
+        results: list[Optional[SamplingResult]] = [None] * len(prompts)
+
+        def _run_batch(client: ServerSamplingClient, batch, indices):
+            if not batch:
+                return indices, []
+            return indices, client.sample_batch(
+                batch, sampling_params, num_samples=num_samples
+            )
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = []
+            for client, batch, indices in zip(self.clients, buckets, index_buckets):
+                if batch:
+                    futures.append(
+                        executor.submit(_run_batch, client, batch, indices)
+                    )
+
+            for future in futures:
+                indices, batch_results = future.result()
+                for idx, result in zip(indices, batch_results):
+                    results[idx] = result
+
+        if any(r is None for r in results):
+            raise RuntimeError("MultiServerSamplingClient received incomplete results")
+        return [r for r in results if r is not None]
 
