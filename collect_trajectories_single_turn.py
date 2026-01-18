@@ -15,6 +15,22 @@ Usage:
     --eval-timeout-s 1.0 \
     --push-to-hub bicycleman15/qwen3_4b_instruct_easy_medium_single_turn
 
+Multi-GPU (launches one vLLM server per GPU, shards prompts across them):
+    python collect_trajectories_single_turn.py \
+    --dataset bicycleman15/intellect_3_code_very_hard \
+    --model Qwen/Qwen3-4B-Instruct-2507 \
+    --backend vllm \
+    --vllm-multi-gpu \
+    --vllm-gpu-ids 0,1,2,3 \
+    --num-problems 1 \
+    --num-samples 32 \
+    \
+    --fast-eval \
+    --eval-workers 16 \
+    --eval-batch-size 8 \
+    --eval-timeout-s 1.0 \
+    --push-to-hub bicycleman15/qwen3_4b_instruct_easy_medium_single_turn
+
 Resume from checkpoint (if previous run failed during evaluation):
     python collect_trajectories_single_turn.py \
         --resume-from checkpoints/20260117_143052 \
@@ -45,6 +61,13 @@ from checkpoint import CheckpointManager, get_checkpoint_dir
 from intellect_env import IntellectCodeEnv
 from utils.fast_eval import EvalTask, evaluate_tasks
 from utils.pass_at_k import compute_pass_at_k
+from utils.vllm_multi_gpu import (
+    resolve_vllm_gpu_ids,
+    build_vllm_server_urls,
+    launch_vllm_servers,
+    wait_for_vllm_servers,
+    register_vllm_shutdown,
+)
 
 # Backend imports (conditional)
 try:
@@ -55,7 +78,13 @@ except ImportError:
     TINKER_AVAILABLE = False
 
 try:
-    from chota_tinker import SamplingClient, ServerSamplingClient, SamplingParams, ModelInput
+    from chota_tinker import (
+        SamplingClient,
+        ServerSamplingClient,
+        MultiServerSamplingClient,
+        SamplingParams,
+        ModelInput,
+    )
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
@@ -90,11 +119,23 @@ def create_sampling_client(args):
     if args.backend == "tinker":
         if not TINKER_AVAILABLE:
             raise ImportError("tinker not installed. Install it or use --backend vllm")
+        if args.vllm_multi_gpu:
+            raise ValueError("--vllm-multi-gpu requires --backend vllm")
         service_client = tinker.ServiceClient()
         return service_client.create_sampling_client(base_model=args.model)
     else:  # vllm
         if not VLLM_AVAILABLE:
             raise ImportError("chota_tinker not installed. Install it or use --backend tinker")
+        if args.vllm_multi_gpu:
+            if args.vllm_server_url:
+                raise ValueError("--vllm-server-url cannot be used with --vllm-multi-gpu")
+            gpu_ids = resolve_vllm_gpu_ids(args)
+            urls = build_vllm_server_urls(args, gpu_ids)
+            print(f"Launching vLLM servers for GPUs: {', '.join(gpu_ids)}")
+            processes = launch_vllm_servers(args, gpu_ids)
+            register_vllm_shutdown(processes)
+            wait_for_vllm_servers(urls, args.vllm_server_startup_timeout_s)
+            return MultiServerSamplingClient(urls)
         if args.vllm_server_url:
             return ServerSamplingClient(args.vllm_server_url)
         else:
@@ -482,8 +523,18 @@ if __name__ == "__main__":
                         help="Inference backend: 'tinker' or 'vllm' (default: vllm)")
     parser.add_argument("--vllm-server-url", type=str, default=None,
                         help="URL for vLLM server (e.g. http://localhost:8000). If not set, uses local vLLM.")
+    parser.add_argument("--vllm-multi-gpu", action="store_true",
+                        help="Launch one local vLLM server per GPU and shard prompts across them.")
+    parser.add_argument("--vllm-gpu-ids", type=str, default=None,
+                        help="Comma-separated GPU IDs for vLLM servers (default: all visible GPUs).")
+    parser.add_argument("--vllm-server-base-port", type=int, default=8000,
+                        help="Base port for vLLM servers; ports increment per GPU.")
+    parser.add_argument("--vllm-server-host", type=str, default="127.0.0.1",
+                        help="Host to bind vLLM servers (default: 127.0.0.1).")
+    parser.add_argument("--vllm-server-startup-timeout-s", type=float, default=300.0,
+                        help="Seconds to wait for vLLM servers to be ready.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8,
-                        help="GPU memory utilization for local vLLM (default: 0.9)")
+                        help="GPU memory utilization for local vLLM or vLLM servers (default: 0.8)")
     parser.add_argument("--eval-workers", type=int, default=16,
                         help="Number of parallel evaluator workers (default: min(32, cpu_count))")
     parser.add_argument("--eval-batch-size", type=int, default=8,
