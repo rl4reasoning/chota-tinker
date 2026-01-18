@@ -618,7 +618,7 @@ if __name__ == "__main__":
     parser.add_argument("--push-to-hub", type=str, default=None, help="HF repo to push to (e.g. username/repo-name)")
     
     # Budget forcing specific
-    parser.add_argument("--num-attempts", type=int, default=2,
+    parser.add_argument("--num-attempts", type=int, default=5,
                         help="Total number of generation rounds (comparable to --max-turns in collect_trajectories.py)")
     
     # Checkpointing options
