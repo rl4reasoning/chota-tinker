@@ -337,8 +337,16 @@ class MultiServerSamplingClient:
         prompts: list[ModelInput],
         sampling_params: SamplingParams,
         num_samples: int = 1,
+        show_progress: bool = False,
     ) -> list[SamplingResult]:
-        """Shard prompts across servers and recombine results in order."""
+        """Shard prompts across servers and recombine results in order.
+        
+        Args:
+            prompts: List of input prompts
+            sampling_params: Sampling parameters
+            num_samples: Number of samples per prompt
+            show_progress: If True, display a tqdm progress bar (updates per GPU batch)
+        """
         if not prompts:
             return []
 
@@ -368,12 +376,24 @@ class MultiServerSamplingClient:
                         executor.submit(_run_batch, client, batch, indices)
                     )
 
-            for future in futures:
-                indices, batch_results = future.result()
-                for idx, result in zip(indices, batch_results):
-                    results[idx] = result
+            if show_progress:
+                from concurrent.futures import as_completed
+                from tqdm import tqdm
+                pbar = tqdm(total=len(prompts), desc="Sampling", unit="prompts")
+                for future in as_completed(futures):
+                    indices, batch_results = future.result()
+                    for idx, result in zip(indices, batch_results):
+                        results[idx] = result
+                    pbar.update(len(indices))
+                pbar.close()
+            else:
+                for future in futures:
+                    indices, batch_results = future.result()
+                    for idx, result in zip(indices, batch_results):
+                        results[idx] = result
 
         if any(r is None for r in results):
             raise RuntimeError("MultiServerSamplingClient received incomplete results")
         return [r for r in results if r is not None]
+
 

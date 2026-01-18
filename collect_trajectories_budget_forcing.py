@@ -257,10 +257,15 @@ async def sample_batch_tinker(client, prompts: list[list[int]], sampling_params,
     return results
 
 
-def sample_batch_vllm(client, prompts: list[list[int]], sampling_params) -> list[tuple[str, int]]:
+def sample_batch_vllm(client, prompts: list[list[int]], sampling_params, show_progress: bool = False) -> list[tuple[str, int]]:
     """Batch sample using vLLM. Returns (text, num_tokens) pairs."""
     model_inputs = [ModelInput.from_ints(p) for p in prompts]
-    results = client.sample_batch(model_inputs, sampling_params, num_samples=1)
+    # Pass show_progress for MultiServerSamplingClient (ignored by other clients)
+    try:
+        results = client.sample_batch(model_inputs, sampling_params, num_samples=1, show_progress=show_progress)
+    except TypeError:
+        # Fallback for clients that don't support show_progress
+        results = client.sample_batch(model_inputs, sampling_params, num_samples=1)
     return [(r.sequences[0].text, len(r.sequences[0].tokens)) for r in results]
 
 
@@ -368,7 +373,7 @@ def run_batched_rollouts_with_budget_forcing(
         if args.backend == "tinker":
             results = asyncio.run(sample_batch_tinker(client, prompts, sampling_params, tokenizer))
         else:
-            results = sample_batch_vllm(client, prompts, sampling_params)
+            results = sample_batch_vllm(client, prompts, sampling_params, show_progress=args.vllm_multi_gpu)
         
         # Process results
         still_active = []

@@ -274,10 +274,15 @@ async def sample_batch_tinker(client, prompts: list[list[int]], sampling_params)
     return results
 
 
-def sample_batch_vllm(client, prompts: list[list[int]], sampling_params) -> list[str]:
+def sample_batch_vllm(client, prompts: list[list[int]], sampling_params, show_progress: bool = False) -> list[str]:
     """Batch sample using vLLM."""
     model_inputs = [ModelInput.from_ints(p) for p in prompts]
-    results = client.sample_batch(model_inputs, sampling_params, num_samples=1)
+    # Pass show_progress for MultiServerSamplingClient (ignored by other clients)
+    try:
+        results = client.sample_batch(model_inputs, sampling_params, num_samples=1, show_progress=show_progress)
+    except TypeError:
+        # Fallback for clients that don't support show_progress
+        results = client.sample_batch(model_inputs, sampling_params, num_samples=1)
     return [r.sequences[0].text for r in results]
 
 
@@ -397,7 +402,7 @@ def run_batched_rollouts(
                 token_results = asyncio.run(sample_batch_tinker(client, prompts, sampling_params))
                 responses = [tokenizer.decode(tokens, skip_special_tokens=True) for tokens in token_results]
             else:
-                responses = sample_batch_vllm(client, prompts, sampling_params)
+                responses = sample_batch_vllm(client, prompts, sampling_params, show_progress=args.vllm_multi_gpu)
             
             # Process responses and step environments
             processed_responses = []
@@ -660,7 +665,7 @@ if __name__ == "__main__":
                         help="Host to bind vLLM servers (default: 127.0.0.1).")
     parser.add_argument("--vllm-server-startup-timeout-s", type=float, default=300.0,
                         help="Seconds to wait for vLLM servers to be ready.")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8,
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
                         help="GPU memory utilization for local vLLM or vLLM servers (default: 0.8)")
     parser.add_argument("--fast-eval", action="store_true",
                         help="Use parallel fast eval for final answers")
