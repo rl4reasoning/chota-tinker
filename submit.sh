@@ -17,7 +17,7 @@ conda activate ct
 
 pwd
 
-python collect_trajectories_budget_forcing.py \
+python collect_trajectories.py \
         --dataset bicycleman15/intellect_3_code_very_hard \
         --model Qwen/Qwen3-4B-Instruct-2507 \
         --backend vllm \
@@ -30,7 +30,7 @@ python collect_trajectories_budget_forcing.py \
         --eval-workers 8 \
         --eval-batch-size 8 \
         --eval-timeout-s 1.0 \
-        --push-to-hub bicycleman15/1k_32_s1
+        --push-to-hub bicycleman15/1k_32_interactions
 
 
 echo "Run finished at: "

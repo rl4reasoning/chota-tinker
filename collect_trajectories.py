@@ -298,11 +298,22 @@ def run_batched_rollouts(
     print(f"Loading dataset {args.dataset}...")
     if args.dataset.startswith("bicycleman15/"):
         from datasets import load_dataset
-        shared_dataset = load_dataset(args.dataset, split="train")
+        full_dataset = load_dataset(args.dataset, split="train")
     else:
         from datasets import load_dataset
-        shared_dataset = load_dataset(args.dataset, "code", split="train")
-    print(f"Dataset loaded with {len(shared_dataset)} problems.")
+        full_dataset = load_dataset(args.dataset, "code", split="train")
+    
+    # Select slice based on start_problem and num_problems
+    end_problem = min(args.start_problem + args.num_problems, len(full_dataset))
+    shared_dataset = full_dataset.select(range(args.start_problem, end_problem))
+    actual_num_problems = len(shared_dataset)
+    print(f"Dataset loaded with {len(full_dataset)} total problems.")
+    print(f"Selected slice: problems {args.start_problem} to {end_problem - 1} ({actual_num_problems} problems)")
+    
+    # Update args.num_problems to reflect actual slice size
+    if actual_num_problems < args.num_problems:
+        print(f"Warning: Requested {args.num_problems} problems but only {actual_num_problems} available in slice.")
+        args.num_problems = actual_num_problems
     
     # Track generation round for checkpointing
     generation_round = 0
@@ -317,6 +328,7 @@ def run_batched_rollouts(
         
         # Verify args match
         for warning in checkpoint_manager.verify_args({
+            "start_problem": args.start_problem,
             "num_problems": args.num_problems,
             "num_samples": args.num_samples,
             "dataset": args.dataset,
@@ -496,7 +508,7 @@ def main(args):
     print(f"  Dataset: {args.dataset}")
     print(f"  Model: {args.model}")
     print(f"  Backend: {args.backend}")
-    print(f"  Problems: {args.num_problems}")
+    print(f"  Problem range: {args.start_problem} to {args.start_problem + args.num_problems - 1} ({args.num_problems} problems)")
     print(f"  Samples per problem: {args.num_samples}")
     print(f"  Max turns: {args.max_turns}")
     print(f"  Output: {args.output_dir}")
@@ -517,6 +529,7 @@ def main(args):
         args_dict={
             "dataset": args.dataset,
             "model": args.model,
+            "start_problem": args.start_problem,
             "num_problems": args.num_problems,
             "num_samples": args.num_samples,
             "max_turns": args.max_turns,
@@ -591,6 +604,7 @@ def main(args):
     metadata = {
         "dataset": args.dataset,
         "model": args.model,
+        "start_problem": args.start_problem,
         "num_problems": args.num_problems,
         "num_samples": args.num_samples,
         "max_turns": args.max_turns,
@@ -637,6 +651,8 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="bicycleman15/intellect_3_code_easy_medium",
                         choices=["bicycleman15/intellect_3_code_easy_medium", "bicycleman15/intellect_3_code_hard",
                                  "bicycleman15/intellect_3_code_very_hard", "PrimeIntellect/INTELLECT-3-RL"])
+    parser.add_argument("--start-problem", type=int, default=0,
+                        help="Starting problem index for dataset slicing (default: 0)")
     parser.add_argument("--num-problems", type=int, default=20)
     parser.add_argument("--num-samples", type=int, default=8)
     parser.add_argument("--max-turns", type=int, default=5)
