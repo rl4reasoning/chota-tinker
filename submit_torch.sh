@@ -21,7 +21,6 @@ conda activate ct
 
 # We want to trigger both of these
 # first command runs on 1 GPU -- change your slurm script and `push-to-hub` commands accordingly
-# next command is on 4 GPU -- trigger this too, change `push-to-hub` so that both dont get pushed to the same place on HF
 # first check on smaller number of problems if everything is working and getting pushed to HF correctly or not :)
 # when all done, trigger!
 
@@ -40,6 +39,10 @@ python collect_trajectories.py \
         --eval-batch-size 8 \
         --eval-timeout-s 1.0 \
         --push-to-hub bicycleman15/0_500_interactions
+
+# also change file name to `collect_trajectories_budget_forcing.py` to collect s1 scaling
+# change start-problem to 500, so that we collect 
+# change push-to-hub accordingly when running different filename and start-problem
 
 ################################################
 
