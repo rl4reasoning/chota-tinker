@@ -14,6 +14,17 @@ Usage:
     --eval-batch-size 8 \
     --eval-timeout-s 1.0 \
     --push-to-hub bicycleman15/qwen3_4b_instruct_easy_medium_single_turn
+
+Resume from checkpoint (if previous run failed during evaluation):
+    python collect_trajectories_single_turn.py \
+        --resume-from checkpoints/20260117_143052 \
+        --dataset bicycleman15/intellect_3_code_very_hard \
+        --model Qwen/Qwen3-4B-Instruct-2507 \
+        ... (same args as original run)
+
+Checkpoints are saved after generation (before evaluation) to:
+    checkpoints/<YYYYMMDD_HHMMSS>/checkpoint.pkl
+    checkpoints/<YYYYMMDD_HHMMSS>/checkpoint_info.json
 """
 
 import os
@@ -22,13 +33,15 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
 import asyncio
 import json
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from datasets import Dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
+from checkpoint import CheckpointManager, get_checkpoint_dir
 from intellect_env import IntellectCodeEnv
 from utils.fast_eval import EvalTask, evaluate_tasks
 from utils.pass_at_k import compute_pass_at_k
@@ -133,11 +146,50 @@ def sample_batch_vllm(client, prompts: list[list[int]], sampling_params) -> list
     return [r.sequences[0].text for r in results]
 
 
+@dataclass
+class SingleTurnState:
+    """State for a single-turn trajectory."""
+    problem_index: int
+    sample_index: int
+    question: str
+    tests: list
+    max_tests: int
+    messages: list[dict]
+    response: str = ""
+
+
+def serialize_single_turn_state(state: SingleTurnState) -> dict:
+    """Serialize a SingleTurnState to a dictionary for checkpointing."""
+    return {
+        "problem_index": state.problem_index,
+        "sample_index": state.sample_index,
+        "question": state.question,
+        "tests": state.tests,
+        "max_tests": state.max_tests,
+        "messages": [msg.copy() for msg in state.messages],
+        "response": state.response,
+    }
+
+
+def deserialize_single_turn_state(data: dict) -> SingleTurnState:
+    """Deserialize a dictionary back to a SingleTurnState."""
+    return SingleTurnState(
+        problem_index=data["problem_index"],
+        sample_index=data["sample_index"],
+        question=data["question"],
+        tests=data["tests"],
+        max_tests=data["max_tests"],
+        messages=data["messages"],
+        response=data["response"],
+    )
+
+
 def run_batched_rollouts(
     args,
     client,
     tokenizer,
     sampling_params,
+    checkpoint_manager: Optional[CheckpointManager] = None,
 ) -> list[list[dict[str, Any]]]:
     """Run batched single-turn rollouts across all problems and samples."""
     # Load dataset ONCE before creating environments
@@ -150,54 +202,101 @@ def run_batched_rollouts(
         shared_dataset = load_dataset(args.dataset, "code", split="train")
     print(f"Dataset loaded with {len(shared_dataset)} problems.")
     
-    # Initialize all environments and build prompts
-    envs = []
-    all_messages = []
-    prompts = []
+    states: list[SingleTurnState] = []
+    skip_generation = False
     
-    print(f"Initializing {args.num_problems * args.num_samples} rollouts...")
-    for problem_idx in range(args.num_problems):
-        for sample_idx in range(args.num_samples):
-            env = IntellectCodeEnv(
-                system_prompt="",
-                dataset_name=args.dataset,
-                problem_index=problem_idx,
-                max_turns=1,
-                dataset=shared_dataset,
-            )
-            obs, info = env.reset()
-            env.has_interacted = True  # Single-turn mode
-            
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": obs}
-            ]
-            prompt = build_prompt(messages, tokenizer)
-            
-            envs.append((problem_idx, sample_idx, env, messages))
-            all_messages.append(messages)
-            prompts.append(prompt)
-    
-    # Batch sample all responses at once
-    print(f"Sampling {len(prompts)} responses...")
-    if args.backend == "tinker":
-        responses = asyncio.run(sample_batch_tinker(client, prompts, sampling_params, tokenizer))
+    # Resume from checkpoint if available
+    if checkpoint_manager and checkpoint_manager.has_checkpoint():
+        print(f"\nResuming from checkpoint: {checkpoint_manager.checkpoint_dir}")
+        checkpoint_data = checkpoint_manager.load()
+        
+        # Verify args match
+        for warning in checkpoint_manager.verify_args({
+            "num_problems": args.num_problems,
+            "num_samples": args.num_samples,
+            "dataset": args.dataset,
+            "model": args.model,
+        }):
+            print(warning)
+        
+        # Restore states
+        print(f"  Restoring {len(checkpoint_data.active_states_data)} states...")
+        for state_data in checkpoint_data.active_states_data:
+            state = deserialize_single_turn_state(state_data)
+            states.append(state)
+        
+        print(f"  Successfully restored {len(states)} states with generated responses.")
+        skip_generation = True
     else:
-        responses = sample_batch_vllm(client, prompts, sampling_params)
+        # Initialize all environments and build prompts
+        print(f"Initializing {args.num_problems * args.num_samples} rollouts...")
+        for problem_idx in range(args.num_problems):
+            for sample_idx in range(args.num_samples):
+                env = IntellectCodeEnv(
+                    system_prompt="",
+                    dataset_name=args.dataset,
+                    problem_index=problem_idx,
+                    max_turns=1,
+                    dataset=shared_dataset,
+                )
+                obs, info = env.reset()
+                env.has_interacted = True  # Single-turn mode
+                
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": obs}
+                ]
+                
+                state = SingleTurnState(
+                    problem_index=problem_idx,
+                    sample_index=sample_idx,
+                    question=env.question,
+                    tests=env.tests,
+                    max_tests=env.max_tests,
+                    messages=messages,
+                )
+                states.append(state)
     
-    # Process responses and collect results
-    print(f"Evaluating responses...")
+    # Generation phase (skip if resuming from checkpoint)
+    if not skip_generation:
+        prompts = [build_prompt(state.messages, tokenizer) for state in states]
+        
+        # Batch sample all responses at once
+        print(f"Sampling {len(prompts)} responses...")
+        if args.backend == "tinker":
+            responses = asyncio.run(sample_batch_tinker(client, prompts, sampling_params, tokenizer))
+        else:
+            responses = sample_batch_vllm(client, prompts, sampling_params)
+        
+        # Store responses in states
+        for state, response in zip(states, responses):
+            state.response = response
+        
+        # Save checkpoint BEFORE evaluation (so we can retry if evaluation fails)
+        if checkpoint_manager:
+            print(f"Saving checkpoint after generation...")
+            checkpoint_manager.save(
+                active_states_data=[serialize_single_turn_state(s) for s in states],
+                completed_states_data=[],
+                current_round=1,
+                total_rounds=1,
+            )
+    else:
+        print(f"\n[Resuming] Skipping generation, going directly to evaluation...")
+    
+    # Evaluation phase
+    print(f"Evaluating {len(states)} responses...")
     all_trajectories: list[list[dict]] = [[] for _ in range(args.num_problems)]
 
     eval_tasks = [
         EvalTask(
-            response=response,
-            tests=env.tests,
-            max_tests=env.max_tests,
+            response=state.response,
+            tests=state.tests,
+            max_tests=state.max_tests,
             timeout_s=args.eval_timeout_s,
             require_solution_class=True,
         )
-        for (problem_idx, sample_idx, env, messages), response in zip(envs, responses)
+        for state in states
     ]
     eval_results = evaluate_tasks(
         eval_tasks,
@@ -206,18 +305,19 @@ def run_batched_rollouts(
         show_progress=True,
     )
 
-    for (problem_idx, sample_idx, env, messages), response, eval_result in zip(envs, responses, eval_results):
-        messages.append({"role": "assistant", "content": response})
+    for state, eval_result in zip(states, eval_results):
+        messages = state.messages.copy()
+        messages.append({"role": "assistant", "content": state.response})
 
         traj = {
-            "question": env.question,
+            "question": state.question,
             "messages": messages,
             "final_reward": eval_result.reward,
             "terminated": eval_result.terminated,
             "truncated": eval_result.truncated,
-            "tests": env.tests,
+            "tests": state.tests,
         }
-        all_trajectories[problem_idx].append(traj)
+        all_trajectories[state.problem_index].append(traj)
     
     return all_trajectories
 
@@ -231,7 +331,29 @@ def main(args):
     print(f"  Problems: {args.num_problems}")
     print(f"  Samples per problem: {args.num_samples}")
     print(f"  Output: {args.output_dir}")
+    if args.resume_from:
+        print(f"  Resuming from: {args.resume_from}")
     print(f"=" * 60)
+    
+    # Setup checkpoint manager
+    if args.resume_from:
+        checkpoint_dir = args.resume_from
+        print(f"\nResuming from checkpoint directory: {checkpoint_dir}")
+    else:
+        checkpoint_dir = get_checkpoint_dir()
+        print(f"\nCheckpoint directory: {checkpoint_dir}")
+    
+    checkpoint_manager = CheckpointManager(
+        checkpoint_dir,
+        args_dict={
+            "dataset": args.dataset,
+            "model": args.model,
+            "num_problems": args.num_problems,
+            "num_samples": args.num_samples,
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+        }
+    )
     
     # Initialize client based on backend
     print(f"\nInitializing {args.backend} client...")
@@ -247,6 +369,7 @@ def main(args):
         client=sampling_client,
         tokenizer=tokenizer,
         sampling_params=sampling_params,
+        checkpoint_manager=checkpoint_manager,
     )
     
     # Flatten into rows (one per trajectory)
@@ -349,6 +472,11 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
     parser.add_argument("--output-dir", type=str, default="artifacts/trajectories_single_turn")
     parser.add_argument("--push-to-hub", type=str, default=None, help="HF repo to push to (e.g. username/repo-name)")
+    
+    # Checkpointing options
+    parser.add_argument("--resume-from", type=str, default=None,
+                        help="Path to checkpoint directory to resume from (e.g. checkpoints/20260117_143052)")
+    
     # Backend options
     parser.add_argument("--backend", type=str, default="vllm", choices=["tinker", "vllm"],
                         help="Inference backend: 'tinker' or 'vllm' (default: vllm)")

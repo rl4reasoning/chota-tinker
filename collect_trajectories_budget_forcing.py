@@ -21,6 +21,17 @@ Usage:
         --eval-batch-size 8 \
         --eval-timeout-s 1.0 \
         --push-to-hub bicycleman15/qwen3_4b_very_hard_s1_x5
+
+Resume from checkpoint (if previous run failed):
+    python collect_trajectories_budget_forcing.py \
+        --resume-from checkpoints/20260117_143052 \
+        --dataset bicycleman15/intellect_3_code_very_hard \
+        --model Qwen/Qwen3-4B-Instruct-2507 \
+        ... (same args as original run)
+
+Checkpoints are automatically saved after each generation round to:
+    checkpoints/<YYYYMMDD_HHMMSS>/checkpoint.pkl
+    checkpoints/<YYYYMMDD_HHMMSS>/checkpoint_info.json
 """
 
 import os
@@ -31,12 +42,13 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from datasets import Dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
+from checkpoint import CheckpointManager, get_checkpoint_dir
 from intellect_env import IntellectCodeEnv, step_batch
 from utils.pass_at_k import compute_pass_at_k
 
@@ -102,6 +114,55 @@ class BudgetForcingState:
     truncated: bool = False
 
 
+def serialize_budget_forcing_state(state: BudgetForcingState) -> dict:
+    """Serialize a BudgetForcingState to a dictionary for checkpointing."""
+    return {
+        "problem_index": state.problem_index,
+        "sample_index": state.sample_index,
+        "prompt_text": state.prompt_text,
+        "full_response": state.full_response,
+        "total_tokens": state.total_tokens,
+        "current_extension": state.current_extension,
+        "done": state.done,
+        "messages": state.messages.copy(),
+        "reward": state.reward,
+        "terminated": state.terminated,
+        "truncated": state.truncated,
+        # Env-related data needed for reconstruction
+        "question": state.env.question,
+        "tests": state.env.tests,
+    }
+
+
+def deserialize_budget_forcing_state(data: dict, shared_dataset, args) -> BudgetForcingState:
+    """Deserialize a dictionary back to a BudgetForcingState."""
+    env = IntellectCodeEnv(
+        system_prompt="",
+        dataset_name=args.dataset,
+        problem_index=data["problem_index"],
+        max_turns=1,
+        dataset=shared_dataset,
+    )
+    env.reset()
+    env.has_interacted = True
+    
+    state = BudgetForcingState(
+        problem_index=data["problem_index"],
+        sample_index=data["sample_index"],
+        env=env,
+        prompt_text=data["prompt_text"],
+        full_response=data["full_response"],
+        total_tokens=data["total_tokens"],
+        current_extension=data["current_extension"],
+        done=data["done"],
+        messages=data["messages"],
+        reward=data["reward"],
+        terminated=data["terminated"],
+        truncated=data["truncated"],
+    )
+    return state
+
+
 def create_sampling_client(args):
     """Create sampling client based on backend choice."""
     if args.backend == "tinker":
@@ -165,6 +226,7 @@ def run_batched_rollouts_with_budget_forcing(
     args,
     client,
     tokenizer,
+    checkpoint_manager: Optional[CheckpointManager] = None,
 ) -> list[list[dict[str, Any]]]:
     """Run batched single-turn rollouts with budget forcing."""
     # Load dataset ONCE before creating environments
@@ -177,47 +239,77 @@ def run_batched_rollouts_with_budget_forcing(
         shared_dataset = load_dataset(args.dataset, "code", split="train")
     print(f"Dataset loaded with {len(shared_dataset)} problems.")
     
-    # Initialize all states
-    active_states: list[BudgetForcingState] = []
-    
-    print(f"Initializing {args.num_problems * args.num_samples} rollouts...")
-    for problem_idx in range(args.num_problems):
-        for sample_idx in range(args.num_samples):
-            env = IntellectCodeEnv(
-                system_prompt="",
-                dataset_name=args.dataset,
-                problem_index=problem_idx,
-                max_turns=1,
-                dataset=shared_dataset,
-            )
-            obs, info = env.reset()
-            env.has_interacted = True  # Single-turn mode
-            
-            # Build initial prompt
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": obs}
-            ]
-            prompt_text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            
-            state = BudgetForcingState(
-                problem_index=problem_idx,
-                sample_index=sample_idx,
-                env=env,
-                prompt_text=prompt_text,
-                messages=messages.copy(),
-            )
-            active_states.append(state)
-    
-    completed_states: list[BudgetForcingState] = []
     num_attempts = args.num_attempts
-    num_ignores = num_attempts - 1  # Number of "Wait" injections
+    start_round = 0
+    active_states: list[BudgetForcingState] = []
+    completed_states: list[BudgetForcingState] = []
+    
+    # Resume from checkpoint if available
+    if checkpoint_manager and checkpoint_manager.has_checkpoint():
+        print(f"\nResuming from checkpoint: {checkpoint_manager.checkpoint_dir}")
+        checkpoint_data = checkpoint_manager.load()
+        
+        # Verify args match
+        for warning in checkpoint_manager.verify_args({
+            "num_problems": args.num_problems,
+            "num_samples": args.num_samples,
+            "dataset": args.dataset,
+            "model": args.model,
+        }):
+            print(warning)
+        
+        # Restore states
+        start_round = checkpoint_data.current_round
+        print(f"  Resuming from round {start_round + 1}/{num_attempts}")
+        print(f"  Restoring {len(checkpoint_data.active_states_data)} active states...")
+        print(f"  Restoring {len(checkpoint_data.completed_states_data)} completed states...")
+        
+        for state_data in checkpoint_data.active_states_data:
+            state = deserialize_budget_forcing_state(state_data, shared_dataset, args)
+            active_states.append(state)
+        
+        for state_data in checkpoint_data.completed_states_data:
+            state = deserialize_budget_forcing_state(state_data, shared_dataset, args)
+            completed_states.append(state)
+        
+        print(f"  Successfully restored {len(active_states)} active and {len(completed_states)} completed states.")
+    else:
+        # Initialize all states from scratch
+        print(f"Initializing {args.num_problems * args.num_samples} rollouts...")
+        for problem_idx in range(args.num_problems):
+            for sample_idx in range(args.num_samples):
+                env = IntellectCodeEnv(
+                    system_prompt="",
+                    dataset_name=args.dataset,
+                    problem_index=problem_idx,
+                    max_turns=1,
+                    dataset=shared_dataset,
+                )
+                obs, info = env.reset()
+                env.has_interacted = True  # Single-turn mode
+                
+                # Build initial prompt
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": obs}
+                ]
+                prompt_text = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                
+                state = BudgetForcingState(
+                    problem_index=problem_idx,
+                    sample_index=sample_idx,
+                    env=env,
+                    prompt_text=prompt_text,
+                    messages=messages.copy(),
+                )
+                active_states.append(state)
+    
     max_tokens = args.max_tokens
     
     # Process in rounds: each round handles one generation step for all active states
-    for extension_round in range(num_attempts):
+    for extension_round in range(start_round, num_attempts):
         if not active_states:
             break
             
@@ -255,6 +347,15 @@ def run_batched_rollouts_with_budget_forcing(
         
         active_states = still_active
         print(f"  Generated. {len(completed_states)} completed, {len(active_states)} continuing.")
+        
+        # Save checkpoint after each round
+        if checkpoint_manager:
+            checkpoint_manager.save(
+                active_states_data=[serialize_budget_forcing_state(s) for s in active_states],
+                completed_states_data=[serialize_budget_forcing_state(s) for s in completed_states],
+                current_round=extension_round + 1,
+                total_rounds=num_attempts,
+            )
     
     # Handle any remaining active states (shouldn't happen but just in case)
     for state in active_states:
@@ -318,7 +419,30 @@ def main(args):
     print(f"  Num attempts: {args.num_attempts}")
     print(f"  Max tokens: {args.max_tokens}")
     print(f"  Output: {args.output_dir}")
+    if args.resume_from:
+        print(f"  Resuming from: {args.resume_from}")
     print(f"=" * 60)
+    
+    # Setup checkpoint manager
+    if args.resume_from:
+        checkpoint_dir = args.resume_from
+        print(f"\nResuming from checkpoint directory: {checkpoint_dir}")
+    else:
+        checkpoint_dir = get_checkpoint_dir()
+        print(f"\nCheckpoint directory: {checkpoint_dir}")
+    
+    checkpoint_manager = CheckpointManager(
+        checkpoint_dir,
+        args_dict={
+            "dataset": args.dataset,
+            "model": args.model,
+            "num_problems": args.num_problems,
+            "num_samples": args.num_samples,
+            "num_attempts": args.num_attempts,
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+        }
+    )
     
     # Initialize client based on backend
     print(f"\nInitializing {args.backend} client...")
@@ -332,6 +456,7 @@ def main(args):
         args=args,
         client=sampling_client,
         tokenizer=tokenizer,
+        checkpoint_manager=checkpoint_manager,
     )
     
     # Flatten into rows (one per trajectory)
@@ -448,6 +573,10 @@ if __name__ == "__main__":
     # Budget forcing specific
     parser.add_argument("--num-attempts", type=int, default=2,
                         help="Total number of generation rounds (comparable to --max-turns in collect_trajectories.py)")
+    
+    # Checkpointing options
+    parser.add_argument("--resume-from", type=str, default=None,
+                        help="Path to checkpoint directory to resume from (e.g. checkpoints/20260117_143052)")
     
     # Backend options
     parser.add_argument("--backend", type=str, default="vllm", choices=["tinker", "vllm"],

@@ -220,3 +220,5 @@ local_artifacts/
 artifacts/
 
 tmp*/
+
+checkpoints/

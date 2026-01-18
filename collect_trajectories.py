@@ -6,14 +6,25 @@ Usage:
     --model Qwen/Qwen3-4B-Instruct-2507 \
     --backend vllm \
     --num-problems 10 \
-    --num-samples 32 \
+    --num-samples 8 \
+    --max-turns 5 \
     \
     --fast-eval \
     --eval-workers 16 \
     --eval-batch-size 8 \
     --eval-timeout-s 1.0 \
-    --push-to-hub bicycleman15/qwen3_4b_instruct_easy_medium
+    --push-to-hub bicycleman15/temp
 
+Resume from checkpoint (if previous run failed):
+    python collect_trajectories.py \
+        --resume-from checkpoints/20260117_143052 \
+        --dataset bicycleman15/intellect_3_code_very_hard \
+        --model Qwen/Qwen3-4B-Instruct-2507 \
+        ... (same args as original run)
+
+Checkpoints are automatically saved after each generation round to:
+    checkpoints/<YYYYMMDD_HHMMSS>/checkpoint.pkl
+    checkpoints/<YYYYMMDD_HHMMSS>/checkpoint_info.json
 """
 
 import os
@@ -30,6 +41,7 @@ from datasets import Dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
+from checkpoint import CheckpointManager, get_checkpoint_dir
 from intellect_env import IntellectCodeEnv, step_batch
 from utils.pass_at_k import compute_pass_at_k
 
@@ -100,6 +112,59 @@ class RolloutState:
     done: bool = False
     terminated: bool = False
     truncated: bool = False
+
+
+def serialize_rollout_state(state: RolloutState) -> dict:
+    """Serialize a RolloutState to a dictionary for checkpointing."""
+    return {
+        "problem_index": state.problem_index,
+        "sample_index": state.sample_index,
+        "history": [msg.copy() for msg in state.history],
+        "messages": [msg.copy() for msg in state.messages],
+        "interactions": [inter.copy() for inter in state.interactions],
+        "total_reward": state.total_reward,
+        "obs": state.obs,
+        "done": state.done,
+        "terminated": state.terminated,
+        "truncated": state.truncated,
+        # Env-related data needed for reconstruction
+        "question": state.env.question,
+        "tests": state.env.tests,
+        "current_turn": state.env.current_turn,
+        "env_history": state.env.history.copy() if state.env.history else [],
+        "has_interacted": state.env.has_interacted,
+    }
+
+
+def deserialize_rollout_state(data: dict, shared_dataset, args) -> RolloutState:
+    """Deserialize a dictionary back to a RolloutState."""
+    env = IntellectCodeEnv(
+        system_prompt="",
+        dataset_name=args.dataset,
+        problem_index=data["problem_index"],
+        max_turns=args.max_turns,
+        dataset=shared_dataset,
+    )
+    env.reset()
+    # Restore env state
+    env.current_turn = data["current_turn"]
+    env.history = data["env_history"]
+    env.has_interacted = data["has_interacted"]
+    
+    state = RolloutState(
+        problem_index=data["problem_index"],
+        sample_index=data["sample_index"],
+        env=env,
+        history=data["history"],
+        messages=data["messages"],
+        interactions=data["interactions"],
+        total_reward=data["total_reward"],
+        obs=data["obs"],
+        done=data["done"],
+        terminated=data["terminated"],
+        truncated=data["truncated"],
+    )
+    return state
 
 
 def create_sampling_client(args):
@@ -178,6 +243,7 @@ def run_batched_rollouts(
     client,
     tokenizer,
     sampling_params,
+    checkpoint_manager: Optional[CheckpointManager] = None,
 ) -> list[list[dict[str, Any]]]:
     """Run batched rollouts across all problems and samples."""
     # Load dataset ONCE before creating environments
@@ -190,55 +256,127 @@ def run_batched_rollouts(
         shared_dataset = load_dataset(args.dataset, "code", split="train")
     print(f"Dataset loaded with {len(shared_dataset)} problems.")
     
-    # Initialize all rollout states
+    # Track generation round for checkpointing
+    generation_round = 0
     active_states: list[RolloutState] = []
-    for problem_idx in range(args.num_problems):
-        for sample_idx in range(args.num_samples):
-            env = IntellectCodeEnv(
-                system_prompt="",
-                dataset_name=args.dataset,
-                problem_index=problem_idx,
-                max_turns=args.max_turns,
-                dataset=shared_dataset,  # Pass pre-loaded dataset
-            )
-            obs, info = env.reset()
-            state = RolloutState(
-                problem_index=problem_idx,
-                sample_index=sample_idx,
-                env=env,
-                history=[{"role": "system", "content": SYSTEM_PROMPT}],
-                messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": obs}],
-                obs=obs,
-            )
-            active_states.append(state)
-    
     completed_states: list[RolloutState] = []
-    problems_completed = set()
+    skip_generation = False  # Flag to skip generation on first iteration after resume
     
-    pbar = tqdm(total=args.num_problems, desc="Problems completed")
+    # Resume from checkpoint if available
+    if checkpoint_manager and checkpoint_manager.has_checkpoint():
+        print(f"\nResuming from checkpoint: {checkpoint_manager.checkpoint_dir}")
+        checkpoint_data = checkpoint_manager.load()
+        
+        # Verify args match
+        for warning in checkpoint_manager.verify_args({
+            "num_problems": args.num_problems,
+            "num_samples": args.num_samples,
+            "dataset": args.dataset,
+            "model": args.model,
+        }):
+            print(warning)
+        
+        # Restore states
+        generation_round = checkpoint_data.current_round
+        print(f"  Resuming from generation round {generation_round}")
+        print(f"  Restoring {len(checkpoint_data.active_states_data)} active states...")
+        print(f"  Restoring {len(checkpoint_data.completed_states_data)} completed states...")
+        
+        for state_data in checkpoint_data.active_states_data:
+            state = deserialize_rollout_state(state_data, shared_dataset, args)
+            active_states.append(state)
+        
+        for state_data in checkpoint_data.completed_states_data:
+            state = deserialize_rollout_state(state_data, shared_dataset, args)
+            completed_states.append(state)
+        
+        print(f"  Successfully restored {len(active_states)} active and {len(completed_states)} completed states.")
+        
+        # Skip generation on first iteration - checkpoint was saved after generation but before step_batch
+        skip_generation = True
+    else:
+        # Initialize all rollout states from scratch
+        for problem_idx in range(args.num_problems):
+            for sample_idx in range(args.num_samples):
+                env = IntellectCodeEnv(
+                    system_prompt="",
+                    dataset_name=args.dataset,
+                    problem_index=problem_idx,
+                    max_turns=args.max_turns,
+                    dataset=shared_dataset,  # Pass pre-loaded dataset
+                )
+                obs, info = env.reset()
+                state = RolloutState(
+                    problem_index=problem_idx,
+                    sample_index=sample_idx,
+                    env=env,
+                    history=[{"role": "system", "content": SYSTEM_PROMPT}],
+                    messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": obs}],
+                    obs=obs,
+                )
+                active_states.append(state)
+    
+    problems_completed = set()
+    # Count already completed problems from checkpoint
+    for state in completed_states:
+        problem_samples_done = sum(1 for s in completed_states if s.problem_index == state.problem_index)
+        if problem_samples_done == args.num_samples:
+            problems_completed.add(state.problem_index)
+    
+    pbar = tqdm(total=args.num_problems, desc="Problems completed", initial=len(problems_completed))
     
     while active_states:
-        # Build prompts for all active states
-        prompts = [build_prompt(s, tokenizer) for s in active_states]
-        
-        # Batch sample
-        if args.backend == "tinker":
-            token_results = asyncio.run(sample_batch_tinker(client, prompts, sampling_params))
-            responses = [tokenizer.decode(tokens, skip_special_tokens=True) for tokens in token_results]
+        # Skip generation if resuming (checkpoint was saved after generation, before step_batch)
+        if skip_generation:
+            print(f"\n[Resuming round {generation_round}] Skipping generation, going directly to code execution...")
+            # Extract the last assistant response from each state's history
+            processed_responses = []
+            for state in active_states:
+                # The last message in history should be the assistant's response
+                last_assistant_msg = None
+                for msg in reversed(state.history):
+                    if msg["role"] == "assistant":
+                        last_assistant_msg = msg["content"]
+                        break
+                if last_assistant_msg is None:
+                    raise ValueError(f"No assistant response found in history for state {state.problem_index}:{state.sample_index}")
+                processed_responses.append(last_assistant_msg)
+            skip_generation = False  # Only skip once
         else:
-            responses = sample_batch_vllm(client, prompts, sampling_params)
-        
-        # Process responses and step environments
-        still_active = []
-        processed_responses = []
-        for state, response in zip(active_states, responses):
-            response = postprocess_response(response)
+            generation_round += 1
+            print(f"\n[Generation round {generation_round}] Processing {len(active_states)} active states...")
             
-            # Update history and messages
-            state.history.append({"role": "user", "content": state.obs})
-            state.history.append({"role": "assistant", "content": response})
-            state.messages.append({"role": "assistant", "content": response})
-            processed_responses.append(response)
+            # Build prompts for all active states
+            prompts = [build_prompt(s, tokenizer) for s in active_states]
+            
+            # Batch sample
+            if args.backend == "tinker":
+                token_results = asyncio.run(sample_batch_tinker(client, prompts, sampling_params))
+                responses = [tokenizer.decode(tokens, skip_special_tokens=True) for tokens in token_results]
+            else:
+                responses = sample_batch_vllm(client, prompts, sampling_params)
+            
+            # Process responses and step environments
+            processed_responses = []
+            for state, response in zip(active_states, responses):
+                response = postprocess_response(response)
+                
+                # Update history and messages
+                state.history.append({"role": "user", "content": state.obs})
+                state.history.append({"role": "assistant", "content": response})
+                state.messages.append({"role": "assistant", "content": response})
+                processed_responses.append(response)
+
+            # Save checkpoint BEFORE code execution (so we can retry if execution fails)
+            if checkpoint_manager:
+                checkpoint_manager.save(
+                    active_states_data=[serialize_rollout_state(s) for s in active_states],
+                    completed_states_data=[serialize_rollout_state(s) for s in completed_states],
+                    current_round=generation_round,
+                    total_rounds=args.max_turns * args.num_problems * args.num_samples,  # Rough estimate
+                )
+
+        still_active = []
 
         if args.fast_eval:
             step_results = step_batch(
@@ -314,7 +452,30 @@ def main(args):
     print(f"  Samples per problem: {args.num_samples}")
     print(f"  Max turns: {args.max_turns}")
     print(f"  Output: {args.output_dir}")
+    if args.resume_from:
+        print(f"  Resuming from: {args.resume_from}")
     print(f"=" * 60)
+    
+    # Setup checkpoint manager
+    if args.resume_from:
+        checkpoint_dir = args.resume_from
+        print(f"\nResuming from checkpoint directory: {checkpoint_dir}")
+    else:
+        checkpoint_dir = get_checkpoint_dir()
+        print(f"\nCheckpoint directory: {checkpoint_dir}")
+    
+    checkpoint_manager = CheckpointManager(
+        checkpoint_dir,
+        args_dict={
+            "dataset": args.dataset,
+            "model": args.model,
+            "num_problems": args.num_problems,
+            "num_samples": args.num_samples,
+            "max_turns": args.max_turns,
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+        }
+    )
     
     # Initialize client based on backend
     print(f"\nInitializing {args.backend} client...")
@@ -330,6 +491,7 @@ def main(args):
         client=sampling_client,
         tokenizer=tokenizer,
         sampling_params=sampling_params,
+        checkpoint_manager=checkpoint_manager,
     )
     
     # Flatten into rows (one per trajectory)
@@ -435,6 +597,11 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
     parser.add_argument("--output-dir", type=str, default="artifacts/trajectories")
     parser.add_argument("--push-to-hub", type=str, default=None, help="HF repo to push to (e.g. username/repo-name)")
+    
+    # Checkpointing options
+    parser.add_argument("--resume-from", type=str, default=None,
+                        help="Path to checkpoint directory to resume from (e.g. checkpoints/20260117_143052)")
+    
     # Backend options
     parser.add_argument("--backend", type=str, default="vllm", choices=["tinker", "vllm"],
                         help="Inference backend: 'tinker' or 'vllm' (default: vllm)")
