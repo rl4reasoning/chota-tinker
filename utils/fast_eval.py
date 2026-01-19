@@ -79,6 +79,42 @@ def _exec_code(code: str, stdin: Optional[str], timeout_s: Optional[float]) -> t
         sys.stdin = old_stdin
 
 
+def _exec_code_subprocess(code: str, stdin: Optional[str], timeout_s: Optional[float]) -> tuple[bool, str, str]:
+    """Execute code in a subprocess with hard timeout (SIGKILL).
+    
+    Unlike _exec_code which uses SIGALRM, this can interrupt C extensions
+    like itertools.permutations that don't release the GIL.
+    """
+    import subprocess
+    import tempfile
+    import os
+    
+    # Write code to a temp file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        f.write(code)
+        temp_path = f.name
+    
+    try:
+        result = subprocess.run(
+            [sys.executable, temp_path],
+            input=stdin or "",
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        success = result.returncode == 0
+        return success, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return False, "", "Execution timed out (subprocess killed)\n"
+    except Exception as e:
+        return False, "", f"Subprocess error: {e}\n"
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
 def _normalize_io(value: Any) -> Any:
     if isinstance(value, list):
         return "\n".join(map(str, value))
@@ -304,7 +340,17 @@ def _evaluate_code(
         timeout_s=timeout_s,
         timeout_record_limit=timeout_record_limit,
     )
-    success, stdout, _ = _exec_code(harness, None, None)
+    # Calculate overall harness timeout: per-test timeout * num_tests + buffer for setup
+    # Use subprocess execution which can kill C extensions that don't release GIL
+    # (e.g., infinite loops in itertools.permutations)
+    num_tests = len(inputs)
+    if timeout_s and timeout_s > 0:
+        # Give each test its timeout plus 5s buffer for compilation/setup
+        overall_timeout = timeout_s * num_tests + 5.0
+    else:
+        # Default to 60s if no per-test timeout specified
+        overall_timeout = 60.0
+    success, stdout, _ = _exec_code_subprocess(harness, None, overall_timeout)
     if not success:
         return 0.0, 0, ()
     return _parse_harness_output(stdout)

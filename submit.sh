@@ -21,7 +21,7 @@ python collect_trajectories_budget_forcing.py \
         --dataset bicycleman15/intellect_3_code_very_hard \
         --model Qwen/Qwen3-4B-Instruct-2507 \
         --backend vllm \
-        --start-problem 550 \
+        --start-problem 500 \
         --num-problems 50 \
         --num-samples 32 \
         \
@@ -29,12 +29,13 @@ python collect_trajectories_budget_forcing.py \
         --eval-workers 8 \
         --eval-batch-size 8 \
         --eval-timeout-s 1.0 \
-        --push-to-hub bicycleman15/550_600_s1
+        --resume-from checkpoints/20260119_015555_e8808fef \
+        --push-to-hub bicycleman15/500_550_s1
 
-# 100_150_s1
-# 250_300_s1
-# 500_550_s1
-# 550_600_s1
+# 100_150_s1 # done!
+# 250_300_s1 # checkpoints/20260119_015555_76d3d6ec
+# 500_550_s1 # checkpoints/20260119_015555_e8808fef
+# 550_600_s1 # done!
 
 
 echo "Run finished at: "
