@@ -22,22 +22,24 @@ Usage:
 import os
 import json
 import pickle
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
 
 def get_checkpoint_dir(base_dir: str = "checkpoints") -> str:
-    """Generate a checkpoint directory with current timestamp.
+    """Generate a checkpoint directory with current timestamp and unique ID.
     
     Args:
         base_dir: Base directory for checkpoints (default: "checkpoints")
         
     Returns:
-        Path like "checkpoints/20260117_143052"
+        Path like "checkpoints/20260117_143052_a1b2c3d4"
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return os.path.join(base_dir, timestamp)
+    short_uuid = uuid.uuid4().hex[:8]
+    return os.path.join(base_dir, f"{timestamp}_{short_uuid}")
 
 
 @dataclass
