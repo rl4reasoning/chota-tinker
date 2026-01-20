@@ -164,6 +164,7 @@ def _build_multi_test_harness(
     safe_timeout = timeout_s if timeout_s and timeout_s > 0 else None
     safe_timeout_records = max(timeout_record_limit, 0)
     return f"""
+import ast
 import contextlib
 import io
 import json
@@ -214,6 +215,25 @@ def _compare(actual, expected_clean):
         return actual.lower() == expected_clean.lower()
     return actual == expected_clean
 
+def _parse_input_args(input_str):
+    \"\"\"Parse stdin-format input string into function arguments.
+    
+    Input format: newline-separated values, each line is a Python literal.
+    Example: '[2, 2, 1]\\n4' -> [[2, 2, 1], 4]
+    \"\"\"
+    lines = input_str.strip().split('\\n')
+    args = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            args.append(ast.literal_eval(line))
+        except (ValueError, SyntaxError):
+            # If literal_eval fails, keep as string
+            args.append(line)
+    return args
+
 def _run_solution_case():
     global_ns = {{"__name__": "__main__"}}
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -225,16 +245,16 @@ def _run_solution_case():
     total = len(_inputs)
     timeout_count = 0
     timeout_indices = []
-    for idx, (input_expr, expected) in enumerate(zip(_inputs, _expected)):
-        def _call():
-            local = {{}}
-            exec("_input = " + input_expr, {{}}, local)
-            _input = local["_input"]
+    for idx, (input_str, expected) in enumerate(zip(_inputs, _expected)):
+        def _call(inp=input_str):
+            # Parse input string into arguments
+            args = _parse_input_args(inp)
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 try:
                     sol = sol_cls()
-                    _result = getattr(sol, _fn_name)(_input)
+                    # Call function with parsed arguments
+                    _result = getattr(sol, _fn_name)(*args)
                     print(_result)
                 except SystemExit:
                     pass
@@ -329,13 +349,14 @@ def _evaluate_code(
     require_solution_class: bool,
 ) -> tuple[float, int, tuple[int, ...]]:
     inputs, outputs = _select_tests(tests, max_tests)
-    normalized_inputs = [_normalize_io(inp) for inp in inputs]
-    normalized_outputs = [_normalize_io(expected) for expected in outputs]
+    # Normalize inputs/outputs to strings (for both Solution class and stdin execution)
+    normalized_inputs = [str(_normalize_io(inp)) if inp is not None else "" for inp in inputs]
+    normalized_outputs = [str(_normalize_io(expected)) if expected is not None else "" for expected in outputs]
 
     harness = _build_multi_test_harness(
         code=code,
-        inputs=[str(inp) if inp is not None else "" for inp in normalized_inputs],
-        outputs=[str(exp) if exp is not None else "" for exp in normalized_outputs],
+        inputs=normalized_inputs,
+        outputs=normalized_outputs,
         fn_name=tests.get("fn_name", None),
         timeout_s=timeout_s,
         timeout_record_limit=timeout_record_limit,

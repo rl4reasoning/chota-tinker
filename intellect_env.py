@@ -174,6 +174,9 @@ class IntellectCodeEnv(Env):
     - LLM submits final answer in ```python``` -> evaluated against tests
     """
 
+    # Reminder text for interaction mode
+    INTERACTION_REMINDER = "NOTE: You must interact at least once before submitting your final answer. Use <interact> ... your code here ... </interact> to test your code first. Remember to pass in the inputs yourself."
+
     def __init__(
         self,
         system_prompt: str = "",
@@ -187,6 +190,7 @@ class IntellectCodeEnv(Env):
         dataset_name: str = "PrimeIntellect/INTELLECT-3-RL",
         problem_index: Optional[int] = None,
         dataset: Optional[Dataset] = None,
+        interaction_mode: bool = False,
     ):
         super().__init__()
         self.system_prompt = system_prompt
@@ -197,6 +201,7 @@ class IntellectCodeEnv(Env):
         self.seed = seed
         self.dataset_name = dataset_name
         self.problem_index = problem_index
+        self.interaction_mode = interaction_mode
         
         # Use pre-loaded dataset if provided, otherwise load it
         if dataset is not None:
@@ -239,6 +244,9 @@ class IntellectCodeEnv(Env):
         self.has_interacted = False
         
         obs = self._build_observation(self.question)
+        # Append interaction reminder on first observation if in interaction mode
+        if self.interaction_mode:
+            obs = obs + "\n\n" + self.INTERACTION_REMINDER
         return obs, {}
 
     def step(self, action: str) -> Tuple[str, float, bool, bool, dict[str, Any]]:
@@ -320,9 +328,13 @@ class IntellectCodeEnv(Env):
         return obs, 0.0, False, False, {}
 
     def _handle_final(self, answer_code: str) -> Tuple[str, float, bool, bool, dict[str, Any]]:
-        # Require at least one interaction before final answer
+        # Require at least one interaction before final answer (unless at turn limit)
         if not self.has_interacted:
-            return self._handle_requires_interaction()
+            if self.current_turn >= self.max_turns:
+                # At turn limit - evaluate anyway even without interaction
+                pass
+            else:
+                return self._handle_requires_interaction()
 
         # Enforce Solution-only when fn_name exists (align with fast_eval)
         if self.fn_name and "class Solution" not in answer_code:
@@ -331,12 +343,13 @@ class IntellectCodeEnv(Env):
         reward = self._evaluate(answer_code)
         return "", reward, True, False, {"final": True}
 
-    def build_eval_task(self, action: str, timeout_s: Optional[float]) -> Optional[EvalTask]:
+    def build_eval_task(self, action: str, timeout_s: Optional[float], force_eval: bool = False) -> Optional[EvalTask]:
         if self._extract_interact_code(action):
             return None
         if not self._extract_answer_code(action):
             return None
-        if not self.has_interacted:
+        # Skip interaction check if force_eval or at turn limit
+        if not self.has_interacted and not force_eval and self.current_turn < self.max_turns:
             return None
         return EvalTask(
             response=action,
@@ -347,6 +360,8 @@ class IntellectCodeEnv(Env):
         )
 
     def _evaluate(self, code: str) -> float:
+        import ast
+        
         tests = self.tests
         
         total_tests = len(tests["inputs"])
@@ -358,18 +373,40 @@ class IntellectCodeEnv(Env):
         
         passed = 0
         for inp, expected in zip(tests["inputs"], tests["outputs"]):
+            # Normalize input to string if it's a list
             if isinstance(inp, list):
                 inp = "\n".join(map(str, inp))
-            if isinstance(expected, list):
-                expected = "\n".join(map(str, expected))
             
             # wrap code with test harness for LeetCode-style Solution class
             if self.fn_name and "class Solution" in code:
-                harness = f"_input = {inp}\n_sol = Solution()\n_result = _sol.{self.fn_name}(_input)\nprint(_result)"
+                # Parse input string into arguments (stdin format: newline-separated values)
+                # Example: '[2, 2, 1]\n4' -> args = [[2, 2, 1], 4]
+                lines = inp.strip().split('\n')
+                args = []
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        args.append(ast.literal_eval(line))
+                    except (ValueError, SyntaxError):
+                        args.append(line)
+                
+                # Build harness that calls function with parsed arguments
+                args_repr = repr(args)
+                harness = f"""_args = {args_repr}
+_sol = Solution()
+_result = _sol.{self.fn_name}(*_args)
+print(_result)"""
                 wrapped_code = code + "\n\n" + harness
                 success, stdout, _ = run_python(wrapped_code, self.sandbox_type)
             else:
+                # For stdin-based execution, use input as-is
                 success, stdout, _ = run_python(code, self.sandbox_type, stdin=inp)
+            
+            # Normalize expected output
+            if isinstance(expected, list):
+                expected = "\n".join(map(str, expected))
             
             # strip outer quotes from expected if present (LeetCode format)
             expected_clean = expected.strip()
@@ -474,8 +511,10 @@ def step_batch(
         answer_code = env._extract_answer_code(action)
         if answer_code:
             if not env.has_interacted:
-                results[idx] = env._handle_requires_interaction()
-                continue
+                # At turn limit - evaluate anyway even without interaction
+                if env.current_turn < env.max_turns:
+                    results[idx] = env._handle_requires_interaction()
+                    continue
             eval_tasks.append(
                 EvalTask(
                     response=action,
