@@ -78,6 +78,41 @@ def _exec_interaction_code(code: str, timeout_s: Optional[float]) -> tuple[bool,
         os._exit = original_os_exit
 
 
+def _exec_interaction_code_subprocess(code: str, timeout_s: Optional[float]) -> tuple[bool, str, str]:
+    """Execute interaction code in subprocess with hard timeout (SIGKILL).
+    
+    Unlike _exec_interaction_code which uses SIGALRM, this can interrupt C extensions
+    like itertools.permutations that don't release the GIL.
+    """
+    import subprocess
+    import tempfile
+    import sys
+    
+    # Write code to a temp file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        f.write(code)
+        temp_path = f.name
+    
+    try:
+        result = subprocess.run(
+            [sys.executable, temp_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        success = result.returncode == 0
+        return success, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return False, "", "Execution timed out\n"
+    except Exception as e:
+        return False, "", f"Subprocess error: {e}\n"
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
 _INTERACTION_EXECUTOR: Optional[ProcessPoolExecutor] = None
 _INTERACTION_EXECUTOR_WORKERS: Optional[int] = None
 _EVAL_EXECUTOR: Optional[ProcessPoolExecutor] = None
@@ -253,7 +288,7 @@ class IntellectCodeEnv(Env):
 
     def _handle_interact(self, python_code: str) -> Tuple[str, float, bool, bool, dict[str, Any]]:
         try:
-            success, stdout, stderr = _exec_interaction_code(
+            success, stdout, stderr = _exec_interaction_code_subprocess(
                 python_code, self.interaction_timeout_s
             )
             if success:
@@ -363,7 +398,7 @@ class IntellectCodeEnv(Env):
 def _run_python_batch_item(item: tuple[str, Optional[float]]) -> tuple[bool, str, str]:
     """Helper function to run interaction code in a worker process (must be at module level for pickling)."""
     code, timeout_s = item
-    return _exec_interaction_code(code, timeout_s)
+    return _exec_interaction_code_subprocess(code, timeout_s)
 
 
 def _run_python_batch(
@@ -386,7 +421,7 @@ def _run_python_batch(
         return list(results_iter)
 
     if max_workers <= 1 and batch_size <= 1:
-        results_iter = (_exec_interaction_code(code, timeout_s) for code, timeout_s in codes_and_timeouts)
+        results_iter = (_exec_interaction_code_subprocess(code, timeout_s) for code, timeout_s in codes_and_timeouts)
         if show_progress:
             from tqdm import tqdm
             results_iter = tqdm(results_iter, total=len(codes_and_timeouts), desc=progress_desc)
@@ -466,7 +501,7 @@ def step_batch(
         ]
         interaction_show_progress = show_progress and len(codes_and_timeouts) > 1
         if len(codes_and_timeouts) == 1:
-            interact_results = [_exec_interaction_code(codes_and_timeouts[0][0], codes_and_timeouts[0][1])]
+            interact_results = [_exec_interaction_code_subprocess(codes_and_timeouts[0][0], codes_and_timeouts[0][1])]
         else:
             interaction_executor = None
             if use_persistent_pool and eval_workers > 1:
