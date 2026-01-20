@@ -4,7 +4,7 @@ Code environment demo using GEM with LLM agent.
 Uses tinker API for sampling.
 
 Usage:
-    python gem_math_demo.py --model Qwen/Qwen3-4B-Instruct-2507 --difficulty easy_medium --problem_index 0
+    python gem_math_demo.py --model Qwen/Qwen3-30B-A3B-Instruct-2507 --difficulty very_hard --problem_index 0
 
 possible models:
 deepseek-ai/DeepSeek-V3.1
@@ -124,7 +124,7 @@ async def main():
     if args.problem_index is not None:
         print(f"Using problem index: {args.problem_index}")
     print()
-    env = IntellectCodeEnv(system_prompt="", max_turns=args.max_steps, dataset_name=dataset_name, problem_index=args.problem_index)
+    env = IntellectCodeEnv(system_prompt="", max_turns=args.max_steps, dataset_name=dataset_name, problem_index=args.problem_index, interaction_mode=True)
     
     rewards = []
     for ep in range(args.num_episodes):
