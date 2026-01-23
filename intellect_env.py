@@ -201,7 +201,7 @@ class IntellectCodeEnv(Env):
         dataset_name: str = "PrimeIntellect/INTELLECT-3-RL",
         problem_index: Optional[int] = None,
         dataset: Optional[Dataset] = None,
-        interaction_mode: bool = False,
+        interaction_mode: bool = True,  # Whether to append interactive mode reminder
     ):
         super().__init__()
         self.system_prompt = system_prompt
