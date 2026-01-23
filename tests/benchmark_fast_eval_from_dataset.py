@@ -144,7 +144,7 @@ def main() -> None:
     )
     parser.add_argument("--split", type=str, default="train")
     parser.add_argument("--max-rows", type=int, default=256)
-    parser.add_argument("--max-tests", type=int, default=12)
+    parser.add_argument("--max-tests", type=int, default=15)
     parser.add_argument("--eval-workers", type=int, default=8)
     parser.add_argument("--eval-batch-size", type=int, default=8)
     parser.add_argument("--eval-timeout-s", type=float, default=5.0)

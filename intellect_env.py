@@ -10,14 +10,15 @@ import os
 import re
 import random
 import signal
+import threading
 import multiprocessing as mp
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Optional, Tuple
 from datasets import Dataset, load_dataset
 from gem.core import Env
-from gem.utils.sandbox import run_python
-from utils.fast_eval import EvalTask, evaluate_task, evaluate_tasks
+from utils.fast_eval import EvalTask, evaluate_task, evaluate_tasks, _evaluate_code
+from code_env.code_env.utils.deepcoder_utils import extract_code_from_model, BASE_IMPORTS
 
 
 @contextlib.contextmanager
@@ -39,7 +40,13 @@ def _time_limit(seconds: Optional[float]):
 
 
 def _exec_interaction_code(code: str, timeout_s: Optional[float]) -> tuple[bool, str, str]:
-    """Execute interaction code in-process (no sandbox)."""
+    """Execute interaction code in-process (no sandbox).
+    
+    Prepends BASE_IMPORTS for consistency with evaluation environment.
+    """
+    # Prepend BASE_IMPORTS for consistency with evaluation (code_env parity)
+    full_code = BASE_IMPORTS + "\n" + code
+    
     stdout_buffer = io.StringIO()
     stderr_buffer = io.StringIO()
     original_os_exit = os._exit
@@ -51,7 +58,7 @@ def _exec_interaction_code(code: str, timeout_s: Optional[float]) -> tuple[bool,
     try:
         with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
             with _time_limit(timeout_s):
-                exec(code, {"__name__": "__main__"})
+                exec(full_code, {"__name__": "__main__"})
         return True, stdout_buffer.getvalue(), stderr_buffer.getvalue()
     except SystemExit as exc:
         if exc.code in (None, 0):
@@ -83,14 +90,19 @@ def _exec_interaction_code_subprocess(code: str, timeout_s: Optional[float]) -> 
     
     Unlike _exec_interaction_code which uses SIGALRM, this can interrupt C extensions
     like itertools.permutations that don't release the GIL.
+    
+    Prepends BASE_IMPORTS for consistency with evaluation environment.
     """
     import subprocess
     import tempfile
     import sys
     
+    # Prepend BASE_IMPORTS for consistency with evaluation (code_env parity)
+    full_code = BASE_IMPORTS + "\n" + code
+    
     # Write code to a temp file
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write(code)
+        f.write(full_code)
         temp_path = f.name
     
     try:
@@ -113,57 +125,56 @@ def _exec_interaction_code_subprocess(code: str, timeout_s: Optional[float]) -> 
             pass
 
 
-_INTERACTION_EXECUTOR: Optional[ProcessPoolExecutor] = None
-_INTERACTION_EXECUTOR_WORKERS: Optional[int] = None
-_EVAL_EXECUTOR: Optional[ProcessPoolExecutor] = None
-_EVAL_EXECUTOR_WORKERS: Optional[int] = None
+class ExecutorPool:
+    """Manages a persistent ProcessPoolExecutor with automatic lifecycle handling.
+    
+    Inspired by code_env's SandboxPool pattern but simplified for local subprocess execution.
+    """
+    
+    def __init__(self, name: str = "pool"):
+        self._executor: Optional[ProcessPoolExecutor] = None
+        self._max_workers: Optional[int] = None
+        self._name = name
+        self._lock = threading.Lock()
+    
+    def get(self, max_workers: int) -> ProcessPoolExecutor:
+        """Get or create executor with specified worker count.
+        
+        If an executor exists with the same worker count, reuse it.
+        Otherwise, shutdown the old one and create a new one.
+        """
+        with self._lock:
+            if self._executor is not None and self._max_workers == max_workers:
+                return self._executor
+            self.shutdown()
+            mp_context = mp.get_context("spawn")
+            self._executor = ProcessPoolExecutor(
+                max_workers=max_workers, mp_context=mp_context
+            )
+            self._max_workers = max_workers
+            return self._executor
+    
+    def shutdown(self) -> None:
+        """Shutdown the executor if running."""
+        with self._lock:
+            if self._executor is not None:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+                self._executor = None
+                self._max_workers = None
 
 
-def _shutdown_persistent_executors() -> None:
-    global _INTERACTION_EXECUTOR, _INTERACTION_EXECUTOR_WORKERS
-    global _EVAL_EXECUTOR, _EVAL_EXECUTOR_WORKERS
-    if _INTERACTION_EXECUTOR is not None:
-        _INTERACTION_EXECUTOR.shutdown(wait=False, cancel_futures=True)
-        _INTERACTION_EXECUTOR = None
-        _INTERACTION_EXECUTOR_WORKERS = None
-    if _EVAL_EXECUTOR is not None:
-        _EVAL_EXECUTOR.shutdown(wait=False, cancel_futures=True)
-        _EVAL_EXECUTOR = None
-        _EVAL_EXECUTOR_WORKERS = None
+# Module-level pool instances
+_interaction_pool = ExecutorPool("interaction")
+_eval_pool = ExecutorPool("eval")
 
 
-atexit.register(_shutdown_persistent_executors)
+def _shutdown_all_pools() -> None:
+    """Shutdown all executor pools on exit."""
+    _interaction_pool.shutdown()
+    _eval_pool.shutdown()
 
 
-def _get_persistent_executor(kind: str, max_workers: int) -> ProcessPoolExecutor:
-    global _INTERACTION_EXECUTOR, _INTERACTION_EXECUTOR_WORKERS
-    global _EVAL_EXECUTOR, _EVAL_EXECUTOR_WORKERS
-
-    if kind == "interaction":
-        if _INTERACTION_EXECUTOR is not None and _INTERACTION_EXECUTOR_WORKERS == max_workers:
-            return _INTERACTION_EXECUTOR
-        if _INTERACTION_EXECUTOR is not None:
-            _INTERACTION_EXECUTOR.shutdown(wait=False, cancel_futures=True)
-        mp_context = mp.get_context("spawn")
-        _INTERACTION_EXECUTOR = ProcessPoolExecutor(
-            max_workers=max_workers, mp_context=mp_context
-        )
-        _INTERACTION_EXECUTOR_WORKERS = max_workers
-        return _INTERACTION_EXECUTOR
-
-    if kind == "eval":
-        if _EVAL_EXECUTOR is not None and _EVAL_EXECUTOR_WORKERS == max_workers:
-            return _EVAL_EXECUTOR
-        if _EVAL_EXECUTOR is not None:
-            _EVAL_EXECUTOR.shutdown(wait=False, cancel_futures=True)
-        mp_context = mp.get_context("spawn")
-        _EVAL_EXECUTOR = ProcessPoolExecutor(
-            max_workers=max_workers, mp_context=mp_context
-        )
-        _EVAL_EXECUTOR_WORKERS = max_workers
-        return _EVAL_EXECUTOR
-
-    raise ValueError(f"Unknown executor kind: {kind}")
+atexit.register(_shutdown_all_pools)
 
 
 class IntellectCodeEnv(Env):
@@ -287,12 +298,9 @@ class IntellectCodeEnv(Env):
 
     @staticmethod
     def _extract_answer_code(text: str) -> Optional[str]:
-        # match ```python for final answer
-        pattern = r"```python\n?(.*?)```"
-        matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
-        if matches:
-            return matches[-1].strip()
-        return None
+        """Extract answer code from markdown code blocks using code_env utility."""
+        code = extract_code_from_model(text)
+        return code if code else None
 
     def _handle_interact(self, python_code: str) -> Tuple[str, float, bool, bool, dict[str, Any]]:
         try:
@@ -360,70 +368,24 @@ class IntellectCodeEnv(Env):
         )
 
     def _evaluate(self, code: str) -> float:
-        import ast
+        """Evaluate code using the same infrastructure as fast_eval for consistency.
         
-        tests = self.tests
-        
-        total_tests = len(tests["inputs"])
-        if total_tests > self.max_tests:
-            tests = {
-                "inputs": list(tests["inputs"][:self.max_tests]),
-                "outputs": list(tests["outputs"][:self.max_tests]),
-            }
-        
-        passed = 0
-        for inp, expected in zip(tests["inputs"], tests["outputs"]):
-            # Normalize input to string if it's a list
-            if isinstance(inp, list):
-                inp = "\n".join(map(str, inp))
-            
-            # wrap code with test harness for LeetCode-style Solution class
-            if self.fn_name and "class Solution" in code:
-                # Parse input string into arguments (stdin format: newline-separated values)
-                # Example: '[2, 2, 1]\n4' -> args = [[2, 2, 1], 4]
-                lines = inp.strip().split('\n')
-                args = []
-                for line in lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        args.append(ast.literal_eval(line))
-                    except (ValueError, SyntaxError):
-                        args.append(line)
-                
-                # Build harness that calls function with parsed arguments
-                args_repr = repr(args)
-                harness = f"""_args = {args_repr}
-_sol = Solution()
-_result = _sol.{self.fn_name}(*_args)
-print(_result)"""
-                wrapped_code = code + "\n\n" + harness
-                success, stdout, _ = run_python(wrapped_code, self.sandbox_type)
-            else:
-                # For stdin-based execution, use input as-is
-                success, stdout, _ = run_python(code, self.sandbox_type, stdin=inp)
-            
-            # Normalize expected output
-            if isinstance(expected, list):
-                expected = "\n".join(map(str, expected))
-            
-            # strip outer quotes from expected if present (LeetCode format)
-            expected_clean = expected.strip()
-            if expected_clean.startswith('"') and expected_clean.endswith('"'):
-                expected_clean = expected_clean[1:-1]
-            
-            # Normalize output for comparison
-            actual = stdout.strip()
-            
-            # Handle boolean case-insensitivity (Python "True"/"False" vs JSON "true"/"false")
-            if actual.lower() in ("true", "false") and expected_clean.lower() in ("true", "false"):
-                if success and actual.lower() == expected_clean.lower():
-                    passed += 1
-            elif success and actual == expected_clean:
-                passed += 1
-        
-        return passed / len(tests["inputs"])
+        Uses _evaluate_code from fast_eval which provides:
+        - Tiered comparison strategies (trimmed, line-wise, token-wise, numeric tolerance)
+        - Tuple/list result comparison for function-call problems
+        - Dict key normalization via process_input_output
+        - Memory limits matching code_env sandbox
+        - Support for both Solution class and standalone functions
+        """
+        reward, _, _ = _evaluate_code(
+            code=code,
+            tests=self.tests,
+            max_tests=self.max_tests,
+            timeout_s=self.eval_timeout,
+            timeout_record_limit=0,
+            require_solution_class=True,
+        )
+        return reward
 
     def sample_random_action(self) -> str:
         if random.random() < 0.8:
@@ -544,7 +506,7 @@ def step_batch(
         else:
             interaction_executor = None
             if use_persistent_pool and eval_workers > 1:
-                interaction_executor = _get_persistent_executor("interaction", eval_workers)
+                interaction_executor = _interaction_pool.get(eval_workers)
             interact_results = _run_python_batch(
                 codes_and_timeouts,
                 max_workers=eval_workers,
@@ -578,7 +540,7 @@ def step_batch(
         else:
             eval_executor = None
             if use_persistent_pool and eval_workers > 1:
-                eval_executor = _get_persistent_executor("eval", eval_workers)
+                eval_executor = _eval_pool.get(eval_workers)
             eval_results = evaluate_tasks(
                 eval_tasks,
                 max_workers=eval_workers,
