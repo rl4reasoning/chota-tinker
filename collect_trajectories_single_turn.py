@@ -3,18 +3,18 @@
 Usage:
 
     python collect_trajectories_single_turn.py \
-    --dataset bicycleman15/intellect_3_code_very_hard \
+    --dataset bicycleman15/intellect_3_code_easy_medium \
     --model Qwen/Qwen3-4B-Instruct-2507 \
     --backend vllm \
     --start-problem 0 \
-    --num-problems 1 \
-    --num-samples 32 \
+    --num-problems 50 \
+    --num-samples 8 \
     \
     --fast-eval \
-    --eval-workers 16 \
+    --eval-workers 8 \
     --eval-batch-size 8 \
-    --eval-timeout-s 1.0 \
-    --push-to-hub bicycleman15/qwen3_4b_instruct_easy_medium_single_turn
+    --eval-timeout-s 10.0 \
+    --push-to-hub bicycleman15/test_avg
 
 Multi-GPU (launches one vLLM server per GPU, shards prompts across them):
     python collect_trajectories_single_turn.py \
@@ -348,36 +348,64 @@ def run_batched_rollouts(
     print(f"Evaluating {len(states)} responses...")
     all_trajectories: list[list[dict]] = [[] for _ in range(args.num_problems)]
 
-    eval_tasks = [
-        EvalTask(
-            response=state.response,
-            tests=state.tests,
-            max_tests=state.max_tests,
-            timeout_s=args.eval_timeout_s,
-            require_solution_class=True,
+    if args.fast_eval:
+        eval_tasks = [
+            EvalTask(
+                response=state.response,
+                tests=state.tests,
+                max_tests=state.max_tests,
+                timeout_s=args.eval_timeout_s,
+                require_solution_class=True,
+            )
+            for state in states
+        ]
+        eval_results = evaluate_tasks(
+            eval_tasks,
+            max_workers=args.eval_workers,
+            batch_size=args.eval_batch_size,
+            show_progress=True,
         )
-        for state in states
-    ]
-    eval_results = evaluate_tasks(
-        eval_tasks,
-        max_workers=args.eval_workers,
-        batch_size=args.eval_batch_size,
-        show_progress=True,
-    )
 
-    for state, eval_result in zip(states, eval_results):
-        messages = state.messages.copy()
-        messages.append({"role": "assistant", "content": state.response})
+        for state, eval_result in zip(states, eval_results):
+            messages = state.messages.copy()
+            messages.append({"role": "assistant", "content": state.response})
 
-        traj = {
-            "question": state.question,
-            "messages": messages,
-            "final_reward": eval_result.reward,
-            "terminated": eval_result.terminated,
-            "truncated": eval_result.truncated,
-            "tests": state.tests,
-        }
-        all_trajectories[state.problem_index].append(traj)
+            traj = {
+                "question": state.question,
+                "messages": messages,
+                "final_reward": eval_result.reward,
+                "terminated": eval_result.terminated,
+                "truncated": eval_result.truncated,
+                "tests": state.tests,
+            }
+            all_trajectories[state.problem_index].append(traj)
+    else:
+        # Sequential evaluation using IntellectCodeEnv
+        for state in tqdm(states, desc="Evaluating"):
+            env = IntellectCodeEnv(
+                system_prompt="",
+                dataset_name=args.dataset,
+                problem_index=state.problem_index,
+                max_turns=1,
+                dataset=shared_dataset,
+            )
+            env.reset()
+            env.has_interacted = True  # Single-turn mode
+            
+            obs, reward, terminated, truncated, info = env.step(state.response)
+            
+            messages = state.messages.copy()
+            messages.append({"role": "assistant", "content": state.response})
+
+            traj = {
+                "question": state.question,
+                "messages": messages,
+                "final_reward": reward,
+                "terminated": terminated,
+                "truncated": truncated,
+                "tests": state.tests,
+            }
+            all_trajectories[state.problem_index].append(traj)
     
     return all_trajectories
 
@@ -558,12 +586,14 @@ if __name__ == "__main__":
                         help="Seconds to wait for vLLM servers to be ready.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8,
                         help="GPU memory utilization for local vLLM or vLLM servers (default: 0.8)")
+    parser.add_argument("--fast-eval", action="store_true",
+                        help="Use parallel fast eval for final answers")
     parser.add_argument("--eval-workers", type=int, default=16,
                         help="Number of parallel evaluator workers (default: min(32, cpu_count))")
     parser.add_argument("--eval-batch-size", type=int, default=8,
                         help="Number of responses per evaluator task (default: 8)")
-    parser.add_argument("--eval-timeout-s", type=float, default=1,
-                        help="Per-test timeout in seconds for fast evaluation (default: 5.0)")
+    parser.add_argument("--eval-timeout-s", type=float, default=1.0,
+                        help="Per-test timeout in seconds for fast evaluation (default: 1.0)")
     
     args = parser.parse_args()
     main(args)
