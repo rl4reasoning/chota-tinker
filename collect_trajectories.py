@@ -5,9 +5,9 @@ Usage:
     --dataset bicycleman15/intellect_3_code_very_hard \
     --model Qwen/Qwen3-4B-Instruct-2507 \
     --backend vllm \
-    --num-problems 10 \
+    --num-problems 2 \
     --num-samples 8 \
-    --max-turns 5 \
+    --max-turns 10 \
     \
     --fast-eval \
     --eval-workers 8 \
