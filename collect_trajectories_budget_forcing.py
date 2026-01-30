@@ -13,14 +13,14 @@ Usage:
         --model Qwen/Qwen3-4B-Instruct-2507 \
         --backend vllm \
         --num-problems 2 \
-        --num-samples 32 \
+        --num-samples 8 \
         --num-attempts 5 \
         \
         --fast-eval \
-        --eval-workers 16 \
+        --eval-workers 8 \
         --eval-batch-size 8 \
         --eval-timeout-s 1.0 \
-        --push-to-hub bicycleman15/qwen3_4b_very_hard_s1_x5
+        --push-to-hub bicycleman15/temp2
 
 Multi-GPU (launches one vLLM server per GPU, shards prompts across them):
     python collect_trajectories_budget_forcing.py \
