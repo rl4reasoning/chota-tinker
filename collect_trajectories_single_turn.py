@@ -298,6 +298,7 @@ def run_batched_rollouts(
                     problem_index=problem_idx,
                     max_turns=1,
                     dataset=shared_dataset,
+                    interaction_mode=False,
                 )
                 obs, info = env.reset()
                 env.has_interacted = True  # Single-turn mode
@@ -388,6 +389,7 @@ def run_batched_rollouts(
                 problem_index=state.problem_index,
                 max_turns=1,
                 dataset=shared_dataset,
+                interaction_mode=False,
             )
             env.reset()
             env.has_interacted = True  # Single-turn mode

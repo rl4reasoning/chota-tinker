@@ -172,6 +172,7 @@ def deserialize_budget_forcing_state(data: dict, shared_dataset, args) -> Budget
         problem_index=data["problem_index"],
         max_turns=1,
         dataset=shared_dataset,
+        interaction_mode=False,
     )
     env.reset()
     env.has_interacted = True
@@ -343,6 +344,7 @@ def run_batched_rollouts_with_budget_forcing(
                     problem_index=problem_idx,
                     max_turns=1,
                     dataset=shared_dataset,
+                    interaction_mode=False,
                 )
                 obs, info = env.reset()
                 env.has_interacted = True  # Single-turn mode
