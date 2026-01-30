@@ -660,7 +660,7 @@ if __name__ == "__main__":
                         help="Seconds to wait for vLLM servers to be ready.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
                         help="GPU memory utilization for local vLLM or vLLM servers (default: 0.9)")
-    parser.add_argument("--max-model-len", type=int, default=32768,
+    parser.add_argument("--max-model-len", type=int, default=None,
                         help="Maximum model context length for vLLM (default: None, uses model default)")
     parser.add_argument("--fast-eval", action="store_true",
                         help="Use parallel fast eval for final answers")
