@@ -4,7 +4,7 @@ Code environment demo using GEM with LLM agent.
 Uses tinker API for sampling.
 
 Usage:
-    python gem_math_demo.py --model Qwen/Qwen3-30B-A3B-Instruct-2507 --difficulty very_hard --problem_index 0
+    python gem_math_demo.py --model Qwen/Qwen3-4B-Instruct-2507 --difficulty very_hard --problem_index 2
 
 possible models:
 deepseek-ai/DeepSeek-V3.1
@@ -21,18 +21,102 @@ from transformers import AutoTokenizer
 from intellect_env import IntellectCodeEnv
 
 # Edit this to customize the system prompt
+# SYSTEM_PROMPT = """You are a helpful coding assistant.
+# You are allowed to interact with the Python interpreter.
+# You can wrap your code in <interact></interact>, and I will run it for you and give you the output.
+# Make sure that you define the inputs (or hardcode inputs) yourself when you give me <interact></interact> block.
+# You can use the output to refine your code.
+
+# Once you are done, wrap the final code in ```python``` code blocks. 
+# When returning the final code, there is no need to hardcode inputs, you will take inputs from stdin.
+
+# Please first think about the problem before you output <interact></interact> or ```python``` code blocks.
+
+# NOTE: You must interact atleast once successfully before you submit the final code!
+# """
+
 SYSTEM_PROMPT = """You are a helpful coding assistant.
-You are allowed to interact with the Python interpreter.
-You can wrap your code in <interact></interact>, and I will run it for you and give you the output.
-Make sure that you define the inputs (or hardcode inputs) yourself when you give me <interact></interact> block.
-You can use the output to refine your code.
 
-Once you are done, wrap the final code in ```python``` code blocks. 
-When returning the final code, there is no need to hardcode inputs, you will take inputs from stdin.
+You have access to a Python interpreter.
+To execute code, wrap it inside <interact></interact>. I will run it and return stdout/stderr in a subsequent turn.
 
-Please first think about the problem before you output <interact></interact> or ```python``` code blocks.
+IMPORTANT CONTEXT:
+- This is a multi-turn conversation.
+- The Python interpreter is a tool for gathering evidence: testing hypotheses, validating assumptions, checking edge cases, and falsifying incorrect reasoning.
+- You should interact only when doing so provides information that can change your understanding, reasoning, or final decision.
 
-NOTE: You must interact atleast once successfully before you submit the final code!
+────────────────────────
+HARD GATING RULES (NON-NEGOTIABLE)
+────────────────────────
+- BEFORE you output ANY final solution code in a ```python``` block, you MUST have completed at least one successful <interact></interact> execution in an earlier turn.
+- If you have NOT yet completed a successful <interact></interact>, you are FORBIDDEN from outputting any ```python``` code block (even partial solutions).
+- In the FIRST assistant response after receiving a new coding problem, you MUST perform an <interact></interact> intended to test, validate, or falsify some part of your reasoning.
+- Interactions performed solely to satisfy this requirement (without testing a hypothesis or reducing uncertainty) are INVALID.
+
+────────────────────────
+EXECUTION ENVIRONMENT (CRITICAL)
+────────────────────────
+- The execution environment shows ONLY what you PRINT to stdout.
+- EVERY <interact></interact> MUST include explicit print(...) statements.
+- Do NOT rely on REPL-style expression outputs or implicit returns.
+
+────────────────────────
+DEFINITION OF “SUCCESSFUL <interact>”
+────────────────────────
+An interaction is successful ONLY if ALL of the following hold:
+- The code executes without exceptions, AND
+- It prints at least 2 lines of task-relevant evidence, AND
+- At least one printed line is a newly computed result (not already given in the prompt), AND
+- The subsequent assistant message explicitly uses this evidence to confirm, revise, or reject a stated hypothesis.
+
+────────────────────────
+MANDATORY INTERACTION STRUCTURE
+────────────────────────
+Before each <interact></interact>, you MUST clearly state:
+- The specific hypothesis, assumption, or uncertainty being tested
+- Why this cannot be fully resolved by reasoning alone
+- What outcome you expect if the hypothesis is correct vs incorrect
+
+After receiving the output, you MUST clearly state:
+- What the output shows (summarize or quote key lines)
+- Whether the hypothesis was confirmed, weakened, or falsified
+- What (if anything) changed in your approach
+
+────────────────────────
+ORACLE / FALSIFICATION GATE (CRITICAL)
+────────────────────────
+- For algorithmic correctness problems, you MUST run at least one interaction that attempts to falsify your proposed solution.
+- This interaction MUST compare your approach against a correct reference implementation using:
+  (a) brute force / exhaustive checking for small inputs (e.g., n ≤ 6–8), OR
+  (b) randomized testing against a slower but correct oracle.
+- This interaction MUST print either:
+  • “No counterexample found in K tests” (K ≥ 100), OR
+  • A concrete counterexample where your approach disagrees with the oracle.
+- If a counterexample is found, you MUST revise your approach and repeat the oracle test.
+
+Testing only the examples provided in the prompt does NOT count as validation or falsification.
+
+────────────────────────
+ANTI-THRASHING RULE
+────────────────────────
+- If an <interact></interact> produces no output, insufficient output, or redundant output, your NEXT interaction MUST fix this and MUST NOT repeat the same interaction pattern.
+
+────────────────────────
+ITERATIVE WORKFLOW
+────────────────────────
+1. State your approach and any assumptions or uncertainties.
+2. Use <interact></interact> to gather evidence addressing those uncertainties.
+3. Update your reasoning based on the evidence.
+4. Repeat steps 2–3 if meaningful uncertainty remains.
+5. ONLY when no critical uncertainty remains, produce the final solution.
+
+────────────────────────
+FINAL CODE REQUIREMENTS
+────────────────────────
+- The final code MUST be inside a ```python``` code block.
+- The final code MUST read inputs from stdin and MUST NOT hardcode inputs.
+- The final answer MUST clearly depend on interaction-generated evidence.
+- Do NOT include <interact></interact> blocks after the final code.
 """
 
 
@@ -98,9 +182,9 @@ async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen3-4B-Thinking-2507")
     parser.add_argument("--num_episodes", type=int, default=1)
-    parser.add_argument("--max_steps", type=int, default=5)
-    parser.add_argument("--max_tokens", type=int, default=2048)
-    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--max_steps", type=int, default=10)
+    parser.add_argument("--max_tokens", type=int, default=4096)
+    parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--difficulty", type=str, default="original",
                         choices=["original", "easy_medium", "hard", "very_hard"],
                         help="Problem difficulty: easy_medium (0.3-1.0), hard (0.1-0.3), very_hard (0.0-0.1), or original (all)")

@@ -196,6 +196,7 @@ class IntellectCodeEnv(Env):
         max_turns: int = 5,
         max_tests: int = 15,
         interaction_timeout_s: Optional[float] = None,
+        eval_timeout_s: Optional[float] = 1.0,
         sandbox_type: str = "none",
         seed: int = 0,
         dataset_name: str = "PrimeIntellect/INTELLECT-3-RL",
@@ -208,6 +209,7 @@ class IntellectCodeEnv(Env):
         self.max_turns = max_turns
         self.max_tests = max_tests
         self.interaction_timeout_s = interaction_timeout_s
+        self.eval_timeout_s = eval_timeout_s
         self.sandbox_type = sandbox_type
         self.seed = seed
         self.dataset_name = dataset_name
@@ -381,7 +383,7 @@ class IntellectCodeEnv(Env):
             code=code,
             tests=self.tests,
             max_tests=self.max_tests,
-            timeout_s=self.eval_timeout,
+            timeout_s=self.eval_timeout_s,
             timeout_record_limit=0,
             require_solution_class=True,
         )
