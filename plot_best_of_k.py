@@ -29,6 +29,30 @@ def compute_best_of_k(problem_results: dict[int, list[float]], k: int) -> float:
     return total_reward / count if count > 0 else 0.0
 
 
+def compute_pass_at_k(problem_results: dict[int, list[float]], k: int) -> float:
+    """
+    Compute pass@K metric - fraction of problems solved (reward == 1.0) in first k samples.
+    
+    Args:
+        problem_results: Dict mapping problem_id to list of final rewards
+        k: Number of samples to consider
+    
+    Returns:
+        Fraction of problems that have at least one sample with reward == 1.0 in first k
+    """
+    num_passed = 0
+    count = 0
+    
+    for problem_id, rewards in problem_results.items():
+        if len(rewards) >= k:
+            # Check if any of the first k samples has reward == 1.0
+            if any(r == 1.0 for r in rewards[:k]):
+                num_passed += 1
+            count += 1
+    
+    return num_passed / count if count > 0 else 0.0
+
+
 def load_and_process_dataset(dataset_name: str, max_problem_id: int = None) -> dict[int, list[float]]:
     """Load dataset and organize final rewards by problem_id."""
     print(f"Loading {dataset_name}...")
@@ -52,51 +76,165 @@ def load_and_process_dataset(dataset_name: str, max_problem_id: int = None) -> d
     return dict(problem_results)
 
 
+def load_and_merge_datasets(dataset_configs: list[tuple[str, int]]) -> dict[int, list[float]]:
+    """Load multiple datasets and merge them by problem_id with offset.
+    
+    Args:
+        dataset_configs: List of (dataset_name, problem_id_offset) tuples
+    """
+    merged_results = {}
+    
+    for dataset_name, offset in dataset_configs:
+        print(f"Loading {dataset_name} (offset={offset})...")
+        ds = load_dataset(dataset_name, split="train")
+        df = ds.to_pandas()
+        df = df.sort_values(['problem_id', 'trajectory_id'])
+        
+        for _, row in df.iterrows():
+            # Apply offset to get global problem_id
+            problem_id = row['problem_id'] + offset
+            final_reward = row['final_reward']
+            
+            if problem_id not in merged_results:
+                merged_results[problem_id] = []
+            merged_results[problem_id].append(final_reward)
+    
+    return merged_results
+
+
 def main():
-    # Use all 1000 problems (only S1 and Multi-turn have all 1000)
-    max_problems = 1000
+    # Multi-turn interaction datasets (10 turns per sample, 32 samples)
+    # Format: (dataset_name, problem_id_offset)
+    multiturn_datasets = [
+        ("anirudhb11/0_25_interations_10_attempts_new_pr", 0),    # problem 0-24
+        ("anirudhb11/25_50_interations_10_attempts_new_pr", 25),  # problem 25-49
+        ("anirudhb11/50_75_interations_10_attempts_new_pr", 50),  # problem 50-74
+    ]
     
-    # Load S1 and Multi-turn datasets
-    s1_results = load_and_process_dataset("bicycleman15/1k_32_s1", max_problem_id=max_problems)
-    interactions_results = load_and_process_dataset("bicycleman15/1k_32_interactions", max_problem_id=max_problems)
+    # S1 datasets (single turn, 32 samples)
+    # Format: (dataset_name, problem_id_offset)
+    s1_datasets = [
+        ("anirudhb11/0_25_s1_10_attempts", 0),    # problem 0-24
+        ("anirudhb11/25_50_s1_10_attempts", 25),  # problem 25-49
+        ("anirudhb11/50_75_s1_10_attempts", 50),  # problem 50-74
+    ]
     
-    print(f"\nUsing first {max_problems} problems")
-    print(f"S1: {len(s1_results)} problems, {len(list(s1_results.values())[0])} trajectories each")
-    print(f"Multi-turn: {len(interactions_results)} problems, {len(list(interactions_results.values())[0])} trajectories each")
+    # Single-turn dataset with 160 samples (problems 0-75)
+    single_turn_160_datasets = [
+        ("bicycleman15/st_k160_0_25", 0),    # problem 0-24, 160 samples
+        ("bicycleman15/st_k160_25_50", 25),  # problem 25-49, 160 samples
+        ("bicycleman15/st_k160_50_75", 50),  # problem 50-74, 160 samples
+    ]
     
-    # Compute best-of-K for K from 1 to 32
-    k_values = list(range(1, 33))
+    # Load and merge datasets
+    print("Loading Multi-turn datasets...")
+    interactions_results = load_and_merge_datasets(multiturn_datasets)
     
+    print("\nLoading S1 datasets...")
+    s1_results = load_and_merge_datasets(s1_datasets)
+    
+    print("\nLoading Single-turn (160 samples) dataset...")
+    st_160_results = load_and_merge_datasets(single_turn_160_datasets)
+    
+    # Print dataset info
+    print(f"\nDataset Summary:")
+    print(f"Multi-turn: {len(interactions_results)} problems")
+    if interactions_results:
+        sample_counts = [len(v) for v in interactions_results.values()]
+        print(f"  Samples per problem: min={min(sample_counts)}, max={max(sample_counts)}")
+    
+    print(f"S1: {len(s1_results)} problems")
+    if s1_results:
+        sample_counts = [len(v) for v in s1_results.values()]
+        print(f"  Samples per problem: min={min(sample_counts)}, max={max(sample_counts)}")
+    
+    print(f"Single-turn (160): {len(st_160_results)} problems")
+    if st_160_results:
+        sample_counts = [len(v) for v in st_160_results.values()]
+        print(f"  Samples per problem: min={min(sample_counts)}, max={max(sample_counts)}")
+    
+    # Compute best-of-K for K from 1 to 32 for multi-turn and s1
+    k_values_32 = list(range(1, 33))
+    # Compute best-of-K for K from 1 to 160 for single-turn 160
+    k_values_160 = list(range(1, 161))
+    
+    # Best-of-K scores (continuous rewards)
     s1_scores = []
     interactions_scores = []
+    st_160_scores = []
     
-    for k in k_values:
+    # Pass@K scores (binary: reward == 1.0)
+    s1_pass_scores = []
+    interactions_pass_scores = []
+    st_160_pass_scores = []
+    
+    print("\n=== Best-of-K Results (Continuous Rewards) ===")
+    for k in k_values_32:
         s1_score = compute_best_of_k(s1_results, k)
         interactions_score = compute_best_of_k(interactions_results, k)
         
         s1_scores.append(s1_score)
         interactions_scores.append(interactions_score)
         
+        # Pass@K
+        s1_pass_scores.append(compute_pass_at_k(s1_results, k))
+        interactions_pass_scores.append(compute_pass_at_k(interactions_results, k))
+        
         if k in [1, 4, 8, 16, 32]:
             print(f"K={k:2d}: S1={s1_score:.4f}, Multi-turn={interactions_score:.4f}")
     
-    # Plot with style matching reference
-    plt.figure(figsize=(8, 6))
+    # Compute for single-turn 160 up to K=160
+    for k in k_values_160:
+        st_160_score = compute_best_of_k(st_160_results, k)
+        st_160_scores.append(st_160_score)
+        st_160_pass_scores.append(compute_pass_at_k(st_160_results, k))
     
-    # Colors: coral for multi-turn, teal for S1
-    plt.plot(k_values, interactions_scores, '-o', color='#FF6B6B', label='Multi-turn', 
+    print(f"\nSingle-turn (160 samples):")
+    for k in [1, 8, 32, 64, 128, 160]:
+        if k <= len(st_160_scores):
+            print(f"  Best@{k}: {st_160_scores[k-1]:.4f}")
+    
+    print("\n=== Pass@K Results (Binary: reward == 1.0) ===")
+    for k in [1, 4, 8, 16, 32]:
+        print(f"K={k:2d}: S1={s1_pass_scores[k-1]:.4f}, Multi-turn={interactions_pass_scores[k-1]:.4f}")
+    
+    print(f"\nSingle-turn (160 samples):")
+    for k in [1, 8, 32, 64, 128, 160]:
+        if k <= len(st_160_pass_scores):
+            print(f"  Pass@{k}: {st_160_pass_scores[k-1]:.4f}")
+    
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Plot 1: Best-of-K (continuous rewards)
+    ax1.plot(k_values_160, st_160_scores, '-', color='#9B59B6', label='Single-turn (160 samples)', 
+             linewidth=1.5)
+    ax1.plot(k_values_32, interactions_scores, '-o', color='#FF6B6B', label='Multi-turn (10 turns)', 
              markersize=3, linewidth=1.5)
-    plt.plot(k_values, s1_scores, '-o', color='#4ECDC4', label='S1', 
+    ax1.plot(k_values_32, s1_scores, '-o', color='#4ECDC4', label='S1', 
              markersize=3, linewidth=1.5)
     
-    plt.xlabel('K (samples)')
-    plt.ylabel('Best-of-K Reward')
-    plt.title('Best-of-K (Oracle Selection) - 1000 Problems', fontsize=12, style='italic')
-    plt.legend(loc='upper left', frameon=True)
-    plt.grid(True, alpha=0.3)
+    ax1.set_xlabel('K (samples)')
+    ax1.set_ylabel('Best-of-K Reward')
+    ax1.set_title('Best-of-K (Continuous Rewards)', fontsize=12, style='italic')
+    ax1.legend(loc='lower right', frameon=True)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xticks([1, 16, 32, 64, 96, 128, 160])
     
-    # Set x-axis ticks
-    plt.xticks([1, 5, 10, 15, 20, 25, 30])
+    # Plot 2: Pass@K (binary rewards)
+    ax2.plot(k_values_160, st_160_pass_scores, '-', color='#9B59B6', label='Single-turn (160 samples)', 
+             linewidth=1.5)
+    ax2.plot(k_values_32, interactions_pass_scores, '-o', color='#FF6B6B', label='Multi-turn (10 turns)', 
+             markersize=3, linewidth=1.5)
+    ax2.plot(k_values_32, s1_pass_scores, '-o', color='#4ECDC4', label='S1', 
+             markersize=3, linewidth=1.5)
+    
+    ax2.set_xlabel('K (samples)')
+    ax2.set_ylabel('Pass@K')
+    ax2.set_title('Pass@K (Binary: reward == 1.0)', fontsize=12, style='italic')
+    ax2.legend(loc='lower right', frameon=True)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xticks([1, 16, 32, 64, 96, 128, 160])
     
     plt.tight_layout()
     plt.savefig('best_of_k_comparison.png', dpi=150)
@@ -105,15 +243,20 @@ def main():
     
     # Also print summary statistics
     print("\n=== Summary Statistics ===")
-    print(f"\nS1 (32 trajectories):")
-    print(f"  Best@1:  {s1_scores[0]:.4f}")
-    print(f"  Best@8:  {s1_scores[7]:.4f}")
-    print(f"  Best@32: {s1_scores[31]:.4f}")
+    print(f"\nS1 (32 samples, problems 0-75):")
+    print(f"  Best@1:  {s1_scores[0]:.4f}  |  Pass@1:  {s1_pass_scores[0]:.4f}")
+    print(f"  Best@8:  {s1_scores[7]:.4f}  |  Pass@8:  {s1_pass_scores[7]:.4f}")
+    print(f"  Best@32: {s1_scores[31]:.4f}  |  Pass@32: {s1_pass_scores[31]:.4f}")
     
-    print(f"\nMulti-turn (32 trajectories):")
-    print(f"  Best@1:  {interactions_scores[0]:.4f}")
-    print(f"  Best@8:  {interactions_scores[7]:.4f}")
-    print(f"  Best@32: {interactions_scores[31]:.4f}")
+    print(f"\nMulti-turn (32 samples, 10 turns each, problems 0-75):")
+    print(f"  Best@1:  {interactions_scores[0]:.4f}  |  Pass@1:  {interactions_pass_scores[0]:.4f}")
+    print(f"  Best@8:  {interactions_scores[7]:.4f}  |  Pass@8:  {interactions_pass_scores[7]:.4f}")
+    print(f"  Best@32: {interactions_scores[31]:.4f}  |  Pass@32: {interactions_pass_scores[31]:.4f}")
+    
+    print(f"\nSingle-turn (160 samples, problems 0-75):")
+    print(f"  Best@1:   {st_160_scores[0]:.4f}  |  Pass@1:   {st_160_pass_scores[0]:.4f}")
+    print(f"  Best@32:  {st_160_scores[31]:.4f}  |  Pass@32:  {st_160_pass_scores[31]:.4f}")
+    print(f"  Best@160: {st_160_scores[159]:.4f}  |  Pass@160: {st_160_pass_scores[159]:.4f}")
 
 
 if __name__ == "__main__":
