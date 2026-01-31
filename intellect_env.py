@@ -135,7 +135,7 @@ class ExecutorPool:
         self._executor: Optional[ProcessPoolExecutor] = None
         self._max_workers: Optional[int] = None
         self._name = name
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
     
     def get(self, max_workers: int) -> ProcessPoolExecutor:
         """Get or create executor with specified worker count.

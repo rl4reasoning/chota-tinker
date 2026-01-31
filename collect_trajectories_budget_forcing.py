@@ -13,14 +13,14 @@ Usage:
         --model Qwen/Qwen3-4B-Instruct-2507 \
         --backend vllm \
         --num-problems 2 \
-        --num-samples 32 \
+        --num-samples 8 \
         --num-attempts 5 \
         \
         --fast-eval \
-        --eval-workers 16 \
+        --eval-workers 8 \
         --eval-batch-size 8 \
         --eval-timeout-s 1.0 \
-        --push-to-hub bicycleman15/qwen3_4b_very_hard_s1_x5
+        --push-to-hub bicycleman15/temp2
 
 Multi-GPU (launches one vLLM server per GPU, shards prompts across them):
     python collect_trajectories_budget_forcing.py \
@@ -172,6 +172,7 @@ def deserialize_budget_forcing_state(data: dict, shared_dataset, args) -> Budget
         problem_index=data["problem_index"],
         max_turns=1,
         dataset=shared_dataset,
+        interaction_mode=False,
     )
     env.reset()
     env.has_interacted = True
@@ -343,6 +344,7 @@ def run_batched_rollouts_with_budget_forcing(
                     problem_index=problem_idx,
                     max_turns=1,
                     dataset=shared_dataset,
+                    interaction_mode=False,
                 )
                 obs, info = env.reset()
                 env.has_interacted = True  # Single-turn mode
@@ -658,7 +660,7 @@ if __name__ == "__main__":
                         help="Seconds to wait for vLLM servers to be ready.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
                         help="GPU memory utilization for local vLLM or vLLM servers (default: 0.9)")
-    parser.add_argument("--max-model-len", type=int, default=32768,
+    parser.add_argument("--max-model-len", type=int, default=None,
                         help="Maximum model context length for vLLM (default: None, uses model default)")
     parser.add_argument("--fast-eval", action="store_true",
                         help="Use parallel fast eval for final answers")
