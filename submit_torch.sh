@@ -4,7 +4,7 @@
 #SBATCH --output=/scratch/jp7467/slurm_logs/%j_%x.out
 #SBATCH --error=/scratch/jp7467/slurm_logs/%j_%x.err
 #SBATCH --export=ALL
-#SBATCH --time=24:00:00
+#SBATCH --time=4:00:00
 #SBATCH --gres=gpu:h200:1
 #SBATCH --account=torch_pr_235_cds
 #SBATCH --mem=200G
@@ -26,19 +26,33 @@ conda activate ct
 
 # needs 1 GPU only
 # reduce number of problems to check :)
-python collect_trajectories.py \
-        --dataset bicycleman15/intellect_3_code_very_hard \
-        --model Qwen/Qwen3-4B-Instruct-2507 \
-        --backend vllm \
-        --start-problem 0 \
-        --num-problems 500 \
-        --num-samples 32 \
-        \
-        --fast-eval \
-        --eval-workers 8 \
-        --eval-batch-size 8 \
-        --eval-timeout-s 1.0 \
-        --push-to-hub bicycleman15/0_500_interactions
+# python collect_trajectories.py \
+#         --dataset bicycleman15/intellect_3_code_very_hard \
+#         --model Qwen/Qwen3-4B-Instruct-2507 \
+#         --backend vllm \
+#         --start-problem 0 \
+#         --num-problems 500 \
+#         --num-samples 32 \
+#         \
+#         --fast-eval \
+#         --eval-workers 8 \
+#         --eval-batch-size 8 \
+#         --eval-timeout-s 1.0 \
+#         --push-to-hub bicycleman15/0_500_interactions
+
+python collect_trajectories_single_turn.py \
+    --dataset bicycleman15/intellect_3_code_very_hard \
+    --model Qwen/Qwen3-4B-Instruct-2507 \
+    --backend vllm \
+    --start-problem 50 \
+    --num-problems 100 \
+    --num-samples 320 \
+    \
+    --fast-eval \
+    --eval-workers 8 \
+    --eval-batch-size 8 \
+    --eval-timeout-s 1.0 \
+    --push-to-hub bicycleman15/single_50_100
 
 # also change file name to `collect_trajectories_budget_forcing.py` to collect s1 scaling
 # change start-problem to 500, so that we collect 

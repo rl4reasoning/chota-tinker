@@ -3,18 +3,18 @@
 Usage:
 
     python collect_trajectories_single_turn.py \
-    --dataset bicycleman15/intellect_3_code_easy_medium \
+    --dataset bicycleman15/intellect_3_code_very_hard \
     --model Qwen/Qwen3-4B-Instruct-2507 \
     --backend vllm \
     --start-problem 0 \
-    --num-problems 50 \
-    --num-samples 8 \
+    --num-problems 25 \
+    --num-samples 320 \
     \
     --fast-eval \
     --eval-workers 8 \
     --eval-batch-size 8 \
-    --eval-timeout-s 10.0 \
-    --push-to-hub bicycleman15/test_avg
+    --eval-timeout-s 1.0 \
+    --push-to-hub bicycleman15/temp
 
 Multi-GPU (launches one vLLM server per GPU, shards prompts across them):
     python collect_trajectories_single_turn.py \
