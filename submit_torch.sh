@@ -40,19 +40,34 @@ conda activate ct
 #         --eval-timeout-s 1.0 \
 #         --push-to-hub bicycleman15/0_500_interactions
 
-python collect_trajectories_single_turn.py \
-    --dataset bicycleman15/intellect_3_code_very_hard \
-    --model Qwen/Qwen3-4B-Instruct-2507 \
-    --backend vllm \
-    --start-problem 50 \
-    --num-problems 100 \
-    --num-samples 320 \
-    \
-    --fast-eval \
-    --eval-workers 8 \
-    --eval-batch-size 8 \
-    --eval-timeout-s 1.0 \
-    --push-to-hub bicycleman15/single_50_100
+# python collect_trajectories_single_turn.py \
+#     --dataset bicycleman15/intellect_3_code_very_hard \
+#     --model Qwen/Qwen3-4B-Instruct-2507 \
+#     --backend vllm \
+#     --start-problem 50 \
+#     --num-problems 100 \
+#     --num-samples 320 \
+#     \
+#     --fast-eval \
+#     --eval-workers 8 \
+#     --eval-batch-size 8 \
+#     --eval-timeout-s 1.0 \
+#     --push-to-hub bicycleman15/single_50_100
+
+python collect_trajectories_budget_forcing.py \
+        --dataset bicycleman15/intellect_3_code_very_hard \
+        --model Qwen/Qwen3-4B-Instruct-2507 \
+        --backend vllm \
+        --start-problem 75 \
+        --num-problems 25 \
+        --num-samples 32 \
+        --num-attempts 10 \
+        \
+        --fast-eval \
+        --eval-workers 8 \
+        --eval-batch-size 8 \
+        --eval-timeout-s 1.0 \
+        --push-to-hub bicycleman15/75_100_s1_10_attempts
 
 # also change file name to `collect_trajectories_budget_forcing.py` to collect s1 scaling
 # change start-problem to 500, so that we collect 
