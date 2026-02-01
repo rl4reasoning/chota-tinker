@@ -51,6 +51,10 @@ Resume from checkpoint (if previous run failed):
 Checkpoints are automatically saved after each RSA step to:
     checkpoints/<YYYYMMDD_HHMMSS>/checkpoint.pkl
     checkpoints/<YYYYMMDD_HHMMSS>/checkpoint_info.json
+
+Output format: DatasetDict with splits step_1, step_2, ..., step_T. Each split has the same
+columns (problem_id, candidate_id, question, response, final_reward, is_successful, rsa_step,
+aggregated_from, tests, rendered). Evaluation is performed at each RSA step.
 """
 
 import os
@@ -64,7 +68,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 
-from datasets import Dataset
+from datasets import Dataset, DatasetDict
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
@@ -173,13 +177,17 @@ class RSAProblemState:
     tests: dict
     # Current population of candidates (list of response strings)
     candidates: list[str] = field(default_factory=list)
-    # Track which candidates were aggregated to produce each new candidate
+    # Population at each step: candidates_by_step[step_idx] = list of N responses at that step (1-indexed step = step_idx + 1)
+    candidates_by_step: list[list[str]] = field(default_factory=list)
+    # Track which candidates were aggregated to produce each new candidate (current step only)
     # List of lists: aggregation_history[candidate_idx] = [source_indices]
     aggregation_history: list[list[int]] = field(default_factory=list)
+    # Per-step aggregation: aggregation_history_by_step[step_idx] = list of N source-index lists
+    aggregation_history_by_step: list[list[list[int]]] = field(default_factory=list)
     # Current RSA step (1 = initial, 2+ = aggregation steps)
     current_step: int = 0
-    # Final rewards after evaluation
-    rewards: list[float] = field(default_factory=list)
+    # Rewards per step: rewards_by_step[step_idx] = list of N rewards for that step
+    rewards_by_step: list[list[float]] = field(default_factory=list)
 
 
 def serialize_rsa_state(state: RSAProblemState) -> dict:
@@ -189,9 +197,11 @@ def serialize_rsa_state(state: RSAProblemState) -> dict:
         "question": state.question,
         "tests": state.tests,
         "candidates": state.candidates.copy(),
+        "candidates_by_step": [list(step) for step in state.candidates_by_step],
         "aggregation_history": [h.copy() for h in state.aggregation_history],
+        "aggregation_history_by_step": [[list(h) for h in step] for step in state.aggregation_history_by_step],
         "current_step": state.current_step,
-        "rewards": state.rewards.copy(),
+        "rewards_by_step": [list(r) for r in state.rewards_by_step],
     }
 
 
@@ -202,9 +212,11 @@ def deserialize_rsa_state(data: dict) -> RSAProblemState:
         question=data["question"],
         tests=data["tests"],
         candidates=data["candidates"],
+        candidates_by_step=data.get("candidates_by_step", []),
         aggregation_history=data["aggregation_history"],
+        aggregation_history_by_step=data.get("aggregation_history_by_step", []),
         current_step=data["current_step"],
-        rewards=data["rewards"],
+        rewards_by_step=data.get("rewards_by_step", []),
     )
 
 
@@ -286,6 +298,7 @@ def run_batched_rsa(
     args,
     client,
     tokenizer,
+    shared_dataset,
     checkpoint_manager: Optional[CheckpointManager] = None,
 ) -> list[RSAProblemState]:
     """Run batched RSA across all problems."""
@@ -406,7 +419,9 @@ def run_batched_rsa(
             response_idx = 0
             for state in problem_states:
                 state.candidates = all_responses[response_idx:response_idx + population]
+                state.candidates_by_step.append(list(state.candidates))
                 state.aggregation_history = [[] for _ in range(population)]  # No aggregation for initial
+                state.aggregation_history_by_step.append([[] for _ in range(population)])
                 state.current_step = 1
                 response_idx += population
             
@@ -453,11 +468,19 @@ def run_batched_rsa(
             response_idx = 0
             for state, subsets in zip(problem_states, all_subsets):
                 state.candidates = all_responses[response_idx:response_idx + population]
+                state.candidates_by_step.append(list(state.candidates))
                 state.aggregation_history = subsets
+                state.aggregation_history_by_step.append([list(s) for s in subsets])
                 state.current_step = step
                 response_idx += population
             
             print(f"  Generated {len(all_responses)} aggregated candidates.")
+        
+        # Evaluate current step candidates (required for per-step splits)
+        print(f"\n  Evaluating step {step} candidates...")
+        problem_states = evaluate_rsa_results(
+            problem_states, args, shared_dataset, step_idx=step - 1
+        )
         
         # Save checkpoint after each step
         if checkpoint_manager:
@@ -475,9 +498,14 @@ def evaluate_rsa_results(
     problem_states: list[RSAProblemState],
     args,
     shared_dataset,
+    step_idx: Optional[int] = None,
 ) -> list[RSAProblemState]:
-    """Evaluate all final candidates in each problem's population."""
-    print(f"\nEvaluating {sum(len(s.candidates) for s in problem_states)} total candidates...")
+    """Evaluate candidates in each problem's population.
+    
+    If step_idx is provided, evaluates state.candidates and stores rewards in
+    state.rewards_by_step[step_idx]. Otherwise uses legacy state.rewards (deprecated).
+    """
+    print(f"  Evaluating {sum(len(s.candidates) for s in problem_states)} candidates...")
     
     # Build environments and responses for batch evaluation
     all_envs = []
@@ -519,11 +547,50 @@ def evaluate_rsa_results(
     
     # Distribute rewards back to states
     for (state_idx, cand_idx), (_, reward, _, _, _) in zip(env_to_state_idx, results):
-        if len(problem_states[state_idx].rewards) <= cand_idx:
-            # Extend rewards list if needed
-            problem_states[state_idx].rewards.extend([0.0] * (cand_idx + 1 - len(problem_states[state_idx].rewards)))
-        problem_states[state_idx].rewards[cand_idx] = reward
+        state = problem_states[state_idx]
+        if step_idx is not None:
+            # Store in rewards_by_step
+            while len(state.rewards_by_step) <= step_idx:
+                state.rewards_by_step.append([])
+            if len(state.rewards_by_step[step_idx]) <= cand_idx:
+                state.rewards_by_step[step_idx].extend(
+                    [0.0] * (cand_idx + 1 - len(state.rewards_by_step[step_idx]))
+                )
+            state.rewards_by_step[step_idx][cand_idx] = reward
+        else:
+            # Legacy: store in rewards
+            if len(state.rewards) <= cand_idx:
+                state.rewards.extend([0.0] * (cand_idx + 1 - len(state.rewards)))
+            state.rewards[cand_idx] = reward
     
+    return problem_states
+
+
+def backfill_missing_step_rewards(
+    problem_states: list[RSAProblemState],
+    args,
+    shared_dataset,
+) -> list[RSAProblemState]:
+    """Re-evaluate any steps that have candidates but missing rewards (e.g. after resume from old checkpoint)."""
+    for step_idx in range(max(len(s.candidates_by_step) for s in problem_states) if problem_states else 0):
+        needs_eval = False
+        for state in problem_states:
+            if step_idx < len(state.candidates_by_step) and (
+                step_idx >= len(state.rewards_by_step) or len(state.rewards_by_step[step_idx]) < len(state.candidates_by_step[step_idx])
+            ):
+                needs_eval = True
+                break
+        if not needs_eval:
+            continue
+        # Temporarily set candidates to this step's candidates, evaluate, store, restore
+        orig_candidates = []
+        for state in problem_states:
+            orig_candidates.append(state.candidates)
+            state.candidates = state.candidates_by_step[step_idx]
+        print(f"\n  Backfilling evaluation for step {step_idx + 1}...")
+        evaluate_rsa_results(problem_states, args, shared_dataset, step_idx=step_idx)
+        for state, orig in zip(problem_states, orig_candidates):
+            state.candidates = orig
     return problem_states
 
 
@@ -585,69 +652,93 @@ def main(args):
     end_problem = min(args.start_problem + args.num_problems, len(full_dataset))
     shared_dataset = full_dataset.select(range(args.start_problem, end_problem))
     
-    # Run RSA
+    # Run RSA (evaluation happens inside the loop after each step)
     problem_states = run_batched_rsa(
         args=args,
         client=sampling_client,
         tokenizer=tokenizer,
+        shared_dataset=shared_dataset,
         checkpoint_manager=checkpoint_manager,
     )
     
-    # Evaluate
-    problem_states = evaluate_rsa_results(problem_states, args, shared_dataset)
+    # Backfill any missing per-step rewards (e.g. when resuming from old checkpoint)
+    problem_states = backfill_missing_step_rewards(problem_states, args, shared_dataset)
     
-    # Build output rows
-    rows = []
-    all_results = []
+    # Build DatasetDict with one split per step (step_1, step_2, ..., step_T)
+    splits_dict = {}
+    metrics_per_step = {}
     
-    for state in problem_states:
-        problem_results = []
+    for step_idx in range(args.steps):
+        split_name = f"step_{step_idx + 1}"
+        rows = []
+        all_results = []
         
-        for cand_idx, (candidate, reward) in enumerate(zip(state.candidates, state.rewards)):
-            is_successful = reward > 0
-            problem_results.append(is_successful)
+        for state in problem_states:
+            if step_idx >= len(state.candidates_by_step):
+                continue
+            candidates = state.candidates_by_step[step_idx]
+            rewards = state.rewards_by_step[step_idx] if step_idx < len(state.rewards_by_step) else [0.0] * len(candidates)
+            agg_history = state.aggregation_history_by_step[step_idx] if step_idx < len(state.aggregation_history_by_step) else [[]] * len(candidates)
             
-            agg_from = state.aggregation_history[cand_idx] if cand_idx < len(state.aggregation_history) else []
-            
-            rows.append({
-                "problem_id": state.problem_index,
-                "candidate_id": cand_idx,
-                "question": state.question,
-                "response": candidate,
-                "final_reward": reward,
-                "is_successful": is_successful,
-                "rsa_step": state.current_step,
-                "aggregated_from": json.dumps(agg_from),
-                "tests": json.dumps(state.tests),
-                "rendered": render_trajectory(
-                    state.question, candidate, reward,
-                    state.current_step, args.steps, cand_idx, agg_from
-                ),
-            })
+            problem_results = []
+            for cand_idx, candidate in enumerate(candidates):
+                reward = rewards[cand_idx] if cand_idx < len(rewards) else 0.0
+                is_successful = reward > 0
+                problem_results.append(is_successful)
+                
+                agg_from = agg_history[cand_idx] if cand_idx < len(agg_history) else []
+                
+                row = {
+                    "problem_id": state.problem_index,
+                    "candidate_id": cand_idx,
+                    "question": state.question,
+                    "response": candidate,
+                    "final_reward": reward,
+                    "is_successful": is_successful,
+                    "rsa_step": step_idx + 1,
+                    "aggregated_from": json.dumps(agg_from),
+                    "tests": json.dumps(state.tests),
+                    "rendered": render_trajectory(
+                        state.question, candidate, reward,
+                        step_idx + 1, args.steps, cand_idx, agg_from
+                    ),
+                }
+                rows.append(row)
+            all_results.append(problem_results)
         
-        all_results.append(problem_results)
+        if rows:
+            splits_dict[split_name] = Dataset.from_list(rows)
+            # Compute metrics for this step
+            pass_at_1 = compute_pass_at_k(all_results, k=1)
+            pass_at_n = compute_pass_at_k(all_results, k=args.population)
+            mean_acc = sum(r["final_reward"] for r in rows) / len(rows)
+            metrics_per_step[split_name] = {
+                "mean_accuracy": mean_acc,
+                "pass_at_1": pass_at_1,
+                f"pass_at_{args.population}": pass_at_n,
+                "num_successful": sum(1 for r in rows if r["is_successful"]),
+                "problems_solved": sum(1 for pr in all_results if any(pr)),
+            }
     
-    # Compute metrics
-    pass_at_1 = compute_pass_at_k(all_results, k=1)
-    pass_at_2 = compute_pass_at_k(all_results, k=min(2, args.population))
-    pass_at_4 = compute_pass_at_k(all_results, k=min(4, args.population))
-    pass_at_n = compute_pass_at_k(all_results, k=args.population)
+    dataset = DatasetDict(splits_dict)
     
-    # Mean accuracy
-    mean_acc = sum(r["final_reward"] for r in rows) / len(rows) if rows else 0
-    
+    # Print results per step
     print(f"\n{'=' * 60}")
-    print(f"Results:")
-    print(f"  Total candidates: {len(rows)}")
-    print(f"  Mean accuracy: {mean_acc:.4f}")
-    print(f"  pass@1: {pass_at_1:.4f}")
-    print(f"  pass@2: {pass_at_2:.4f}")
-    print(f"  pass@4: {pass_at_4:.4f}")
-    print(f"  pass@{args.population}: {pass_at_n:.4f}")
+    print(f"Results per step:")
+    for split_name, m in metrics_per_step.items():
+        print(f"  {split_name}: mean_acc={m['mean_accuracy']:.4f}, pass@1={m['pass_at_1']:.4f}, pass@{args.population}={m[f'pass_at_{args.population}']:.4f}")
     print(f"{'=' * 60}")
     
-    # Save dataset
-    dataset = Dataset.from_list(rows)
+    # Use final step metrics for overall summary
+    final_split = f"step_{args.steps}"
+    final_metrics = metrics_per_step.get(final_split, {})
+    if not final_metrics and metrics_per_step:
+        final_split = list(metrics_per_step.keys())[-1]
+        final_metrics = metrics_per_step[final_split]
+    mean_acc = final_metrics.get("mean_accuracy", 0.0)
+    pass_at_1 = final_metrics.get("pass_at_1", 0.0)
+    pass_at_n = final_metrics.get(f"pass_at_{args.population}", 0.0)
+    
     metadata = {
         "dataset": args.dataset,
         "model": args.model,
@@ -659,13 +750,14 @@ def main(args):
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "timestamp": datetime.now().isoformat(),
-        "mean_accuracy": mean_acc,
-        "pass_at_1": pass_at_1,
-        "pass_at_2": pass_at_2,
-        "pass_at_4": pass_at_4,
-        f"pass_at_{args.population}": pass_at_n,
+        "splits": list(splits_dict.keys()),
+        "metrics_per_step": metrics_per_step,
+        "mean_accuracy_final_step": mean_acc,
+        "pass_at_1_final_step": pass_at_1,
+        f"pass_at_{args.population}_final_step": pass_at_n,
         "mode": "rsa",
         "method": "recursive_self_aggregation",
+        "splits_note": f"Each split (step_1, ..., step_{args.steps}) contains N={args.population} candidates per problem for that RSA step, with evaluation done at that step.",
     }
     
     os.makedirs(args.output_dir, exist_ok=True)
@@ -675,14 +767,16 @@ def main(args):
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
     
-    print(f"\nSaved dataset to: {args.output_dir}")
+    print(f"\nSaved dataset (splits: {list(splits_dict.keys())}) to: {args.output_dir}")
     print(f"Saved metadata to: {metadata_path}")
     
     summary_path = os.path.join(args.output_dir, "summary.json")
+    total_rows = sum(len(splits_dict[s]) for s in splits_dict)
     summary = {
         **metadata,
-        "num_successful_candidates": sum(1 for r in rows if r["is_successful"]),
-        "problems_solved": sum(1 for pr in all_results if any(pr)),
+        "total_rows_across_splits": total_rows,
+        "num_successful_final_step": final_metrics.get("num_successful", 0),
+        "problems_solved_final_step": final_metrics.get("problems_solved", 0),
     }
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
