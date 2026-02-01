@@ -48,9 +48,10 @@ Resume from checkpoint (if previous run failed):
         --model Qwen/Qwen3-4B-Instruct-2507 \
         ... (same args as original run)
 
-Checkpoints are automatically saved after each RSA step to:
+Checkpoints are automatically saved after each generation (before evaluation) to:
     checkpoints/<YYYYMMDD_HHMMSS>/checkpoint.pkl
     checkpoints/<YYYYMMDD_HHMMSS>/checkpoint_info.json
+On resume, generation is skipped for the checkpointed step and evaluation is run first.
 
 Output format: DatasetDict with splits step_1, step_2, ..., step_T. Each split has the same
 columns (problem_id, candidate_id, question, response, final_reward, is_successful, rsa_step,
@@ -326,6 +327,7 @@ def run_batched_rsa(
     k = args.k
     steps = args.steps
     start_step = 1
+    skip_generation = False  # When True, we have generations for start_step; only run evaluation
     
     # Set random seed
     if args.seed is not None:
@@ -333,7 +335,7 @@ def run_batched_rsa(
     
     problem_states: list[RSAProblemState] = []
     
-    # Resume from checkpoint if available
+    # Resume from checkpoint if available (checkpoint was saved after generation, before evaluation)
     if checkpoint_manager and checkpoint_manager.has_checkpoint():
         print(f"\nResuming from checkpoint: {checkpoint_manager.checkpoint_dir}")
         checkpoint_data = checkpoint_manager.load()
@@ -350,7 +352,8 @@ def run_batched_rsa(
             print(warning)
         
         start_step = checkpoint_data.current_round
-        print(f"  Resuming from step {start_step}/{steps}")
+        skip_generation = True
+        print(f"  Resuming from step {start_step}/{steps} (will skip generation, run evaluation)")
         print(f"  Restoring {len(checkpoint_data.active_states_data)} problem states...")
         
         for state_data in checkpoint_data.active_states_data:
@@ -385,111 +388,115 @@ def run_batched_rsa(
     for step in range(start_step, steps + 1):
         is_initial = (step == 1)
         
-        if is_initial:
-            print(f"\n[RSA Step 1/{steps}] Generating initial population of {population} candidates per problem...")
-            
-            # Build initial prompts for all problems
-            all_prompts = []
-            prompt_to_problem = []  # Track which problem each prompt belongs to
-            
-            for state in problem_states:
-                messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": state.question}
-                ]
-                prompt_text = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-                input_ids = tokenizer(prompt_text)["input_ids"]
-                
-                # Add N copies for population
-                for _ in range(population):
-                    all_prompts.append(input_ids)
-                    prompt_to_problem.append(state.problem_index)
-            
-            print(f"  Total prompts to generate: {len(all_prompts)}")
-            
-            # Batch sample
-            if args.backend == "tinker":
-                all_responses = asyncio.run(sample_batch_tinker(client, all_prompts, sampling_params, tokenizer))
-            else:
-                all_responses = sample_batch_vllm(client, all_prompts, sampling_params, show_progress=args.vllm_multi_gpu)
-            
-            # Distribute responses to problem states
-            response_idx = 0
-            for state in problem_states:
-                state.candidates = all_responses[response_idx:response_idx + population]
-                state.candidates_by_step.append(list(state.candidates))
-                state.aggregation_history = [[] for _ in range(population)]  # No aggregation for initial
-                state.aggregation_history_by_step.append([[] for _ in range(population)])
-                state.current_step = 1
-                response_idx += population
-            
-            print(f"  Generated {len(all_responses)} initial candidates.")
-        
+        if skip_generation:
+            print(f"\n[Resuming RSA Step {step}/{steps}] Skipping generation, going directly to evaluation...")
+            skip_generation = False
         else:
-            print(f"\n[RSA Step {step}/{steps}] Aggregating with K={k}...")
-            
-            # Build aggregation prompts
-            all_prompts = []
-            all_subsets = []  # Track which candidates were aggregated
-            prompt_to_problem = []
-            
-            for state in problem_states:
-                new_subsets = []
-                for _ in range(population):
-                    # Subsample K candidates without replacement
-                    subset_indices = random.sample(range(len(state.candidates)), k)
-                    subset = [state.candidates[idx] for idx in subset_indices]
-                    new_subsets.append(subset_indices)
-                    
-                    # Build aggregation prompt
-                    agg_prompt_text = aggregate_prompt(state.question, subset)
-                    messages = [{"role": "user", "content": agg_prompt_text}]
+            if is_initial:
+                print(f"\n[RSA Step 1/{steps}] Generating initial population of {population} candidates per problem...")
+                
+                # Build initial prompts for all problems
+                all_prompts = []
+                prompt_to_problem = []  # Track which problem each prompt belongs to
+                
+                for state in problem_states:
+                    messages = [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": state.question}
+                    ]
                     prompt_text = tokenizer.apply_chat_template(
                         messages, tokenize=False, add_generation_prompt=True
                     )
                     input_ids = tokenizer(prompt_text)["input_ids"]
                     
-                    all_prompts.append(input_ids)
-                    prompt_to_problem.append(state.problem_index)
+                    # Add N copies for population
+                    for _ in range(population):
+                        all_prompts.append(input_ids)
+                        prompt_to_problem.append(state.problem_index)
                 
-                all_subsets.append(new_subsets)
+                print(f"  Total prompts to generate: {len(all_prompts)}")
+                
+                # Batch sample
+                if args.backend == "tinker":
+                    all_responses = asyncio.run(sample_batch_tinker(client, all_prompts, sampling_params, tokenizer))
+                else:
+                    all_responses = sample_batch_vllm(client, all_prompts, sampling_params, show_progress=args.vllm_multi_gpu)
+                
+                # Distribute responses to problem states
+                response_idx = 0
+                for state in problem_states:
+                    state.candidates = all_responses[response_idx:response_idx + population]
+                    state.candidates_by_step.append(list(state.candidates))
+                    state.aggregation_history = [[] for _ in range(population)]  # No aggregation for initial
+                    state.aggregation_history_by_step.append([[] for _ in range(population)])
+                    state.current_step = 1
+                    response_idx += population
+                
+                print(f"  Generated {len(all_responses)} initial candidates.")
             
-            print(f"  Total prompts to generate: {len(all_prompts)}")
-            
-            # Batch sample
-            if args.backend == "tinker":
-                all_responses = asyncio.run(sample_batch_tinker(client, all_prompts, sampling_params, tokenizer))
             else:
-                all_responses = sample_batch_vllm(client, all_prompts, sampling_params, show_progress=args.vllm_multi_gpu)
+                print(f"\n[RSA Step {step}/{steps}] Aggregating with K={k}...")
+                
+                # Build aggregation prompts
+                all_prompts = []
+                all_subsets = []  # Track which candidates were aggregated
+                prompt_to_problem = []
+                
+                for state in problem_states:
+                    new_subsets = []
+                    for _ in range(population):
+                        # Subsample K candidates without replacement
+                        subset_indices = random.sample(range(len(state.candidates)), k)
+                        subset = [state.candidates[idx] for idx in subset_indices]
+                        new_subsets.append(subset_indices)
+                        
+                        # Build aggregation prompt
+                        agg_prompt_text = aggregate_prompt(state.question, subset)
+                        messages = [{"role": "user", "content": agg_prompt_text}]
+                        prompt_text = tokenizer.apply_chat_template(
+                            messages, tokenize=False, add_generation_prompt=True
+                        )
+                        input_ids = tokenizer(prompt_text)["input_ids"]
+                        
+                        all_prompts.append(input_ids)
+                        prompt_to_problem.append(state.problem_index)
+                    
+                    all_subsets.append(new_subsets)
+                
+                print(f"  Total prompts to generate: {len(all_prompts)}")
+                
+                # Batch sample
+                if args.backend == "tinker":
+                    all_responses = asyncio.run(sample_batch_tinker(client, all_prompts, sampling_params, tokenizer))
+                else:
+                    all_responses = sample_batch_vllm(client, all_prompts, sampling_params, show_progress=args.vllm_multi_gpu)
+                
+                # Distribute responses to problem states
+                response_idx = 0
+                for state, subsets in zip(problem_states, all_subsets):
+                    state.candidates = all_responses[response_idx:response_idx + population]
+                    state.candidates_by_step.append(list(state.candidates))
+                    state.aggregation_history = subsets
+                    state.aggregation_history_by_step.append([list(s) for s in subsets])
+                    state.current_step = step
+                    response_idx += population
+                
+                print(f"  Generated {len(all_responses)} aggregated candidates.")
             
-            # Distribute responses to problem states
-            response_idx = 0
-            for state, subsets in zip(problem_states, all_subsets):
-                state.candidates = all_responses[response_idx:response_idx + population]
-                state.candidates_by_step.append(list(state.candidates))
-                state.aggregation_history = subsets
-                state.aggregation_history_by_step.append([list(s) for s in subsets])
-                state.current_step = step
-                response_idx += population
-            
-            print(f"  Generated {len(all_responses)} aggregated candidates.")
+            # Save checkpoint BEFORE evaluation (so we can retry if evaluation fails)
+            if checkpoint_manager:
+                checkpoint_manager.save(
+                    active_states_data=[serialize_rsa_state(s) for s in problem_states],
+                    completed_states_data=[],
+                    current_round=step,
+                    total_rounds=steps,
+                )
         
         # Evaluate current step candidates (required for per-step splits)
         print(f"\n  Evaluating step {step} candidates...")
         problem_states = evaluate_rsa_results(
             problem_states, args, shared_dataset, step_idx=step - 1
         )
-        
-        # Save checkpoint after each step
-        if checkpoint_manager:
-            checkpoint_manager.save(
-                active_states_data=[serialize_rsa_state(s) for s in problem_states],
-                completed_states_data=[],
-                current_round=step + 1,
-                total_rounds=steps,
-            )
     
     return problem_states
 
