@@ -102,28 +102,62 @@ def load_and_merge_datasets(dataset_configs: list[tuple[str, int]]) -> dict[int,
     return merged_results
 
 
+def load_and_merge_datasets_with_filter(dataset_configs: list[tuple[str, int]], max_problem_id: int = None) -> dict[int, list[float]]:
+    """Load multiple datasets and merge them by problem_id with offset, with optional filtering.
+    
+    Args:
+        dataset_configs: List of (dataset_name, problem_id_offset) tuples
+        max_problem_id: If specified, only include problems with global id < max_problem_id
+    """
+    merged_results = {}
+    
+    for dataset_name, offset in dataset_configs:
+        print(f"Loading {dataset_name} (offset={offset})...")
+        ds = load_dataset(dataset_name, split="train")
+        df = ds.to_pandas()
+        df = df.sort_values(['problem_id', 'trajectory_id'])
+        
+        for _, row in df.iterrows():
+            # Apply offset to get global problem_id
+            problem_id = row['problem_id'] + offset
+            
+            # Filter by max_problem_id if specified
+            if max_problem_id is not None and problem_id >= max_problem_id:
+                continue
+                
+            final_reward = row['final_reward']
+            
+            if problem_id not in merged_results:
+                merged_results[problem_id] = []
+            merged_results[problem_id].append(final_reward)
+    
+    return merged_results
+
+
 def main():
-    # Multi-turn interaction datasets (10 turns per sample, 32 samples)
+    # Multi-turn interaction datasets (10 turns per sample)
     # Format: (dataset_name, problem_id_offset)
     multiturn_datasets = [
-        ("anirudhb11/0_25_interations_10_attempts_new_pr", 0),    # problem 0-24
-        ("anirudhb11/25_50_interations_10_attempts_new_pr", 25),  # problem 25-49
-        ("anirudhb11/50_75_interations_10_attempts_new_pr", 50),  # problem 50-74
+        ("anirudhb11/0_25_interations_10_attempts_new_pr", 0),     # problem 0-24
+        ("anirudhb11/25_50_interations_10_attempts_new_pr", 25),   # problem 25-49
+        ("anirudhb11/50_75_interations_10_attempts_new_pr", 50),   # problem 50-74
+        ("anirudhb11/75_100_interations_10_attempts_new_pr", 75),  # problem 75-99
     ]
     
-    # S1 datasets (single turn, 32 samples)
+    # S1 datasets
     # Format: (dataset_name, problem_id_offset)
     s1_datasets = [
-        ("anirudhb11/0_25_s1_10_attempts", 0),    # problem 0-24
-        ("anirudhb11/25_50_s1_10_attempts", 25),  # problem 25-49
-        ("anirudhb11/50_75_s1_10_attempts", 50),  # problem 50-74
+        ("anirudhb11/0_25_s1_10_attempts", 0),      # problem 0-24
+        ("anirudhb11/25_50_s1_10_attempts", 25),    # problem 25-49
+        ("anirudhb11/50_75_s1_10_attempts", 50),    # problem 50-74
+        ("bicycleman15/75_100_s1_10_attempts", 75), # problem 75-99
     ]
     
-    # Single-turn dataset with 160 samples (problems 0-75)
-    single_turn_160_datasets = [
-        ("bicycleman15/st_k160_0_25", 0),    # problem 0-24, 160 samples
-        ("bicycleman15/st_k160_25_50", 25),  # problem 25-49, 160 samples
-        ("bicycleman15/st_k160_50_75", 50),  # problem 50-74, 160 samples
+    # Single-turn datasets (higher K, up to 320)
+    # Note: single_50_150 covers 50-150 but we restrict to problem_id < 100
+    single_turn_datasets = [
+        ("bicycleman15/single_0_50", 0),     # problem 0-49
+        ("bicycleman15/single_50_150", 50),  # problem 50-149, but filter to < 100
     ]
     
     # Load and merge datasets
@@ -133,8 +167,9 @@ def main():
     print("\nLoading S1 datasets...")
     s1_results = load_and_merge_datasets(s1_datasets)
     
-    print("\nLoading Single-turn (160 samples) dataset...")
-    st_160_results = load_and_merge_datasets(single_turn_160_datasets)
+    print("\nLoading Single-turn datasets...")
+    # Use filtered version to restrict to problem_id < 100
+    single_turn_results = load_and_merge_datasets_with_filter(single_turn_datasets, max_problem_id=100)
     
     # Print dataset info
     print(f"\nDataset Summary:")
@@ -148,25 +183,25 @@ def main():
         sample_counts = [len(v) for v in s1_results.values()]
         print(f"  Samples per problem: min={min(sample_counts)}, max={max(sample_counts)}")
     
-    print(f"Single-turn (160): {len(st_160_results)} problems")
-    if st_160_results:
-        sample_counts = [len(v) for v in st_160_results.values()]
+    print(f"Single-turn: {len(single_turn_results)} problems")
+    if single_turn_results:
+        sample_counts = [len(v) for v in single_turn_results.values()]
         print(f"  Samples per problem: min={min(sample_counts)}, max={max(sample_counts)}")
     
     # Compute best-of-K for K from 1 to 32 for multi-turn and s1
     k_values_32 = list(range(1, 33))
-    # Compute best-of-K for K from 1 to 160 for single-turn 160
-    k_values_160 = list(range(1, 161))
+    # Compute best-of-K for K from 1 to 320 for single-turn
+    k_values_320 = list(range(1, 321))
     
     # Best-of-K scores (continuous rewards)
     s1_scores = []
     interactions_scores = []
-    st_160_scores = []
+    single_turn_scores = []
     
     # Pass@K scores (binary: reward == 1.0)
     s1_pass_scores = []
     interactions_pass_scores = []
-    st_160_pass_scores = []
+    single_turn_pass_scores = []
     
     print("\n=== Best-of-K Results (Continuous Rewards) ===")
     for k in k_values_32:
@@ -183,31 +218,31 @@ def main():
         if k in [1, 4, 8, 16, 32]:
             print(f"K={k:2d}: S1={s1_score:.4f}, Multi-turn={interactions_score:.4f}")
     
-    # Compute for single-turn 160 up to K=160
-    for k in k_values_160:
-        st_160_score = compute_best_of_k(st_160_results, k)
-        st_160_scores.append(st_160_score)
-        st_160_pass_scores.append(compute_pass_at_k(st_160_results, k))
+    # Compute for single-turn up to K=320
+    for k in k_values_320:
+        single_turn_score = compute_best_of_k(single_turn_results, k)
+        single_turn_scores.append(single_turn_score)
+        single_turn_pass_scores.append(compute_pass_at_k(single_turn_results, k))
     
-    print(f"\nSingle-turn (160 samples):")
-    for k in [1, 8, 32, 64, 128, 160]:
-        if k <= len(st_160_scores):
-            print(f"  Best@{k}: {st_160_scores[k-1]:.4f}")
+    print(f"\nSingle-turn (up to 320 samples):")
+    for k in [1, 8, 32, 64, 128, 256, 320]:
+        if k <= len(single_turn_scores):
+            print(f"  Best@{k}: {single_turn_scores[k-1]:.4f}")
     
     print("\n=== Pass@K Results (Binary: reward == 1.0) ===")
     for k in [1, 4, 8, 16, 32]:
         print(f"K={k:2d}: S1={s1_pass_scores[k-1]:.4f}, Multi-turn={interactions_pass_scores[k-1]:.4f}")
     
-    print(f"\nSingle-turn (160 samples):")
-    for k in [1, 8, 32, 64, 128, 160]:
-        if k <= len(st_160_pass_scores):
-            print(f"  Pass@{k}: {st_160_pass_scores[k-1]:.4f}")
+    print(f"\nSingle-turn (up to 320 samples):")
+    for k in [1, 8, 32, 64, 128, 256, 320]:
+        if k <= len(single_turn_pass_scores):
+            print(f"  Pass@{k}: {single_turn_pass_scores[k-1]:.4f}")
     
     # Create figure with two subplots
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     
     # Plot 1: Best-of-K (continuous rewards)
-    ax1.plot(k_values_160, st_160_scores, '-', color='#9B59B6', label='Single-turn (160 samples)', 
+    ax1.plot(k_values_320, single_turn_scores, '-', color='#9B59B6', label='Single-turn', 
              linewidth=1.5)
     ax1.plot(k_values_32, interactions_scores, '-o', color='#FF6B6B', label='Multi-turn (10 turns)', 
              markersize=3, linewidth=1.5)
@@ -219,10 +254,10 @@ def main():
     ax1.set_title('Best-of-K (Continuous Rewards)', fontsize=12, style='italic')
     ax1.legend(loc='lower right', frameon=True)
     ax1.grid(True, alpha=0.3)
-    ax1.set_xticks([1, 16, 32, 64, 96, 128, 160])
+    ax1.set_xticks([1, 32, 64, 128, 192, 256, 320])
     
     # Plot 2: Pass@K (binary rewards)
-    ax2.plot(k_values_160, st_160_pass_scores, '-', color='#9B59B6', label='Single-turn (160 samples)', 
+    ax2.plot(k_values_320, single_turn_pass_scores, '-', color='#9B59B6', label='Single-turn', 
              linewidth=1.5)
     ax2.plot(k_values_32, interactions_pass_scores, '-o', color='#FF6B6B', label='Multi-turn (10 turns)', 
              markersize=3, linewidth=1.5)
@@ -234,7 +269,7 @@ def main():
     ax2.set_title('Pass@K (Binary: reward == 1.0)', fontsize=12, style='italic')
     ax2.legend(loc='lower right', frameon=True)
     ax2.grid(True, alpha=0.3)
-    ax2.set_xticks([1, 16, 32, 64, 96, 128, 160])
+    ax2.set_xticks([1, 32, 64, 128, 192, 256, 320])
     
     plt.tight_layout()
     plt.savefig('best_of_k_comparison.png', dpi=150)
@@ -243,20 +278,21 @@ def main():
     
     # Also print summary statistics
     print("\n=== Summary Statistics ===")
-    print(f"\nS1 (32 samples, problems 0-75):")
+    print(f"\nS1 (problems 0-99):")
     print(f"  Best@1:  {s1_scores[0]:.4f}  |  Pass@1:  {s1_pass_scores[0]:.4f}")
     print(f"  Best@8:  {s1_scores[7]:.4f}  |  Pass@8:  {s1_pass_scores[7]:.4f}")
     print(f"  Best@32: {s1_scores[31]:.4f}  |  Pass@32: {s1_pass_scores[31]:.4f}")
     
-    print(f"\nMulti-turn (32 samples, 10 turns each, problems 0-75):")
+    print(f"\nMulti-turn (10 turns each, problems 0-99):")
     print(f"  Best@1:  {interactions_scores[0]:.4f}  |  Pass@1:  {interactions_pass_scores[0]:.4f}")
     print(f"  Best@8:  {interactions_scores[7]:.4f}  |  Pass@8:  {interactions_pass_scores[7]:.4f}")
     print(f"  Best@32: {interactions_scores[31]:.4f}  |  Pass@32: {interactions_pass_scores[31]:.4f}")
     
-    print(f"\nSingle-turn (160 samples, problems 0-75):")
-    print(f"  Best@1:   {st_160_scores[0]:.4f}  |  Pass@1:   {st_160_pass_scores[0]:.4f}")
-    print(f"  Best@32:  {st_160_scores[31]:.4f}  |  Pass@32:  {st_160_pass_scores[31]:.4f}")
-    print(f"  Best@160: {st_160_scores[159]:.4f}  |  Pass@160: {st_160_pass_scores[159]:.4f}")
+    print(f"\nSingle-turn (problems 0-99):")
+    print(f"  Best@1:   {single_turn_scores[0]:.4f}  |  Pass@1:   {single_turn_pass_scores[0]:.4f}")
+    print(f"  Best@32:  {single_turn_scores[31]:.4f}  |  Pass@32:  {single_turn_pass_scores[31]:.4f}")
+    if len(single_turn_scores) >= 320:
+        print(f"  Best@320: {single_turn_scores[319]:.4f}  |  Pass@320: {single_turn_pass_scores[319]:.4f}")
 
 
 if __name__ == "__main__":
