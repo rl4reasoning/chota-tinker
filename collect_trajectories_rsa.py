@@ -157,16 +157,43 @@ Candidate solutions (may contain mistakes):"""]
 
 def render_trajectory(question: str, candidate: str, reward: float, 
                       rsa_step: int, total_steps: int, candidate_idx: int,
-                      aggregated_from: list[int]) -> str:
-    """Render a trajectory as a formatted string."""
+                      aggregated_from: list[int],
+                      aggregated_candidates: list[str] | None = None) -> str:
+    """Render a trajectory as a formatted string showing the actual LLM prompt.
+    
+    Args:
+        question: The problem statement
+        candidate: The LLM response for this candidate
+        reward: The evaluation reward
+        rsa_step: Current RSA step (1-indexed)
+        total_steps: Total number of RSA steps
+        candidate_idx: Index of this candidate in the population
+        aggregated_from: Indices of candidates from previous step that were aggregated
+        aggregated_candidates: The actual candidate strings that were aggregated (for step 2+)
+    """
     lines = []
     lines.append("=" * 80)
-    lines.append(f"Question: {question[:50]}..." if len(question) > 50 else f"Question: {question}")
     lines.append(f"Reward: {reward:.2f} | RSA Step: {rsa_step}/{total_steps} | Candidate: {candidate_idx}")
     if aggregated_from:
-        lines.append(f"Aggregated from indices: {aggregated_from}")
+        lines.append(f"Aggregated from previous step indices: {aggregated_from}")
     lines.append("=" * 80)
-    lines.append(f"\n[RESPONSE]\n{candidate}")
+    
+    # Build and show the actual prompt that was passed to the LLM
+    if rsa_step == 1:
+        # Initial step: SYSTEM_PROMPT + question
+        lines.append(f"\n[SYSTEM]\n{SYSTEM_PROMPT}")
+        lines.append(f"\n[USER]\n{question}")
+    else:
+        # Aggregation step: show the aggregation prompt with actual candidates
+        if aggregated_candidates:
+            agg_prompt = aggregate_prompt(question, aggregated_candidates)
+            lines.append(f"\n[USER]\n{agg_prompt}")
+        else:
+            # Fallback if candidates not available
+            lines.append(f"\n[USER]\n(Aggregation prompt for question with {len(aggregated_from)} candidates)")
+            lines.append(f"\nQuestion:\n{question}")
+    
+    lines.append(f"\n[ASSISTANT]\n{candidate}")
     return "\n".join(lines)
 
 
@@ -695,6 +722,15 @@ def main(args):
                 
                 agg_from = agg_history[cand_idx] if cand_idx < len(agg_history) else []
                 
+                # Get the actual aggregated candidate strings for step 2+
+                aggregated_candidates = None
+                if step_idx > 0 and agg_from and step_idx - 1 < len(state.candidates_by_step):
+                    prev_candidates = state.candidates_by_step[step_idx - 1]
+                    aggregated_candidates = [
+                        prev_candidates[idx] for idx in agg_from 
+                        if idx < len(prev_candidates)
+                    ]
+                
                 row = {
                     "problem_id": state.problem_index,
                     "candidate_id": cand_idx,
@@ -707,7 +743,8 @@ def main(args):
                     "tests": json.dumps(state.tests),
                     "rendered": render_trajectory(
                         state.question, candidate, reward,
-                        step_idx + 1, args.steps, cand_idx, agg_from
+                        step_idx + 1, args.steps, cand_idx, agg_from,
+                        aggregated_candidates=aggregated_candidates,
                     ),
                 }
                 rows.append(row)
