@@ -53,6 +53,53 @@ def compute_pass_at_k(problem_results: dict[int, list[float]], k: int) -> float:
     return num_passed / count if count > 0 else 0.0
 
 
+def compute_mean_at_k(problem_results: dict[int, list[float]], k: int) -> float:
+    """
+    Compute mean@K metric - average reward across first k samples.
+    
+    Args:
+        problem_results: Dict mapping problem_id to list of final rewards
+        k: Number of samples to consider
+    
+    Returns:
+        Average of mean reward over first k samples across all problems
+    """
+    total_mean = 0.0
+    count = 0
+    
+    for problem_id, rewards in problem_results.items():
+        if len(rewards) >= k:
+            mean_reward = sum(rewards[:k]) / k
+            total_mean += mean_reward
+            count += 1
+    
+    return total_mean / count if count > 0 else 0.0
+
+
+def compute_success_rate_at_k(problem_results: dict[int, list[float]], k: int) -> float:
+    """
+    Compute success rate@K - fraction of samples with reward == 1.0 among first k samples.
+    
+    Args:
+        problem_results: Dict mapping problem_id to list of final rewards
+        k: Number of samples to consider
+    
+    Returns:
+        Average success rate (count of reward==1.0 / k) across all problems
+    """
+    total_rate = 0.0
+    count = 0
+    
+    for problem_id, rewards in problem_results.items():
+        if len(rewards) >= k:
+            success_count = sum(1 for r in rewards[:k] if r == 1.0)
+            success_rate = success_count / k
+            total_rate += success_rate
+            count += 1
+    
+    return total_rate / count if count > 0 else 0.0
+
+
 def load_and_process_dataset(dataset_name: str, max_problem_id: int = None) -> dict[int, list[float]]:
     """Load dataset and organize final rewards by problem_id."""
     print(f"Loading {dataset_name}...")
@@ -244,6 +291,40 @@ def compute_pass_at_step(results_by_step: dict[int, dict[int, list[float]]], ste
     return num_passed / count if count > 0 else 0.0
 
 
+def compute_mean_at_step(results_by_step: dict[int, dict[int, list[float]]], step: int) -> float:
+    """
+    Compute mean@step_k: average reward across all candidates at step k for each problem.
+    """
+    total_mean = 0.0
+    count = 0
+    
+    for problem_id, step_rewards in results_by_step.items():
+        if step in step_rewards and len(step_rewards[step]) > 0:
+            mean_reward = sum(step_rewards[step]) / len(step_rewards[step])
+            total_mean += mean_reward
+            count += 1
+    
+    return total_mean / count if count > 0 else 0.0
+
+
+def compute_success_rate_at_step(results_by_step: dict[int, dict[int, list[float]]], step: int) -> float:
+    """
+    Compute success rate@step: fraction of candidates with reward == 1.0 at step k.
+    """
+    total_rate = 0.0
+    count = 0
+    
+    for problem_id, step_rewards in results_by_step.items():
+        if step in step_rewards and len(step_rewards[step]) > 0:
+            rewards = step_rewards[step]
+            success_count = sum(1 for r in rewards if r == 1.0)
+            success_rate = success_count / len(rewards)
+            total_rate += success_rate
+            count += 1
+    
+    return total_rate / count if count > 0 else 0.0
+
+
 def main():
     # Multi-turn interaction datasets (10 turns per sample)
     # Format: (dataset_name, problem_id_offset)
@@ -329,9 +410,21 @@ def main():
     interactions_scores = []
     single_turn_scores = []
     
+    # Mean@K scores
+    s1_mean_scores = []
+    interactions_mean_scores = []
+    single_turn_mean_scores = []
+    
+    # Success rate@K scores (fraction of samples with reward == 1.0)
+    s1_success_rate_scores = []
+    interactions_success_rate_scores = []
+    single_turn_success_rate_scores = []
+    
     # RSA scores by step
     rsa_step_scores = []
     rsa_step_pass_scores = []
+    rsa_step_mean_scores = []
+    rsa_step_success_rate_scores = []
     
     # Pass@K scores (binary: reward == 1.0)
     s1_pass_scores = []
@@ -350,6 +443,14 @@ def main():
         s1_pass_scores.append(compute_pass_at_k(s1_results, k))
         interactions_pass_scores.append(compute_pass_at_k(interactions_results, k))
         
+        # Mean@K
+        s1_mean_scores.append(compute_mean_at_k(s1_results, k))
+        interactions_mean_scores.append(compute_mean_at_k(interactions_results, k))
+        
+        # Success rate@K
+        s1_success_rate_scores.append(compute_success_rate_at_k(s1_results, k))
+        interactions_success_rate_scores.append(compute_success_rate_at_k(interactions_results, k))
+        
         if k in [1, 4, 8, 16, 32]:
             print(f"K={k:2d}: S1={s1_score:.4f}, Multi-turn={interactions_score:.4f}")
     
@@ -358,15 +459,21 @@ def main():
         single_turn_score = compute_best_of_k(single_turn_results, k)
         single_turn_scores.append(single_turn_score)
         single_turn_pass_scores.append(compute_pass_at_k(single_turn_results, k))
+        single_turn_mean_scores.append(compute_mean_at_k(single_turn_results, k))
+        single_turn_success_rate_scores.append(compute_success_rate_at_k(single_turn_results, k))
     
     # Compute RSA by step (best across all candidates at each step)
     print(f"\nRSA (best@step across all parallel populations):")
     for step in rsa_step_values:
         rsa_score = compute_best_at_step(rsa_results_by_step, step)
         rsa_pass = compute_pass_at_step(rsa_results_by_step, step)
+        rsa_mean = compute_mean_at_step(rsa_results_by_step, step)
+        rsa_success_rate = compute_success_rate_at_step(rsa_results_by_step, step)
         rsa_step_scores.append(rsa_score)
         rsa_step_pass_scores.append(rsa_pass)
-        print(f"  Step {step:2d}: Best={rsa_score:.4f}, Pass={rsa_pass:.4f}")
+        rsa_step_mean_scores.append(rsa_mean)
+        rsa_step_success_rate_scores.append(rsa_success_rate)
+        print(f"  Step {step:2d}: Best={rsa_score:.4f}, Mean={rsa_mean:.4f}, SuccessRate={rsa_success_rate:.4f}, Pass={rsa_pass:.4f}")
     
     print(f"\nSingle-turn (up to 320 samples):")
     for k in [1, 8, 32, 64, 128, 256, 320]:
@@ -382,8 +489,8 @@ def main():
         if k <= len(single_turn_pass_scores):
             print(f"  Pass@{k}: {single_turn_pass_scores[k-1]:.4f}")
     
-    # Create figure with two subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    # Create figure with four subplots
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 10))
     
     # Plot 1: Best-of-K (continuous rewards)
     ax1.plot(k_values_320, single_turn_scores, '-', color='#9B59B6', label='Single-turn (K)', 
@@ -402,22 +509,56 @@ def main():
     ax1.grid(True, alpha=0.3)
     ax1.set_xticks([1, 10, 32, 64, 128, 192, 256, 320])
     
-    # Plot 2: Pass@K (binary rewards)
-    ax2.plot(k_values_320, single_turn_pass_scores, '-', color='#9B59B6', label='Single-turn (K)', 
+    # Plot 2: Mean@K
+    ax2.plot(k_values_320, single_turn_mean_scores, '-', color='#9B59B6', label='Single-turn (K)', 
              linewidth=1.5)
-    ax2.plot(k_values_32, interactions_pass_scores, '-o', color='#FF6B6B', label='Multi-turn (K, 10 turns each)', 
+    ax2.plot(k_values_32, interactions_mean_scores, '-o', color='#FF6B6B', label='Multi-turn (K, 10 turns each)', 
              markersize=3, linewidth=1.5)
-    ax2.plot(k_values_32, s1_pass_scores, '-o', color='#4ECDC4', label='S1 (K)', 
+    ax2.plot(k_values_32, s1_mean_scores, '-o', color='#4ECDC4', label='S1 (K)', 
              markersize=3, linewidth=1.5)
-    ax2.plot(rsa_x_values, rsa_step_pass_scores, '-s', color='#F39C12', label='RSA (step*32)', 
+    ax2.plot(rsa_x_values, rsa_step_mean_scores, '-s', color='#F39C12', label='RSA (step*32)', 
              markersize=5, linewidth=2)
     
     ax2.set_xlabel('K (samples)')
-    ax2.set_ylabel('Pass@K')
-    ax2.set_title('Pass@K (Binary: reward == 1.0)', fontsize=12, style='italic')
-    ax2.legend(loc='lower right', frameon=True)
+    ax2.set_ylabel('Mean@K Reward')
+    ax2.set_title('Mean@K (Average Reward)', fontsize=12, style='italic')
+    ax2.legend(loc='upper right', frameon=True)
     ax2.grid(True, alpha=0.3)
     ax2.set_xticks([1, 10, 32, 64, 128, 192, 256, 320])
+    
+    # Plot 3: Pass@K (binary rewards)
+    ax3.plot(k_values_320, single_turn_pass_scores, '-', color='#9B59B6', label='Single-turn (K)', 
+             linewidth=1.5)
+    ax3.plot(k_values_32, interactions_pass_scores, '-o', color='#FF6B6B', label='Multi-turn (K, 10 turns each)', 
+             markersize=3, linewidth=1.5)
+    ax3.plot(k_values_32, s1_pass_scores, '-o', color='#4ECDC4', label='S1 (K)', 
+             markersize=3, linewidth=1.5)
+    ax3.plot(rsa_x_values, rsa_step_pass_scores, '-s', color='#F39C12', label='RSA (step*32)', 
+             markersize=5, linewidth=2)
+    
+    ax3.set_xlabel('K (samples)')
+    ax3.set_ylabel('Pass@K')
+    ax3.set_title('Pass@K (Any reward == 1.0)', fontsize=12, style='italic')
+    ax3.legend(loc='lower right', frameon=True)
+    ax3.grid(True, alpha=0.3)
+    ax3.set_xticks([1, 10, 32, 64, 128, 192, 256, 320])
+    
+    # Plot 4: Success Rate@K (fraction of samples with reward == 1.0)
+    ax4.plot(k_values_320, single_turn_success_rate_scores, '-', color='#9B59B6', label='Single-turn (K)', 
+             linewidth=1.5)
+    ax4.plot(k_values_32, interactions_success_rate_scores, '-o', color='#FF6B6B', label='Multi-turn (K, 10 turns each)', 
+             markersize=3, linewidth=1.5)
+    ax4.plot(k_values_32, s1_success_rate_scores, '-o', color='#4ECDC4', label='S1 (K)', 
+             markersize=3, linewidth=1.5)
+    ax4.plot(rsa_x_values, rsa_step_success_rate_scores, '-s', color='#F39C12', label='RSA (step*32)', 
+             markersize=5, linewidth=2)
+    
+    ax4.set_xlabel('K (samples)')
+    ax4.set_ylabel('Success Rate@K')
+    ax4.set_title('Success Rate@K (Fraction with reward == 1.0)', fontsize=12, style='italic')
+    ax4.legend(loc='upper right', frameon=True)
+    ax4.grid(True, alpha=0.3)
+    ax4.set_xticks([1, 10, 32, 64, 128, 192, 256, 320])
     
     plt.tight_layout()
     plt.savefig('best_of_k_comparison.png', dpi=150)
