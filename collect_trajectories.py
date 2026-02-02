@@ -139,7 +139,7 @@ IMPORTANT CONTEXT:
 - You should interact only when doing so provides information that can change your understanding, reasoning, or final decision.
 
 ────────────────────────
-HARD GATING RULES (NON-NEGOTIABLE)
+HARD RULES
 ────────────────────────
 - BEFORE you output ANY final solution code in a ```python``` block, you MUST have completed at least one successful <interact></interact> execution in an earlier turn.
 - If you have NOT yet completed a successful <interact></interact>, you are FORBIDDEN from outputting any ```python``` code block (even partial solutions).
@@ -147,23 +147,21 @@ HARD GATING RULES (NON-NEGOTIABLE)
 - Interactions performed solely to satisfy this requirement (without testing a hypothesis or reducing uncertainty) are INVALID.
 
 ────────────────────────
-EXECUTION ENVIRONMENT (CRITICAL)
+EXECUTION ENVIRONMENT
 ────────────────────────
 - The execution environment shows ONLY what you PRINT to stdout.
 - EVERY <interact></interact> MUST include explicit print(...) statements.
-- Do NOT rely on REPL-style expression outputs or implicit returns.
 
 ────────────────────────
 DEFINITION OF “SUCCESSFUL <interact>”
 ────────────────────────
 An interaction is successful ONLY if ALL of the following hold:
 - The code executes without exceptions, AND
-- It prints at least 2 lines of task-relevant evidence, AND
 - At least one printed line is a newly computed result (not already given in the prompt), AND
 - The subsequent assistant message explicitly uses this evidence to confirm, revise, or reject a stated hypothesis.
 
 ────────────────────────
-MANDATORY INTERACTION STRUCTURE
+INTERACTION STRUCTURE
 ────────────────────────
 Before each <interact></interact>, you MUST clearly state:
 - The specific hypothesis, assumption, or uncertainty being tested
@@ -175,23 +173,6 @@ After receiving the output, you MUST clearly state:
 - Whether the hypothesis was confirmed, weakened, or falsified
 - What (if anything) changed in your approach
 
-────────────────────────
-ORACLE / FALSIFICATION GATE (CRITICAL)
-────────────────────────
-- For algorithmic correctness problems, you MUST run at least one interaction that attempts to falsify your proposed solution.
-- This interaction MUST compare your approach against a correct reference implementation using:
-  (a) brute force / exhaustive checking for small inputs (e.g., n ≤ 6–8), OR
-  (b) randomized testing against a slower but correct oracle.
-- This interaction MUST print either:
-  • “No counterexample found in K tests” (K ≥ 100), OR
-  • A concrete counterexample where your approach disagrees with the oracle.
-- If a counterexample is found, you MUST revise your approach and repeat the oracle test.
-
-Testing only the examples provided in the prompt does NOT count as validation or falsification.
-
-────────────────────────
-ANTI-THRASHING RULE
-────────────────────────
 - If an <interact></interact> produces no output, insufficient output, or redundant output, your NEXT interaction MUST fix this and MUST NOT repeat the same interaction pattern.
 
 ────────────────────────
@@ -383,6 +364,9 @@ def run_batched_rollouts(
     if args.dataset.startswith("bicycleman15/"):
         from datasets import load_dataset
         full_dataset = load_dataset(args.dataset, split="train")
+    elif args.dataset.__contains__('lcb'):
+        from datasets import load_dataset
+        full_dataset = load_dataset(args.dataset, split="test")
     else:
         from datasets import load_dataset
         full_dataset = load_dataset(args.dataset, "code", split="train")

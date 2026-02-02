@@ -335,6 +335,9 @@ def run_batched_rsa(
     if args.dataset.startswith("bicycleman15/"):
         from datasets import load_dataset
         full_dataset = load_dataset(args.dataset, split="train")
+    elif args.dataset.__contains__('lcb'):
+        from datasets import load_dataset
+        full_dataset = load_dataset(args.dataset, split="test")
     else:
         from datasets import load_dataset
         full_dataset = load_dataset(args.dataset, "code", split="train")
