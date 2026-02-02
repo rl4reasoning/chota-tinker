@@ -559,7 +559,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Collect single-turn trajectories for code problems")
     parser.add_argument("--dataset", type=str, default="bicycleman15/intellect_3_code_easy_medium",
                         choices=["bicycleman15/intellect_3_code_easy_medium", "bicycleman15/intellect_3_code_hard",
-                                 "bicycleman15/intellect_3_code_very_hard", "PrimeIntellect/INTELLECT-3-RL"])
+                                 "bicycleman15/intellect_3_code_very_hard", "PrimeIntellect/INTELLECT-3-RL", "anirudhb11/lcb_v6_formatted"])
     parser.add_argument("--start-problem", type=int, default=0,
                         help="Starting problem index for dataset slicing (default: 0)")
     parser.add_argument("--num-problems", type=int, default=20)
