@@ -147,7 +147,7 @@ HARD RULES (NON-NEGOTIABLE)
 - Interactions performed solely to satisfy this requirement (without testing a hypothesis or reducing uncertainty) are INVALID.
 
 ────────────────────────
-EXECUTION ENVIRONMENT
+EXECUTION ENVIRONMENT (CRITICAL)
 ────────────────────────
 - The execution environment shows ONLY what you PRINT to stdout.
 - EVERY <interact></interact> MUST include explicit print(...) statements.
@@ -163,7 +163,7 @@ An interaction is successful ONLY if ALL of the following hold:
 - The subsequent assistant message explicitly uses this evidence to confirm, revise, or reject a stated hypothesis.
 
 ────────────────────────
-INTERACTION STRUCTURE
+MANDATORY INTERACTION STRUCTURE
 ────────────────────────
 Before each <interact></interact>, you MUST clearly state:
 - The specific hypothesis, assumption, or uncertainty being tested
@@ -175,10 +175,8 @@ After receiving the output, you MUST clearly state:
 - Whether the hypothesis was confirmed, weakened, or falsified
 - What (if anything) changed in your approach
 
-- If an <interact></interact> produces no output, insufficient output, or redundant output, your NEXT interaction MUST fix this and MUST NOT repeat the same interaction pattern.
-
 ────────────────────────
-SOLUTION STRESS TEST (MANDATORY)
+SOLUTION STRESS TEST (CRITICAL)
 ────────────────────────
 - For algorithmic correctness problems, you MUST run at least one interaction that attempts to falsify your proposed solution.
 - This interaction MUST compare your approach against a correct reference implementation using:
@@ -190,6 +188,11 @@ SOLUTION STRESS TEST (MANDATORY)
 - If a counterexample is found, you MUST revise your approach and repeat the oracle test.
 
 Testing only the examples provided in the prompt does NOT count as validation or falsification.
+
+────────────────────────
+ANTI-THRASHING RULE
+────────────────────────
+- If an <interact></interact> produces no output, insufficient output, or redundant output, your NEXT interaction MUST fix this and MUST NOT repeat the same interaction pattern.
 
 ────────────────────────
 ITERATIVE WORKFLOW
@@ -734,7 +737,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Collect multi-turn trajectories for code problems")
     parser.add_argument("--dataset", type=str, default="bicycleman15/intellect_3_code_easy_medium",
                         choices=["bicycleman15/intellect_3_code_easy_medium", "bicycleman15/intellect_3_code_hard",
-                                 "bicycleman15/intellect_3_code_very_hard", "PrimeIntellect/INTELLECT-3-RL"])
+                                 "bicycleman15/intellect_3_code_very_hard", "PrimeIntellect/INTELLECT-3-RL", "anirudhb11/lcb_v6_feb_may_2025_formatted"])
     parser.add_argument("--start-problem", type=int, default=0,
                         help="Starting problem index for dataset slicing (default: 0)")
     parser.add_argument("--num-problems", type=int, default=20)
