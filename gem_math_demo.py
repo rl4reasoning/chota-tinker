@@ -46,7 +46,7 @@ IMPORTANT CONTEXT:
 - You should interact only when doing so provides information that can change your understanding, reasoning, or final decision.
 
 ────────────────────────
-HARD GATING RULES (NON-NEGOTIABLE)
+HARD RULES (NON-NEGOTIABLE)
 ────────────────────────
 - BEFORE you output ANY final solution code in a ```python``` block, you MUST have completed at least one successful <interact></interact> execution in an earlier turn.
 - If you have NOT yet completed a successful <interact></interact>, you are FORBIDDEN from outputting any ```python``` code block (even partial solutions).
@@ -83,7 +83,7 @@ After receiving the output, you MUST clearly state:
 - What (if anything) changed in your approach
 
 ────────────────────────
-ORACLE / FALSIFICATION GATE (CRITICAL)
+SOLUTION STRESS TEST (CRITICAL)
 ────────────────────────
 - For algorithmic correctness problems, you MUST run at least one interaction that attempts to falsify your proposed solution.
 - This interaction MUST compare your approach against a correct reference implementation using:

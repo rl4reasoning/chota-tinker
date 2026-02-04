@@ -50,6 +50,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
@@ -307,7 +308,10 @@ def create_sampling_client(args):
         if args.vllm_server_url:
             return ServerSamplingClient(args.vllm_server_url)
         else:
-            return SamplingClient(args.model, gpu_memory_utilization=args.gpu_memory_utilization)
+            kwargs = {"gpu_memory_utilization": args.gpu_memory_utilization}
+            if getattr(args, "max_model_len", None) is not None:
+                kwargs["max_model_len"] = args.max_model_len
+            return SamplingClient(args.model, **kwargs)
 
 
 def create_sampling_params(args, backend: str):
@@ -342,6 +346,36 @@ def postprocess_response(response: str) -> str:
     if "<interact>" in response and "</interact>" not in response:
         response += "</interact>"
     return response
+
+
+def truncate_interaction_output(
+    output_text: str,
+    tokenizer,
+    max_tokens: int,
+) -> str:
+    """If output_text has more than max_tokens tokens, keep only the last max_tokens and prepend a notice."""
+    if not output_text or max_tokens <= 0:
+        return output_text
+    ids = tokenizer.encode(output_text, add_special_tokens=False)
+    if len(ids) <= max_tokens:
+        return output_text
+    keep = ids[-max_tokens:]
+    tail_text = tokenizer.decode(keep, skip_special_tokens=False)
+    return f"Output too long, showing only last {max_tokens} tokens.\n{tail_text}"
+
+
+def maybe_truncate_obs(obs: str, tokenizer, max_interaction_output_tokens: Optional[int]) -> str:
+    """If obs is <output>...</output> and body exceeds max_interaction_output_tokens, truncate to tail and prepend notice."""
+    if obs is None or not obs or max_interaction_output_tokens is None or max_interaction_output_tokens <= 0:
+        return obs
+    match = re.match(r"^<output>\n(.*)</output>\s*$", obs, re.DOTALL)
+    if not match:
+        return obs
+    body = match.group(1)
+    truncated = truncate_interaction_output(body, tokenizer, max_interaction_output_tokens)
+    if truncated is body:
+        return obs
+    return f"<output>\n{truncated}</output>"
 
 
 async def sample_batch_tinker(client, prompts: list[list[int]], sampling_params) -> list[str]:
@@ -537,6 +571,7 @@ def run_batched_rollouts(
         else:
             step_results = [s.env.step(r) for s, r in zip(active_states, processed_responses)]
 
+        max_out_tokens = getattr(args, "max_interaction_output_tokens", None)
         for state, _response, (obs, reward, terminated, truncated, info) in zip(
             active_states, processed_responses, step_results
         ):
@@ -546,7 +581,11 @@ def run_batched_rollouts(
             state.terminated = terminated
             state.truncated = truncated
             
-            # Update interactions
+            # Truncate interaction output if over limit (guardrail against huge terminal output)
+            if obs and max_out_tokens is not None and max_out_tokens > 0:
+                obs = maybe_truncate_obs(obs, tokenizer, max_out_tokens)
+            
+            # Update interactions (truncation already applied to obs that goes into history)
             if state.env.history and len(state.env.history) > len(state.interactions):
                 state.interactions = state.env.history.copy()
             
@@ -770,6 +809,8 @@ if __name__ == "__main__":
                         help="Seconds to wait for vLLM servers to be ready.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
                         help="GPU memory utilization for local vLLM or vLLM servers (default: 0.8)")
+    parser.add_argument("--max-model-len", type=int, default=None,
+                        help="Max sequence length for vLLM; lower than model default to reduce KV cache (e.g. 16384 or 143104)")
     parser.add_argument("--fast-eval", action="store_true",
                         help="Use parallel fast eval for final answers")
     parser.add_argument("--eval-workers", type=int, default=16,
@@ -778,6 +819,8 @@ if __name__ == "__main__":
                         help="Number of responses per evaluator task (default: 8)")
     parser.add_argument("--eval-timeout-s", type=float, default=1.0,
                         help="Per-test timeout in seconds for fast evaluation (default: 5.0)")
+    parser.add_argument("--max-interaction-output-tokens", type=int, default=4000,
+                        help="Truncate terminal output in <output> to this many tokens (keep tail); prepend 'Output too long, showing only last X tokens' to avoid context overflow (default: 4000).")
     
     args = parser.parse_args()
     main(args)

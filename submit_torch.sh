@@ -33,6 +33,8 @@ conda activate ct
 #         --start-problem 0 \
 #         --num-problems 500 \
 #         --num-samples 32 \
+#         --max-model-len 120000 \
+#         --max-interaction-output-tokens 4000 \
 #         \
 #         --fast-eval \
 #         --eval-workers 8 \
