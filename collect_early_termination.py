@@ -170,6 +170,8 @@ class EarlyTermState:
     prompt: Optional[str] = None  # The final prompt string sent to vLLM
     response: Optional[str] = None
     new_reward: float = 0.0
+    needs_inference: bool = True  # False if trajectory already completed by turn_index
+    already_completed_at_turn: Optional[int] = None  # Turn at which trajectory originally completed
 
 
 def _parse_json_field(value: Any) -> Any:
@@ -306,129 +308,161 @@ def run_early_termination_for_turn(
     print(f"{'#' * 60}")
     
     # =========================================================================
-    # Step 1: Prepare states (truncate messages)
+    # Step 1: Prepare states (check completion status and truncate if needed)
     # =========================================================================
     print(f"\n[Step 1] Preparing states from {len(dataset)} trajectories...")
     
     states = []
-    skipped = 0
+    already_completed_count = 0
+    needs_inference_count = 0
     
     for idx, row in enumerate(tqdm(dataset, desc="Loading trajectories")):
         messages = _parse_json_field(row.get("messages", []))
         tests = _parse_json_field(row.get("tests", {}))
         
-        # Check if we have enough turns
-        max_turn = (len(messages) - 2) // 2
-        if turn_index > max_turn:
-            skipped += 1
-            continue
+        # Check if trajectory already ended (terminated or truncated) by turn_index
+        num_turns = row.get("num_turns", float('inf'))
+        terminated = row.get("terminated", False)
         
-        # Truncate messages (make a copy to avoid modifying the original)
-        truncated = truncate_messages_at_turn(messages, turn_index)
-        truncated = [msg.copy() for msg in truncated]  # Deep copy
-        
-        # Add final prompt
-        truncated.append({"role": "user", "content": FINAL_PROMPT})
-        
-        states.append(EarlyTermState(
-            row_idx=idx,
-            problem_id=row.get("problem_id", idx),
-            trajectory_id=row.get("trajectory_id", 0),
-            question=row.get("question", ""),
-            tests=tests,
-            original_reward=row.get("final_reward", 0.0),
-            truncated_messages=truncated,
-        ))
+        if num_turns <= turn_index:
+            # Trajectory already ended within turn_index - use as-is
+            # No truncation, no termination prompt, no inference needed
+            already_completed_count += 1
+            
+            states.append(EarlyTermState(
+                row_idx=idx,
+                problem_id=row.get("problem_id", idx),
+                trajectory_id=row.get("trajectory_id", 0),
+                question=row.get("question", ""),
+                tests=tests,
+                original_reward=row.get("final_reward", 0.0),
+                truncated_messages=[msg.copy() for msg in messages],  # Full messages as-is
+                response=None,  # Will extract from original messages
+                new_reward=row.get("final_reward", 0.0),  # Same as original
+                needs_inference=False,
+                already_completed_at_turn=num_turns,
+            ))
+        else:
+            # Trajectory didn't complete by turn_index - truncate and add termination prompt
+            truncated = truncate_messages_at_turn(messages, turn_index)
+            truncated = [msg.copy() for msg in truncated]
+            
+            # Add termination prompt
+            truncated.append({"role": "user", "content": FINAL_PROMPT})
+            needs_inference_count += 1
+            
+            states.append(EarlyTermState(
+                row_idx=idx,
+                problem_id=row.get("problem_id", idx),
+                trajectory_id=row.get("trajectory_id", 0),
+                question=row.get("question", ""),
+                tests=tests,
+                original_reward=row.get("final_reward", 0.0),
+                truncated_messages=truncated,
+                needs_inference=True,
+            ))
     
-    if skipped > 0:
-        print(f"  Skipped {skipped} rows with fewer than {turn_index} turns")
-    print(f"  Prepared {len(states)} states for inference")
+    print(f"  Total states: {len(states)}")
+    print(f"  Already completed (no inference needed): {already_completed_count}")
+    print(f"  Needs inference: {needs_inference_count}")
     
     if not states:
         print("No states to process!")
         return [], {}
     
     # =========================================================================
-    # Step 2: Build prompts and run inference
+    # Step 2: Build prompts and run inference (only for states that need it)
     # =========================================================================
-    print(f"\n[Step 2] Running inference on {len(states)} states...")
+    states_needing_inference = [s for s in states if s.needs_inference]
     
-    # Build prompts and store prompt text in states
-    prompts = []
-    for state in tqdm(states, desc="Building prompts"):
-        prompt_text = tokenizer.apply_chat_template(
-            state.truncated_messages, tokenize=False, add_generation_prompt=True
-        )
-        state.prompt = prompt_text  # Store the prompt string
-        prompts.append(tokenizer(prompt_text)["input_ids"])
-    
-    # Run batched inference
-    print(f"  Sampling responses...")
-    if args.backend == "vllm":
-        responses = sample_batch_vllm(
-            client, prompts, sampling_params,
-            show_progress=args.vllm_multi_gpu
-        )
-    else:
-        responses = asyncio.run(sample_batch_tinker(client, prompts, sampling_params, tokenizer))
-    
-    # Store responses in states
-    for state, response in zip(states, responses):
-        state.response = response
-    
-    print(f"  Completed inference for {len(states)} states")
-    
-    # =========================================================================
-    # Step 3: Run evaluation
-    # =========================================================================
-    print(f"\n[Step 3] Evaluating {len(states)} responses...")
-    
-    if args.fast_eval:
-        # Build eval tasks
-        eval_tasks = []
-        for state in states:
-            eval_tasks.append(EvalTask(
-                response=state.response,
-                tests=state.tests,
-                max_tests=15,
-                timeout_s=args.eval_timeout_s,
-                require_solution_class=True,
-            ))
+    if states_needing_inference:
+        print(f"\n[Step 2] Running inference on {len(states_needing_inference)} states...")
         
-        # Run parallel evaluation
-        results = evaluate_tasks(
-            eval_tasks,
-            max_workers=args.eval_workers,
-            batch_size=args.eval_batch_size,
-            show_progress=True,
-        )
+        # Build prompts and store prompt text in states
+        prompts = []
+        for state in tqdm(states_needing_inference, desc="Building prompts"):
+            prompt_text = tokenizer.apply_chat_template(
+                state.truncated_messages, tokenize=False, add_generation_prompt=True
+            )
+            state.prompt = prompt_text  # Store the prompt string
+            prompts.append(tokenizer(prompt_text)["input_ids"])
         
-        for state, result in zip(states, results):
-            state.new_reward = result.reward
+        # Run batched inference
+        print(f"  Sampling responses...")
+        if args.backend == "vllm":
+            responses = sample_batch_vllm(
+                client, prompts, sampling_params,
+                show_progress=args.vllm_multi_gpu
+            )
+        else:
+            responses = asyncio.run(sample_batch_tinker(client, prompts, sampling_params, tokenizer))
+        
+        # Store responses in states
+        for state, response in zip(states_needing_inference, responses):
+            state.response = response
+        
+        print(f"  Completed inference for {len(states_needing_inference)} states")
     else:
-        # Sequential evaluation
-        for state in tqdm(states, desc="Evaluating"):
-            code = extract_code_from_model(state.response)
-            if not code:
-                state.new_reward = 0.0
-            else:
-                reward, _, _ = _evaluate_code(
-                    code=code,
+        print(f"\n[Step 2] No inference needed (all trajectories already completed)")
+    
+    # =========================================================================
+    # Step 3: Run evaluation (only for states that needed inference)
+    # =========================================================================
+    # Note: States that already completed have new_reward set to original_reward
+    
+    if states_needing_inference:
+        print(f"\n[Step 3] Evaluating {len(states_needing_inference)} responses...")
+        
+        if args.fast_eval:
+            # Build eval tasks
+            eval_tasks = []
+            for state in states_needing_inference:
+                eval_tasks.append(EvalTask(
+                    response=state.response,
                     tests=state.tests,
                     max_tests=15,
                     timeout_s=args.eval_timeout_s,
-                    timeout_record_limit=0,
                     require_solution_class=True,
-                )
-                state.new_reward = reward
-    
-    print(f"  Completed evaluation for {len(states)} states")
+                ))
+            
+            # Run parallel evaluation
+            results = evaluate_tasks(
+                eval_tasks,
+                max_workers=args.eval_workers,
+                batch_size=args.eval_batch_size,
+                show_progress=True,
+            )
+            
+            for state, result in zip(states_needing_inference, results):
+                state.new_reward = result.reward
+        else:
+            # Sequential evaluation
+            for state in tqdm(states_needing_inference, desc="Evaluating"):
+                code = extract_code_from_model(state.response)
+                if not code:
+                    state.new_reward = 0.0
+                else:
+                    reward, _, _ = _evaluate_code(
+                        code=code,
+                        tests=state.tests,
+                        max_tests=15,
+                        timeout_s=args.eval_timeout_s,
+                        timeout_record_limit=0,
+                        require_solution_class=True,
+                    )
+                    state.new_reward = reward
+        
+        print(f"  Completed evaluation for {len(states_needing_inference)} states")
+    else:
+        print(f"\n[Step 3] No evaluation needed (all trajectories already completed)")
     
     # =========================================================================
     # Compute metrics (simple stats)
     # =========================================================================
     num_trajectories = len(states)
     num_problems = len(set(s.problem_id for s in states))
+    num_already_complete = sum(1 for s in states if not s.needs_inference)
+    num_needed_inference = sum(1 for s in states if s.needs_inference)
     
     # Mean rewards (dense, 0-1)
     mean_reward_original = sum(s.original_reward for s in states) / num_trajectories if states else 0
@@ -438,14 +472,22 @@ def run_early_termination_for_turn(
     successes_original = sum(1 for s in states if s.original_reward > 0)
     successes_new = sum(1 for s in states if s.new_reward > 0)
     
+    # Success breakdown by category
+    successes_already_complete = sum(1 for s in states if not s.needs_inference and s.new_reward > 0)
+    successes_terminated = sum(1 for s in states if s.needs_inference and s.new_reward > 0)
+    
     metrics = {
         "turn_index": turn_index,
         "total_trajectories": num_trajectories,
         "unique_problems": num_problems,
+        "already_complete": num_already_complete,
+        "needed_inference": num_needed_inference,
         "mean_reward_original": mean_reward_original,
         "mean_reward_new": mean_reward_new,
         "successes_original": successes_original,
         "successes_new": successes_new,
+        "successes_already_complete": successes_already_complete,
+        "successes_terminated": successes_terminated,
     }
     
     print(f"\n{'=' * 60}")
@@ -454,11 +496,16 @@ def run_early_termination_for_turn(
     print(f"  Total trajectories: {num_trajectories}")
     print(f"  Unique problems: {num_problems}")
     print(f"  ")
+    print(f"  Already completed (no termination): {num_already_complete}")
+    print(f"  Terminated at turn {turn_index}: {num_needed_inference}")
+    print(f"  ")
     print(f"  Mean reward (original): {mean_reward_original:.4f}")
     print(f"  Mean reward (new):      {mean_reward_new:.4f}")
     print(f"  ")
     print(f"  Successes (original): {successes_original}/{num_trajectories}")
     print(f"  Successes (new):      {successes_new}/{num_trajectories}")
+    print(f"    - From already complete: {successes_already_complete}/{num_already_complete}")
+    print(f"    - From terminated:       {successes_terminated}/{num_needed_inference}")
     print(f"{'=' * 60}")
     
     return states, metrics
@@ -468,29 +515,45 @@ def build_output_dataset(states: List[EarlyTermState], turn_index: int) -> Datas
     """Build output dataset from states.
     
     Output columns match collect_trajectories.py style:
-    - final_reward: dense reward (float 0-1) for the early-terminated trajectory
+    - final_reward: dense reward (float 0-1) for the trajectory at this turn
     - original_final_reward: dense reward from the original full trajectory (for comparison)
+    - was_already_complete: True if trajectory completed before turn_index (no termination prompt added)
     """
     rows = []
     for state in states:
-        # Build final messages with response
-        final_messages = state.truncated_messages.copy()
-        final_messages.append({"role": "assistant", "content": state.response or ""})
+        if state.needs_inference:
+            # Trajectory was truncated and terminated - use new response
+            final_messages = state.truncated_messages.copy()
+            final_messages.append({"role": "assistant", "content": state.response or ""})
+            response = state.response or ""
+            effective_turn = turn_index
+        else:
+            # Trajectory already completed - use original messages as-is
+            final_messages = state.truncated_messages  # Already has full original messages
+            # Extract the last assistant response from original messages
+            response = ""
+            for msg in reversed(state.truncated_messages):
+                if msg.get("role") == "assistant":
+                    response = msg.get("content", "")
+                    break
+            effective_turn = state.already_completed_at_turn
         
         rows.append({
             "problem_id": state.problem_id,
             "trajectory_id": state.trajectory_id,
             "question": state.question,
             "messages": json.dumps(final_messages),
-            "truncated_at_turn": turn_index,
-            "prompt": state.prompt or "",  # The final prompt string sent to vLLM
-            "final_reward": state.new_reward,  # Dense reward (0-1) for early-terminated trajectory
-            "original_final_reward": state.original_reward,  # Original trajectory's reward for comparison
+            "truncated_at_turn": effective_turn,  # Actual turn where trajectory ended
+            "requested_turn": turn_index,  # The turn index we requested
+            "prompt": state.prompt or "",  # Empty if no inference was needed
+            "final_reward": state.new_reward,  # Reward for this trajectory
+            "original_final_reward": state.original_reward,  # Original trajectory's reward
             "is_successful": state.new_reward > 0,
+            "was_already_complete": not state.needs_inference,  # True if completed before turn_index
             "tests": json.dumps(state.tests),
             "rendered": render_result(
-                state.truncated_messages, state.response or "", state.question,
-                state.original_reward, state.new_reward, turn_index
+                state.truncated_messages, response, state.question,
+                state.original_reward, state.new_reward, effective_turn
             ),
         })
     
@@ -613,14 +676,14 @@ def main(args):
     # Print summary across all turns
     # =========================================================================
     if len(all_metrics) > 1:
-        print(f"\n{'=' * 60}")
+        print(f"\n{'=' * 80}")
         print(f"SUMMARY ACROSS ALL TURNS")
-        print(f"{'=' * 60}")
-        print(f"{'Turn':<6} {'Mean Reward (orig)':<20} {'Mean Reward (new)':<20} {'Successes':<15}")
-        print(f"{'-' * 60}")
+        print(f"{'=' * 80}")
+        print(f"{'Turn':<6} {'Already Done':<14} {'Terminated':<12} {'Mean Reward':<14} {'Successes':<15}")
+        print(f"{'-' * 80}")
         for m in all_metrics:
-            print(f"{m['turn_index']:<6} {m['mean_reward_original']:.4f}               {m['mean_reward_new']:.4f}               {m['successes_new']}/{m['total_trajectories']}")
-        print(f"{'=' * 60}")
+            print(f"{m['turn_index']:<6} {m['already_complete']:<14} {m['needed_inference']:<12} {m['mean_reward_new']:.4f}         {m['successes_new']}/{m['total_trajectories']}")
+        print(f"{'=' * 80}")
     
     # Save overall summary
     if all_metrics:
