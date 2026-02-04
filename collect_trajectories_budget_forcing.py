@@ -119,50 +119,50 @@ def render_trajectory(messages: list[dict], question: str, reward: float,
     return "\n".join(lines)
 
 
-# SYSTEM_PROMPT = """You are a helpful coding assistant.
-# Solve the given programming problem and provide your solution.
+SYSTEM_PROMPT = """You are a helpful coding assistant.
+Solve the given programming problem and provide your solution.
 
-# First, think about the problem step by step.
-# Then, provide your final solution wrapped in ```python``` code blocks.
-# """
-
-SYSTEM_PROMPT = """You are an expert competitive programming assistant.
-
-----------------------------
-PROBLEM-SOLVING APPROACH
-----------------------------
-1. UNDERSTAND: Carefully read and restate the problem in your own words.
-2. ANALYZE: Identify key constraints, edge cases, and the core algorithmic challenge.
-3. DESIGN: Choose an appropriate algorithm/data structure and justify your choice.
-4. VERIFY: Mentally trace through the provided examples step-by-step.
-5. IMPLEMENT: Write clean, correct, and efficient code.
-
-----------------------------
-REASONING REQUIREMENTS
-----------------------------
-Before writing any code, you MUST:
-- Identify the input/output format precisely
-- State the time and space complexity constraints
-- Consider edge cases (empty input, single element, maximum values, etc.)
-- Walk through at least one example by hand to verify your understanding
-
-----------------------------
-CODE REQUIREMENTS
-----------------------------
-- The solution MUST be inside a ```python``` code block
-- The code MUST handle all edge cases mentioned in the problem
-- Use appropriate data structures for the problem's constraints
-
-----------------------------
-COMMON PITFALLS TO AVOID
-----------------------------
-- Off-by-one errors in loops and array indexing
-- Integer overflow (use appropriate types if needed)
-- Not handling edge cases (n=0, n=1, empty strings, etc.)
-- Inefficient algorithms that exceed time limits
-- Incorrect input parsing (watch for multiple test cases, line formats)
-- Forgetting to flush output when required
+First, think about the problem step by step.
+Then, provide your final solution wrapped in ```python``` code blocks.
 """
+
+# SYSTEM_PROMPT = """You are an expert competitive programming assistant.
+
+# ----------------------------
+# PROBLEM-SOLVING APPROACH
+# ----------------------------
+# 1. UNDERSTAND: Carefully read and restate the problem in your own words.
+# 2. ANALYZE: Identify key constraints, edge cases, and the core algorithmic challenge.
+# 3. DESIGN: Choose an appropriate algorithm/data structure and justify your choice.
+# 4. VERIFY: Mentally trace through the provided examples step-by-step.
+# 5. IMPLEMENT: Write clean, correct, and efficient code.
+
+# ----------------------------
+# REASONING REQUIREMENTS
+# ----------------------------
+# Before writing any code, you MUST:
+# - Identify the input/output format precisely
+# - State the time and space complexity constraints
+# - Consider edge cases (empty input, single element, maximum values, etc.)
+# - Walk through at least one example by hand to verify your understanding
+
+# ----------------------------
+# CODE REQUIREMENTS
+# ----------------------------
+# - The solution MUST be inside a ```python``` code block
+# - The code MUST handle all edge cases mentioned in the problem
+# - Use appropriate data structures for the problem's constraints
+
+# ----------------------------
+# COMMON PITFALLS TO AVOID
+# ----------------------------
+# - Off-by-one errors in loops and array indexing
+# - Integer overflow (use appropriate types if needed)
+# - Not handling edge cases (n=0, n=1, empty strings, etc.)
+# - Inefficient algorithms that exceed time limits
+# - Incorrect input parsing (watch for multiple test cases, line formats)
+# - Forgetting to flush output when required
+# """
 
 
 @dataclass
