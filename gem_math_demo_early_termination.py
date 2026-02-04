@@ -124,80 +124,89 @@ async def run_demo(args):
     tests = _parse_json_field(example.get("tests", {}))
     question = example.get("question", "")
     original_reward = example.get("final_reward", 0.0)
+    num_turns = example.get("num_turns", float('inf'))
+    terminated = example.get("terminated", False)
     
     print(f"Problem ID: {args.problem_id}, Trajectory ID: {args.trajectory_id}")
     print(f"Original Reward: {original_reward}")
     print(f"Total Messages: {len(messages)}")
+    print(f"Original num_turns: {num_turns}, Terminated: {terminated}")
     print()
     
-    # Calculate max possible turn index
-    max_turn = (len(messages) - 2) // 2
-    print(f"Max turn index available: {max_turn}")
+    # Check if trajectory already ended within turn budget (BEFORE capping turn_index)
+    # (either terminated with answer OR truncated at max turns)
+    already_ended = num_turns <= args.turn_index
     
-    if args.turn_index > max_turn:
-        print(f"Warning: turn_index {args.turn_index} > max available {max_turn}, using {max_turn}")
-        args.turn_index = max_turn
-    
-    # Truncate messages
-    truncated_messages = truncate_messages_at_turn(messages, args.turn_index)
-    print(f"Truncated to {len(truncated_messages)} messages (turn {args.turn_index})")
-    print()
-    
-    # Print truncated conversation
-    for i, msg in enumerate(truncated_messages):
-        role = msg["role"]
-        content = msg["content"]
-        print(f"[{role}]\n{content}\n")
-    
-    # Add final prompt
-    truncated_messages.append({"role": "user", "content": FINAL_PROMPT})
-    print(f"[user]\n{FINAL_PROMPT}\n")
-    
-    # Initialize model
-    service_client = tinker.ServiceClient()
-    client = service_client.create_sampling_client(base_model=args.model)
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    
-    sampling_params = types.SamplingParams(
-        max_tokens=args.max_tokens,
-        temperature=args.temperature,
-        top_p=0.95,
-        stop=[],  # No stop - we want full response
-    )
-    
-    # Print full prompt sent to model
-    full_prompt = tokenizer.apply_chat_template(
-        truncated_messages, tokenize=False, add_generation_prompt=True
-    )
-    print(f"[full_prompt]\n{full_prompt}\n")
-    
-    # Run inference
-    response = await get_llm_action(truncated_messages, tokenizer, client, sampling_params)
-    print(f"[assistant]\n{response}\n")
-    
-    # Extract code from response
-    code = extract_code_from_model(response)
-    if not code:
-        print(f"[warning] No code found in response\n")
-        reward = 0.0
+    if already_ended:
+        # Trajectory already ended - use original result
+        print(f"\nTrajectory already ended at turn {num_turns} (within budget of {args.turn_index})")
+        print(f"Terminated: {terminated}, using original result without inference.\n")
+        reward = original_reward
     else:
-        # Evaluate using _evaluate_code (same as IntellectCodeEnv uses internally)
-        reward, _, _ = _evaluate_code(
-            code=code,
-            tests=tests,
-            max_tests=15,
-            timeout_s=1.0,
-            timeout_record_limit=0,
-            require_solution_class=True,
+        # Need to truncate and run inference
+        print(f"\nTrajectory did not complete by turn {args.turn_index}, running inference...\n")
+        
+        # Truncate messages
+        truncated_messages = truncate_messages_at_turn(messages, args.turn_index)
+        print(f"Truncated to {len(truncated_messages)} messages (turn {args.turn_index})")
+        print()
+        
+        # Print truncated conversation
+        for i, msg in enumerate(truncated_messages):
+            role = msg["role"]
+            content = msg["content"]
+            print(f"[{role}]\n{content}\n")
+        
+        # Add final prompt
+        truncated_messages.append({"role": "user", "content": FINAL_PROMPT})
+        print(f"[user]\n{FINAL_PROMPT}\n")
+        
+        # Initialize model
+        service_client = tinker.ServiceClient()
+        client = service_client.create_sampling_client(base_model=args.model)
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        
+        sampling_params = types.SamplingParams(
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_p=0.95,
+            stop=[],  # No stop - we want full response
         )
-    
-    print(f"[reward] {reward:.3f}\n")
+        
+        # Print full prompt sent to model
+        full_prompt = tokenizer.apply_chat_template(
+            truncated_messages, tokenize=False, add_generation_prompt=True
+        )
+        print(f"[full_prompt]\n{full_prompt}\n")
+        
+        # Run inference
+        response = await get_llm_action(truncated_messages, tokenizer, client, sampling_params)
+        print(f"[assistant]\n{response}\n")
+        
+        # Extract code from response
+        code = extract_code_from_model(response)
+        if not code:
+            print(f"[warning] No code found in response\n")
+            reward = 0.0
+        else:
+            # Evaluate using _evaluate_code (same as IntellectCodeEnv uses internally)
+            reward, _, _ = _evaluate_code(
+                code=code,
+                tests=tests,
+                max_tests=15,
+                timeout_s=1.0,
+                timeout_record_limit=0,
+                require_solution_class=True,
+            )
+        
+        print(f"[reward] {reward:.3f}\n")
     
     print(f"=" * 60)
     print(f"RESULTS")
     print(f"=" * 60)
     print(f"  Original reward (full trajectory): {original_reward}")
-    print(f"  New reward (truncated at turn {args.turn_index}): {reward}")
+    print(f"  New reward (at turn {args.turn_index}): {reward}")
+    print(f"  Already ended: {already_ended}")
     print(f"  Success: {'YES' if reward > 0 else 'NO'}")
     print(f"=" * 60)
     
