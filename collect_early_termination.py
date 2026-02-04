@@ -1,19 +1,31 @@
 """
 Batched early termination inference on trajectory datasets.
 
-Takes a collected trajectory dataset, truncates at a specific turn index,
+Takes a collected trajectory dataset, truncates at specific turn indices,
 adds a prompt asking the model to write final code, and evaluates the results.
+Results are pushed as new splits to the same dataset.
 
-Usage:
+Usage (single turn):
     python collect_early_termination.py \
         --trajectory-dataset anirudhb11/qwen3_4b_instruct_start_425_end_450_interations_10_turns \
         --model Qwen/Qwen3-4B-Instruct-2507 \
         --backend vllm \
-        --turn-index 3 \
+        --turns 3 \
         --fast-eval \
         --eval-workers 8 \
         --eval-batch-size 8 \
-        --push-to-hub anirudhb11/early_term_turn_3
+        --push-to-hub
+
+Usage (multiple turns):
+    python collect_early_termination.py \
+        --trajectory-dataset anirudhb11/qwen3_4b_instruct_start_425_end_450_interations_10_turns \
+        --model Qwen/Qwen3-4B-Instruct-2507 \
+        --backend vllm \
+        --turns 1,2,3,4,5 \
+        --fast-eval \
+        --eval-workers 8 \
+        --eval-batch-size 8 \
+        --push-to-hub
 
 Multi-GPU:
     python collect_early_termination.py \
@@ -22,9 +34,11 @@ Multi-GPU:
         --backend vllm \
         --vllm-multi-gpu \
         --vllm-gpu-ids 0,1 \
-        --turn-index 3 \
+        --turns 1,2,3,4,5 \
         --fast-eval \
-        --push-to-hub anirudhb11/early_term_turn_3
+        --push-to-hub
+
+Output splits will be named: early_termination_1, early_termination_2, etc.
 """
 
 import os
@@ -102,19 +116,42 @@ def render_result(
     - The assistant's response
     """
     lines = []
+    
+    # Header
     lines.append("=" * 80)
     lines.append(f"Question: {question[:100]}..." if len(question) > 100 else f"Question: {question}")
     lines.append(f"Turn Index: {turn_index} | Original Reward: {original_reward:.2f} | New Reward: {new_reward:.2f}")
+    success_str = "SUCCESS" if new_reward > 0 else "FAILED"
+    lines.append(f"Status: {success_str}")
     lines.append("=" * 80)
     
-    # Show full messages (including the final prompt)
-    for msg in messages:
+    # Truncated conversation (all messages except the last one which is FINAL_PROMPT)
+    lines.append(f"\n{'─' * 80}")
+    lines.append(f"TRUNCATED CONVERSATION (Turn 1 to {turn_index}):")
+    lines.append(f"{'─' * 80}")
+    
+    # Show messages up to (but not including) the final prompt
+    for i, msg in enumerate(messages[:-1]):  # Exclude the last message (FINAL_PROMPT)
         role = msg['role'].upper()
         content = msg['content']
         lines.append(f"\n[{role}]\n{content}")
     
-    # Show the assistant's response
-    lines.append(f"\n[ASSISTANT RESPONSE]\n{response}")
+    # Final prompt section
+    lines.append(f"\n{'─' * 80}")
+    lines.append(f"FINAL PROMPT (Early Termination Request):")
+    lines.append(f"{'─' * 80}")
+    if messages:
+        final_prompt_msg = messages[-1]
+        lines.append(f"\n[{final_prompt_msg['role'].upper()}]\n{final_prompt_msg['content']}")
+    
+    # Assistant response section
+    lines.append(f"\n{'─' * 80}")
+    lines.append(f"ASSISTANT RESPONSE:")
+    lines.append(f"{'─' * 80}")
+    lines.append(f"\n{response}")
+    
+    # Footer
+    lines.append(f"\n{'=' * 80}")
     
     return "\n".join(lines)
 
@@ -129,6 +166,7 @@ class EarlyTermState:
     tests: dict
     original_reward: float
     truncated_messages: List[Dict[str, str]] = field(default_factory=list)
+    prompt: Optional[str] = None  # The final prompt string sent to vLLM
     response: Optional[str] = None
     new_reward: float = 0.0
 
@@ -244,24 +282,27 @@ def sample_batch_vllm(client, prompts: List[List[int]], sampling_params, show_pr
     return [r.sequences[0].text for r in results]
 
 
-def run_early_termination_batch(
+def run_early_termination_for_turn(
+    turn_index: int,
     args,
     client,
     tokenizer,
     sampling_params,
     dataset,
-) -> List[EarlyTermState]:
+) -> tuple[List[EarlyTermState], Dict[str, Any]]:
     """
-    Run early termination on all trajectories in the dataset.
+    Run early termination for a single turn index.
     
     This is the main processing function that:
     1. Prepares states by truncating messages
     2. Runs batched inference
     3. Runs batched evaluation
     
-    Returns list of EarlyTermState with results.
+    Returns tuple of (states, metrics_dict).
     """
-    turn_index = args.turn_index
+    print(f"\n{'#' * 60}")
+    print(f"# Processing Turn Index: {turn_index}")
+    print(f"{'#' * 60}")
     
     # =========================================================================
     # Step 1: Prepare states (truncate messages)
@@ -281,8 +322,9 @@ def run_early_termination_batch(
             skipped += 1
             continue
         
-        # Truncate messages
+        # Truncate messages (make a copy to avoid modifying the original)
         truncated = truncate_messages_at_turn(messages, turn_index)
+        truncated = [msg.copy() for msg in truncated]  # Deep copy
         
         # Add final prompt
         truncated.append({"role": "user", "content": FINAL_PROMPT})
@@ -303,19 +345,20 @@ def run_early_termination_batch(
     
     if not states:
         print("No states to process!")
-        return []
+        return [], {}
     
     # =========================================================================
     # Step 2: Build prompts and run inference
     # =========================================================================
     print(f"\n[Step 2] Running inference on {len(states)} states...")
     
-    # Build prompts
+    # Build prompts and store prompt text in states
     prompts = []
     for state in tqdm(states, desc="Building prompts"):
         prompt_text = tokenizer.apply_chat_template(
             state.truncated_messages, tokenize=False, add_generation_prompt=True
         )
+        state.prompt = prompt_text  # Store the prompt string
         prompts.append(tokenizer(prompt_text)["input_ids"])
     
     # Run batched inference
@@ -380,10 +423,102 @@ def run_early_termination_batch(
     
     print(f"  Completed evaluation for {len(states)} states")
     
-    return states
+    # =========================================================================
+    # Compute metrics
+    # =========================================================================
+    problem_results: Dict[int, List[bool]] = {}
+    for state in states:
+        pid = state.problem_id
+        if pid not in problem_results:
+            problem_results[pid] = []
+        problem_results[pid].append(state.new_reward > 0)
+    
+    all_results = list(problem_results.values())
+    pass_at_1 = compute_pass_at_k(all_results, k=1) if all_results else 0.0
+    
+    total_successful = sum(1 for s in states if s.new_reward > 0)
+    success_rate = total_successful / len(states) if states else 0
+    
+    original_successes = sum(1 for s in states if s.original_reward > 0)
+    original_rate = original_successes / len(states) if states else 0
+    
+    problems_solved_new = sum(1 for results in all_results if any(results))
+    problems_solved_original = len(set(s.problem_id for s in states if s.original_reward > 0))
+    
+    metrics = {
+        "turn_index": turn_index,
+        "total_trajectories": len(states),
+        "unique_problems": len(problem_results),
+        "original_success_rate": original_rate,
+        "new_success_rate": success_rate,
+        "original_successes": original_successes,
+        "new_successes": total_successful,
+        "problems_solved_original": problems_solved_original,
+        "problems_solved_new": problems_solved_new,
+        "pass_at_1": pass_at_1,
+    }
+    
+    print(f"\n{'=' * 60}")
+    print(f"Results (Turn Index = {turn_index})")
+    print(f"{'=' * 60}")
+    print(f"  Total trajectories processed: {len(states)}")
+    print(f"  Unique problems: {len(problem_results)}")
+    print(f"  ")
+    print(f"  Original success rate: {original_rate:.4f} ({original_successes}/{len(states)})")
+    print(f"  New success rate:      {success_rate:.4f} ({total_successful}/{len(states)})")
+    print(f"  ")
+    print(f"  Problems solved (original): {problems_solved_original}/{len(problem_results)}")
+    print(f"  Problems solved (new):      {problems_solved_new}/{len(problem_results)}")
+    print(f"  ")
+    print(f"  pass@1: {pass_at_1:.4f}")
+    print(f"{'=' * 60}")
+    
+    return states, metrics
+
+
+def build_output_dataset(states: List[EarlyTermState], turn_index: int) -> Dataset:
+    """Build output dataset from states."""
+    rows = []
+    for state in states:
+        # Build final messages with response
+        final_messages = state.truncated_messages.copy()
+        final_messages.append({"role": "assistant", "content": state.response or ""})
+        
+        rows.append({
+            "problem_id": state.problem_id,
+            "trajectory_id": state.trajectory_id,
+            "question": state.question,
+            "messages": json.dumps(final_messages),
+            "truncated_at_turn": turn_index,
+            "prompt": state.prompt or "",  # The final prompt string sent to vLLM
+            "response": state.response or "",
+            "original_reward": state.original_reward,
+            "new_reward": state.new_reward,
+            "is_successful": state.new_reward > 0,
+            "tests": json.dumps(state.tests),
+            "rendered": render_result(
+                state.truncated_messages, state.response or "", state.question,
+                state.original_reward, state.new_reward, turn_index
+            ),
+        })
+    
+    return Dataset.from_list(rows)
+
+
+def parse_turns(turns_str: str) -> List[int]:
+    """Parse comma-separated turn indices."""
+    turns = []
+    for part in turns_str.split(","):
+        part = part.strip()
+        if part:
+            turns.append(int(part))
+    return sorted(turns)
 
 
 def main(args):
+    # Parse turn indices
+    turn_indices = parse_turns(args.turns)
+    
     print(f"=" * 60)
     print(f"Early Termination Batch Inference")
     print(f"=" * 60)
@@ -391,7 +526,7 @@ def main(args):
     print(f"  Split: {args.split}")
     print(f"  Model: {args.model}")
     print(f"  Backend: {args.backend}")
-    print(f"  Turn Index: {args.turn_index}")
+    print(f"  Turn Indices: {turn_indices}")
     print(f"  Max Tokens: {args.max_tokens}")
     print(f"  Temperature: {args.temperature}")
     print(f"  Fast Eval: {args.fast_eval}")
@@ -401,7 +536,7 @@ def main(args):
         print(f"    Eval Timeout: {args.eval_timeout_s}s")
     print(f"  Output Dir: {args.output_dir}")
     if args.push_to_hub:
-        print(f"  Push to Hub: {args.push_to_hub}")
+        print(f"  Push to Hub: {args.trajectory_dataset} (as new splits)")
     print(f"=" * 60)
     
     # =========================================================================
@@ -420,143 +555,91 @@ def main(args):
     sampling_params = create_sampling_params(args, args.backend)
     
     # =========================================================================
-    # Run batched processing
+    # Process each turn index
     # =========================================================================
-    states = run_early_termination_batch(
-        args=args,
-        client=client,
-        tokenizer=tokenizer,
-        sampling_params=sampling_params,
-        dataset=dataset,
-    )
+    all_metrics = []
     
-    if not states:
-        print("\nNo results to save.")
-        return None, None
-    
-    # =========================================================================
-    # Compute metrics
-    # =========================================================================
-    # Group by problem_id for pass@k
-    problem_results: Dict[int, List[bool]] = {}
-    for state in states:
-        pid = state.problem_id
-        if pid not in problem_results:
-            problem_results[pid] = []
-        problem_results[pid].append(state.new_reward > 0)
-    
-    all_results = list(problem_results.values())
-    pass_at_1 = compute_pass_at_k(all_results, k=1) if all_results else 0.0
-    
-    # Compute success rates
-    total_successful = sum(1 for s in states if s.new_reward > 0)
-    success_rate = total_successful / len(states) if states else 0
-    
-    original_successes = sum(1 for s in states if s.original_reward > 0)
-    original_rate = original_successes / len(states) if states else 0
-    
-    # Count problems solved
-    problems_solved_new = sum(1 for results in all_results if any(results))
-    problems_solved_original = len(set(s.problem_id for s in states if s.original_reward > 0))
-    
-    print(f"\n{'=' * 60}")
-    print(f"Results (Turn Index = {args.turn_index})")
-    print(f"{'=' * 60}")
-    print(f"  Total trajectories processed: {len(states)}")
-    print(f"  Unique problems: {len(problem_results)}")
-    print(f"  ")
-    print(f"  Original success rate: {original_rate:.4f} ({original_successes}/{len(states)})")
-    print(f"  New success rate:      {success_rate:.4f} ({total_successful}/{len(states)})")
-    print(f"  ")
-    print(f"  Problems solved (original): {problems_solved_original}/{len(problem_results)}")
-    print(f"  Problems solved (new):      {problems_solved_new}/{len(problem_results)}")
-    print(f"  ")
-    print(f"  pass@1: {pass_at_1:.4f}")
-    print(f"{'=' * 60}")
-    
-    # =========================================================================
-    # Build output rows
-    # =========================================================================
-    rows = []
-    for state in states:
-        # Build final messages with response
-        final_messages = state.truncated_messages.copy()
-        final_messages.append({"role": "assistant", "content": state.response or ""})
-        
-        rows.append({
-            "problem_id": state.problem_id,
-            "trajectory_id": state.trajectory_id,
-            "question": state.question,
-            "messages": json.dumps(final_messages),
-            "truncated_at_turn": args.turn_index,
-            "response": state.response or "",
-            "original_reward": state.original_reward,
-            "new_reward": state.new_reward,
-            "is_successful": state.new_reward > 0,
-            "tests": json.dumps(state.tests),
-            "rendered": render_result(
-                state.truncated_messages, state.response or "", state.question,
-                state.original_reward, state.new_reward, args.turn_index
-            ),
-        })
-    
-    output_dataset = Dataset.from_list(rows)
-    
-    # =========================================================================
-    # Save metadata
-    # =========================================================================
-    metadata = {
-        "trajectory_dataset": args.trajectory_dataset,
-        "split": args.split,
-        "model": args.model,
-        "turn_index": args.turn_index,
-        "max_tokens": args.max_tokens,
-        "temperature": args.temperature,
-        "timestamp": datetime.now().isoformat(),
-        "total_trajectories": len(states),
-        "unique_problems": len(problem_results),
-        "original_success_rate": original_rate,
-        "new_success_rate": success_rate,
-        "problems_solved_original": problems_solved_original,
-        "problems_solved_new": problems_solved_new,
-        "pass_at_1": pass_at_1,
-    }
-    
-    # =========================================================================
-    # Save locally
-    # =========================================================================
-    os.makedirs(args.output_dir, exist_ok=True)
-    output_dataset.save_to_disk(args.output_dir)
-    
-    metadata_path = os.path.join(args.output_dir, "metadata.json")
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2)
-    
-    summary_path = os.path.join(args.output_dir, "summary.json")
-    summary = {
-        **metadata,
-        "num_successful_trajectories": total_successful,
-    }
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-    
-    print(f"\nSaved dataset to: {args.output_dir}")
-    print(f"Saved metadata to: {metadata_path}")
-    print(f"Saved summary to: {summary_path}")
-    
-    # =========================================================================
-    # Push to hub
-    # =========================================================================
-    if args.push_to_hub:
-        print(f"\nPushing to HuggingFace Hub: {args.push_to_hub}")
-        output_dataset.push_to_hub(
-            args.push_to_hub,
-            private=False,
-            commit_message=f"Early termination at turn {args.turn_index}, model={args.model}"
+    for turn_index in turn_indices:
+        states, metrics = run_early_termination_for_turn(
+            turn_index=turn_index,
+            args=args,
+            client=client,
+            tokenizer=tokenizer,
+            sampling_params=sampling_params,
+            dataset=dataset,
         )
-        print(f"Successfully pushed to: https://huggingface.co/datasets/{args.push_to_hub}")
+        
+        if not states:
+            print(f"\nNo results for turn {turn_index}, skipping...")
+            continue
+        
+        all_metrics.append(metrics)
+        
+        # Build output dataset for this turn
+        output_dataset = build_output_dataset(states, turn_index)
+        
+        # Save locally
+        turn_output_dir = os.path.join(args.output_dir, f"early_termination_{turn_index}")
+        os.makedirs(turn_output_dir, exist_ok=True)
+        output_dataset.save_to_disk(turn_output_dir)
+        
+        metadata = {
+            "trajectory_dataset": args.trajectory_dataset,
+            "split": args.split,
+            "model": args.model,
+            "turn_index": turn_index,
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+            "timestamp": datetime.now().isoformat(),
+            **metrics,
+        }
+        
+        metadata_path = os.path.join(turn_output_dir, "metadata.json")
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        
+        print(f"\nSaved dataset for turn {turn_index} to: {turn_output_dir}")
+        
+        # Push to hub as new split
+        if args.push_to_hub:
+            split_name = f"early_termination_{turn_index}"
+            print(f"\nPushing to HuggingFace Hub: {args.trajectory_dataset} (split: {split_name})")
+            output_dataset.push_to_hub(
+                args.trajectory_dataset,
+                split=split_name,
+                private=False,
+                commit_message=f"Early termination at turn {turn_index}, model={args.model}"
+            )
+            print(f"Successfully pushed split '{split_name}' to: https://huggingface.co/datasets/{args.trajectory_dataset}")
     
-    return output_dataset, metadata
+    # =========================================================================
+    # Print summary across all turns
+    # =========================================================================
+    if len(all_metrics) > 1:
+        print(f"\n{'=' * 60}")
+        print(f"SUMMARY ACROSS ALL TURNS")
+        print(f"{'=' * 60}")
+        print(f"{'Turn':<6} {'Success Rate':<15} {'pass@1':<10} {'Problems Solved':<20}")
+        print(f"{'-' * 60}")
+        for m in all_metrics:
+            print(f"{m['turn_index']:<6} {m['new_success_rate']:.4f}          {m['pass_at_1']:.4f}     {m['problems_solved_new']}/{m['unique_problems']}")
+        print(f"{'=' * 60}")
+    
+    # Save overall summary
+    if all_metrics:
+        summary_path = os.path.join(args.output_dir, "summary.json")
+        summary = {
+            "trajectory_dataset": args.trajectory_dataset,
+            "model": args.model,
+            "turn_indices": turn_indices,
+            "timestamp": datetime.now().isoformat(),
+            "results_by_turn": all_metrics,
+        }
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"\nSaved overall summary to: {summary_path}")
+    
+    return all_metrics
 
 
 if __name__ == "__main__":
@@ -567,8 +650,8 @@ if __name__ == "__main__":
                         help="HuggingFace dataset with trajectory data (messages, tests, etc.)")
     parser.add_argument("--split", type=str, default="train",
                         help="Dataset split to use (default: train)")
-    parser.add_argument("--turn-index", type=int, required=True,
-                        help="Turn index to truncate at (1-indexed)")
+    parser.add_argument("--turns", type=str, required=True,
+                        help="Comma-separated turn indices to process (e.g., '1,2,3,4,5')")
     
     # Model args
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-Instruct-2507",
@@ -581,8 +664,8 @@ if __name__ == "__main__":
     # Output args
     parser.add_argument("--output-dir", type=str, default="artifacts/early_termination",
                         help="Directory to save output dataset")
-    parser.add_argument("--push-to-hub", type=str, default=None,
-                        help="HF repo to push to (e.g. username/repo-name)")
+    parser.add_argument("--push-to-hub", action="store_true",
+                        help="Push results as new splits to the trajectory dataset")
     
     # Backend options
     parser.add_argument("--backend", type=str, default="vllm", choices=["tinker", "vllm"],
