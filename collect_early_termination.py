@@ -3,7 +3,7 @@ Batched early termination inference on trajectory datasets.
 
 Takes a collected trajectory dataset, truncates at specific turn indices,
 adds a prompt asking the model to write final code, and evaluates the results.
-Results are pushed as new splits to the same dataset.
+Results are pushed to a NEW dataset with "_early_termination" suffix.
 
 Usage (single turn):
     python collect_early_termination.py \
@@ -38,7 +38,8 @@ Multi-GPU:
         --fast-eval \
         --push-to-hub
 
-Output splits will be named: early_termination_1, early_termination_2, etc.
+Output dataset will be named: {original_dataset}_early_termination
+Splits will be named: turn_1, turn_2, etc.
 """
 
 import os
@@ -56,7 +57,7 @@ from transformers import AutoTokenizer
 from tqdm import tqdm
 
 from utils.fast_eval import _evaluate_code, EvalTask, evaluate_tasks
-from utils.pass_at_k import compute_pass_at_k
+# pass_at_k not used - metrics computed from final_reward column in dataset
 from code_env.code_env.utils.deepcoder_utils import extract_code_from_model
 
 # Backend imports (conditional)
@@ -424,60 +425,52 @@ def run_early_termination_for_turn(
     print(f"  Completed evaluation for {len(states)} states")
     
     # =========================================================================
-    # Compute metrics
+    # Compute metrics (simple stats)
     # =========================================================================
-    problem_results: Dict[int, List[bool]] = {}
-    for state in states:
-        pid = state.problem_id
-        if pid not in problem_results:
-            problem_results[pid] = []
-        problem_results[pid].append(state.new_reward > 0)
+    num_trajectories = len(states)
+    num_problems = len(set(s.problem_id for s in states))
     
-    all_results = list(problem_results.values())
-    pass_at_1 = compute_pass_at_k(all_results, k=1) if all_results else 0.0
+    # Mean rewards (dense, 0-1)
+    mean_reward_original = sum(s.original_reward for s in states) / num_trajectories if states else 0
+    mean_reward_new = sum(s.new_reward for s in states) / num_trajectories if states else 0
     
-    total_successful = sum(1 for s in states if s.new_reward > 0)
-    success_rate = total_successful / len(states) if states else 0
-    
-    original_successes = sum(1 for s in states if s.original_reward > 0)
-    original_rate = original_successes / len(states) if states else 0
-    
-    problems_solved_new = sum(1 for results in all_results if any(results))
-    problems_solved_original = len(set(s.problem_id for s in states if s.original_reward > 0))
+    # Success counts (reward > 0)
+    successes_original = sum(1 for s in states if s.original_reward > 0)
+    successes_new = sum(1 for s in states if s.new_reward > 0)
     
     metrics = {
         "turn_index": turn_index,
-        "total_trajectories": len(states),
-        "unique_problems": len(problem_results),
-        "original_success_rate": original_rate,
-        "new_success_rate": success_rate,
-        "original_successes": original_successes,
-        "new_successes": total_successful,
-        "problems_solved_original": problems_solved_original,
-        "problems_solved_new": problems_solved_new,
-        "pass_at_1": pass_at_1,
+        "total_trajectories": num_trajectories,
+        "unique_problems": num_problems,
+        "mean_reward_original": mean_reward_original,
+        "mean_reward_new": mean_reward_new,
+        "successes_original": successes_original,
+        "successes_new": successes_new,
     }
     
     print(f"\n{'=' * 60}")
     print(f"Results (Turn Index = {turn_index})")
     print(f"{'=' * 60}")
-    print(f"  Total trajectories processed: {len(states)}")
-    print(f"  Unique problems: {len(problem_results)}")
+    print(f"  Total trajectories: {num_trajectories}")
+    print(f"  Unique problems: {num_problems}")
     print(f"  ")
-    print(f"  Original success rate: {original_rate:.4f} ({original_successes}/{len(states)})")
-    print(f"  New success rate:      {success_rate:.4f} ({total_successful}/{len(states)})")
+    print(f"  Mean reward (original): {mean_reward_original:.4f}")
+    print(f"  Mean reward (new):      {mean_reward_new:.4f}")
     print(f"  ")
-    print(f"  Problems solved (original): {problems_solved_original}/{len(problem_results)}")
-    print(f"  Problems solved (new):      {problems_solved_new}/{len(problem_results)}")
-    print(f"  ")
-    print(f"  pass@1: {pass_at_1:.4f}")
+    print(f"  Successes (original): {successes_original}/{num_trajectories}")
+    print(f"  Successes (new):      {successes_new}/{num_trajectories}")
     print(f"{'=' * 60}")
     
     return states, metrics
 
 
 def build_output_dataset(states: List[EarlyTermState], turn_index: int) -> Dataset:
-    """Build output dataset from states."""
+    """Build output dataset from states.
+    
+    Output columns match collect_trajectories.py style:
+    - final_reward: dense reward (float 0-1) for the early-terminated trajectory
+    - original_final_reward: dense reward from the original full trajectory (for comparison)
+    """
     rows = []
     for state in states:
         # Build final messages with response
@@ -491,9 +484,8 @@ def build_output_dataset(states: List[EarlyTermState], turn_index: int) -> Datas
             "messages": json.dumps(final_messages),
             "truncated_at_turn": turn_index,
             "prompt": state.prompt or "",  # The final prompt string sent to vLLM
-            "response": state.response or "",
-            "original_reward": state.original_reward,
-            "new_reward": state.new_reward,
+            "final_reward": state.new_reward,  # Dense reward (0-1) for early-terminated trajectory
+            "original_final_reward": state.original_reward,  # Original trajectory's reward for comparison
             "is_successful": state.new_reward > 0,
             "tests": json.dumps(state.tests),
             "rendered": render_result(
@@ -535,8 +527,12 @@ def main(args):
         print(f"    Eval Batch Size: {args.eval_batch_size}")
         print(f"    Eval Timeout: {args.eval_timeout_s}s")
     print(f"  Output Dir: {args.output_dir}")
+    
+    # Generate output dataset name by appending _early_termination
+    output_dataset_name = f"{args.trajectory_dataset}_early_termination"
     if args.push_to_hub:
-        print(f"  Push to Hub: {args.trajectory_dataset} (as new splits)")
+        print(f"  Push to Hub: {output_dataset_name}")
+        print(f"  Splits: turn_1, turn_2, ...")
     print(f"=" * 60)
     
     # =========================================================================
@@ -579,12 +575,13 @@ def main(args):
         output_dataset = build_output_dataset(states, turn_index)
         
         # Save locally
-        turn_output_dir = os.path.join(args.output_dir, f"early_termination_{turn_index}")
+        turn_output_dir = os.path.join(args.output_dir, f"turn_{turn_index}")
         os.makedirs(turn_output_dir, exist_ok=True)
         output_dataset.save_to_disk(turn_output_dir)
         
         metadata = {
             "trajectory_dataset": args.trajectory_dataset,
+            "output_dataset": output_dataset_name,
             "split": args.split,
             "model": args.model,
             "turn_index": turn_index,
@@ -600,17 +597,17 @@ def main(args):
         
         print(f"\nSaved dataset for turn {turn_index} to: {turn_output_dir}")
         
-        # Push to hub as new split
+        # Push to hub as new split in the new dataset
         if args.push_to_hub:
-            split_name = f"early_termination_{turn_index}"
-            print(f"\nPushing to HuggingFace Hub: {args.trajectory_dataset} (split: {split_name})")
+            split_name = f"turn_{turn_index}"
+            print(f"\nPushing to HuggingFace Hub: {output_dataset_name} (split: {split_name})")
             output_dataset.push_to_hub(
-                args.trajectory_dataset,
+                output_dataset_name,
                 split=split_name,
                 private=False,
                 commit_message=f"Early termination at turn {turn_index}, model={args.model}"
             )
-            print(f"Successfully pushed split '{split_name}' to: https://huggingface.co/datasets/{args.trajectory_dataset}")
+            print(f"Successfully pushed split '{split_name}' to: https://huggingface.co/datasets/{output_dataset_name}")
     
     # =========================================================================
     # Print summary across all turns
@@ -619,10 +616,10 @@ def main(args):
         print(f"\n{'=' * 60}")
         print(f"SUMMARY ACROSS ALL TURNS")
         print(f"{'=' * 60}")
-        print(f"{'Turn':<6} {'Success Rate':<15} {'pass@1':<10} {'Problems Solved':<20}")
+        print(f"{'Turn':<6} {'Mean Reward (orig)':<20} {'Mean Reward (new)':<20} {'Successes':<15}")
         print(f"{'-' * 60}")
         for m in all_metrics:
-            print(f"{m['turn_index']:<6} {m['new_success_rate']:.4f}          {m['pass_at_1']:.4f}     {m['problems_solved_new']}/{m['unique_problems']}")
+            print(f"{m['turn_index']:<6} {m['mean_reward_original']:.4f}               {m['mean_reward_new']:.4f}               {m['successes_new']}/{m['total_trajectories']}")
         print(f"{'=' * 60}")
     
     # Save overall summary
@@ -630,6 +627,7 @@ def main(args):
         summary_path = os.path.join(args.output_dir, "summary.json")
         summary = {
             "trajectory_dataset": args.trajectory_dataset,
+            "output_dataset": output_dataset_name,
             "model": args.model,
             "turn_indices": turn_indices,
             "timestamp": datetime.now().isoformat(),
