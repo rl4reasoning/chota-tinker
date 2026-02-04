@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=llama_50_100
+#SBATCH --job-name=llama_single_50_100
 #SBATCH --open-mode=append
 #SBATCH --output=/scratch/jp7467/slurm_logs/%j_%x.out
 #SBATCH --error=/scratch/jp7467/slurm_logs/%j_%x.err
 #SBATCH --export=ALL
-#SBATCH --time=12:00:00
+#SBATCH --time=16:00:00
 #SBATCH --gres=gpu:h200:1
 #SBATCH --account=torch_pr_235_cds
 #SBATCH --mem=200G
@@ -100,20 +100,34 @@ conda activate ct
 #         --eval-timeout-s 1.0 \
 #         --push-to-hub bicycleman15/new_prompt_s1_50_100
 
-python collect_trajectories.py \
+# python collect_trajectories.py \
+#     --dataset bicycleman15/intellect_3_code_very_hard \
+#     --model meta-llama/Llama-3.1-8B-Instruct \
+#     --backend vllm \
+#     --start-problem 50 \
+#     --num-problems 50 \
+#     --num-samples 32 \
+#     --max-turns 10 \
+#     \
+#     --fast-eval \
+#     --eval-workers 8 \
+#     --eval-batch-size 8 \
+#     --eval-timeout-s 1.0 \
+#     --push-to-hub bicycleman15/interaction_llama_50_100
+
+python collect_trajectories_single_turn.py \
     --dataset bicycleman15/intellect_3_code_very_hard \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --backend vllm \
     --start-problem 50 \
     --num-problems 50 \
-    --num-samples 32 \
-    --max-turns 10 \
+    --num-samples 350 \
     \
     --fast-eval \
     --eval-workers 8 \
     --eval-batch-size 8 \
     --eval-timeout-s 1.0 \
-    --push-to-hub bicycleman15/interaction_llama_50_100
+    --push-to-hub bicycleman15/llama_single_turn_50_100
 
 # also change file name to `collect_trajectories_budget_forcing.py` to collect s1 scaling
 # change start-problem to 500, so that we collect 
