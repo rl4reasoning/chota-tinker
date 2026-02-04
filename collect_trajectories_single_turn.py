@@ -7,14 +7,14 @@ Usage:
     --model Qwen/Qwen3-4B-Instruct-2507 \
     --backend vllm \
     --start-problem 0 \
-    --num-problems 100 \
+    --num-problems 25 \
     --num-samples 350 \
     \
     --fast-eval \
     --eval-workers 8 \
     --eval-batch-size 8 \
     --eval-timeout-s 1.0 \
-    --push-to-hub bicycleman15/new_prompt_single_turn_0_100
+    --push-to-hub bicycleman15/prompt_v2_single_turn_0_50
 
 Multi-GPU (launches one vLLM server per GPU, shards prompts across them):
     python collect_trajectories_single_turn.py \
