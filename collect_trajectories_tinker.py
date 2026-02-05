@@ -6,13 +6,13 @@ Usage:
     --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
     --num-problems 10 \
     --num-samples 4 \
-    --max-turns 10 \
+    --max-turns 8 \
     \
     --fast-eval \
     --eval-workers 8 \
     --eval-batch-size 8 \
     --eval-timeout-s 1.0 \
-    --push-to-hub bicycleman15/temp
+    --push-to-hub bicycleman15/235b_interactions
 
 Resume from checkpoint (if previous run failed):
     python collect_trajectories_tinker.py \
