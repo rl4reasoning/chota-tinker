@@ -4,7 +4,7 @@ Code environment demo using GEM with LLM agent.
 Uses tinker API for sampling.
 
 Usage:
-    python gem_math_demo.py --model Qwen/Qwen3-4B-Instruct-2507 --difficulty very_hard --problem_index 2
+    python gem_math_demo.py --model Qwen/Qwen3-30B-A3B-Instruct-2507 --difficulty very_hard --problem_index 2 --fast-eval --eval-timeout-s 1.0
 
 possible models:
 deepseek-ai/DeepSeek-V3.1
@@ -18,7 +18,7 @@ import asyncio
 import tinker
 from tinker import types
 from transformers import AutoTokenizer
-from intellect_env import IntellectCodeEnv
+from intellect_env import IntellectCodeEnv, step_batch
 
 # Edit this to customize the system prompt
 # SYSTEM_PROMPT = """You are a helpful coding assistant.
@@ -141,7 +141,9 @@ async def get_llm_action(obs: str, history: list, tokenizer, client, sampling_pa
     return response
 
 
-async def run_episode(env, tokenizer, client, sampling_params, max_steps: int = 5):
+async def run_episode(env, tokenizer, client, sampling_params, max_steps: int = 5, 
+                      fast_eval: bool = False, eval_workers: int = 8, 
+                      eval_batch_size: int = 8, eval_timeout_s: float = 1.0):
     obs, info = env.reset()
     history = [{"role": "system", "content": SYSTEM_PROMPT}]
     total_reward = 0
@@ -156,7 +158,16 @@ async def run_episode(env, tokenizer, client, sampling_params, max_steps: int = 
         history.append({"role": "user", "content": obs})
         history.append({"role": "assistant", "content": action})
         
-        obs, reward, terminated, truncated, info = env.step(action)
+        if fast_eval:
+            results = step_batch(
+                [env], [action],
+                eval_workers=eval_workers,
+                eval_batch_size=eval_batch_size,
+                eval_timeout_s=eval_timeout_s,
+            )
+            obs, reward, terminated, truncated, info = results[0]
+        else:
+            obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
         
         if obs:
@@ -190,6 +201,14 @@ async def main():
                         help="Problem difficulty: easy_medium (0.3-1.0), hard (0.1-0.3), very_hard (0.0-0.1), or original (all)")
     parser.add_argument("--problem_index", type=int, default=None,
                         help="Specific problem index to use (if not set, iterates through dataset)")
+    parser.add_argument("--fast-eval", action="store_true",
+                        help="Use parallel fast eval for code execution")
+    parser.add_argument("--eval-workers", type=int, default=8,
+                        help="Number of parallel evaluator workers (default: 8)")
+    parser.add_argument("--eval-batch-size", type=int, default=8,
+                        help="Number of responses per evaluator task (default: 8)")
+    parser.add_argument("--eval-timeout-s", type=float, default=1.0,
+                        help="Per-test timeout in seconds for evaluation (default: 5.0)")
     args = parser.parse_args()
     
     service_client = tinker.ServiceClient()
@@ -213,7 +232,13 @@ async def main():
     rewards = []
     for ep in range(args.num_episodes):
         print(f"episode {ep + 1}\n")
-        r = await run_episode(env, tokenizer, client, sampling_params, args.max_steps)
+        r = await run_episode(
+            env, tokenizer, client, sampling_params, args.max_steps,
+            fast_eval=args.fast_eval,
+            eval_workers=args.eval_workers,
+            eval_batch_size=args.eval_batch_size,
+            eval_timeout_s=args.eval_timeout_s,
+        )
         rewards.append(r)
     
     print(f"avg reward: {sum(rewards)/len(rewards):.3f}")
