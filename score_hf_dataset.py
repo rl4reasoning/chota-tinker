@@ -5,9 +5,10 @@ Usage:
 
     # With more workers for faster evaluation:
     python score_hf_dataset.py \
-        --dataset bicycleman15/prompt_v2_single_turn_0_25 \
-        --eval-workers 16 \
-        --eval-batch-size 8
+        --dataset bicycleman15/prompt_v2_single_turn_0_75 \
+        --eval-workers 8 \
+        --eval-batch-size 8 \
+        --push-to-hub username/prompt_v2_single_turn_0_75_rescored
 
     # To score only a subset:
     python score_hf_dataset.py \
@@ -124,7 +125,10 @@ def score_dataset(
         problem_results[problem_id].append(new_reward > 0)
         
         scored_row = dict(row)
-        scored_row["rescored_reward"] = new_reward
+        # Rename original final_reward to old_final_reward
+        scored_row["old_final_reward"] = original_reward
+        # Replace final_reward with the new rescored value
+        scored_row["final_reward"] = new_reward
         scored_row["rescored_terminated"] = eval_result.terminated
         scored_row["rescored_truncated"] = eval_result.truncated
         scored_row["rescored_is_successful"] = new_reward > 0
