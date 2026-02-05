@@ -228,6 +228,8 @@ class RolloutState:
     done: bool = False
     terminated: bool = False
     truncated: bool = False
+    interaction_timeout_count: int = 0  # Number of interactions that timed out
+    eval_timeout_count: int = 0  # Number of test cases that timed out during final eval
 
 
 def serialize_rollout_state(state: RolloutState) -> dict:
@@ -243,6 +245,8 @@ def serialize_rollout_state(state: RolloutState) -> dict:
         "done": state.done,
         "terminated": state.terminated,
         "truncated": state.truncated,
+        "interaction_timeout_count": state.interaction_timeout_count,
+        "eval_timeout_count": state.eval_timeout_count,
         # Env-related data needed for reconstruction
         "question": state.env.question,
         "tests": state.env.tests,
@@ -279,6 +283,8 @@ def deserialize_rollout_state(data: dict, shared_dataset, args) -> RolloutState:
         done=data["done"],
         terminated=data["terminated"],
         truncated=data["truncated"],
+        interaction_timeout_count=data.get("interaction_timeout_count", 0),
+        eval_timeout_count=data.get("eval_timeout_count", 0),
     )
     return state
 
@@ -581,6 +587,12 @@ def run_batched_rollouts(
             state.terminated = terminated
             state.truncated = truncated
             
+            # Track timeout counts from info
+            if info.get("interaction_timed_out", False):
+                state.interaction_timeout_count += 1
+            if info.get("eval_timeout_count", 0) > 0:
+                state.eval_timeout_count = info["eval_timeout_count"]
+            
             # Truncate interaction output if over limit (guardrail against huge terminal output)
             if obs and max_out_tokens is not None and max_out_tokens > 0:
                 obs = maybe_truncate_obs(obs, tokenizer, max_out_tokens)
@@ -623,6 +635,8 @@ def run_batched_rollouts(
             "truncated": state.truncated,
             "interactions": state.interactions,
             "tests": state.env.tests,
+            "interaction_timeout_count": state.interaction_timeout_count,
+            "eval_timeout_count": state.eval_timeout_count,
         }
         all_trajectories[state.problem_index].append(traj)
     
@@ -704,6 +718,8 @@ def main(args):
                 "interactions": json.dumps(traj["interactions"]),
                 "tests": json.dumps(traj["tests"]),
                 "is_successful": is_successful,
+                "interaction_timeout_count": traj["interaction_timeout_count"],
+                "eval_timeout_count": traj["eval_timeout_count"],
                 "rendered": render_trajectory(
                     traj["messages"], traj["interactions"], traj["question"],
                     traj["final_reward"], traj["num_turns"], traj["terminated"], traj["truncated"]

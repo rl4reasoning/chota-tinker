@@ -520,6 +520,9 @@ def step_batch(
         
         for (idx, python_code), (success, stdout, stderr) in zip(interact_tasks, interact_results):
             env = envs[idx]
+            # Check if this interaction timed out
+            interaction_timed_out = "timed out" in stderr.lower() if stderr else False
+            
             if success:
                 output = stdout if stdout else "(no output during interaction -- did you forget to print? did you enclose the code correctly in <interact></interact>?)"
             else:
@@ -529,10 +532,12 @@ def step_batch(
             env.has_interacted = True
             obs = f"<output>\n{output}</output>"
             
+            info = {"interaction_timed_out": interaction_timed_out}
             if env.current_turn >= env.max_turns:
-                results[idx] = (obs, 0.0, True, True, {"truncated": True})
+                info["truncated"] = True
+                results[idx] = (obs, 0.0, True, True, info)
             else:
-                results[idx] = (obs, 0.0, False, False, {})
+                results[idx] = (obs, 0.0, False, False, info)
 
     if eval_tasks:
         if len(eval_tasks) == 1:
@@ -551,7 +556,10 @@ def step_batch(
                 executor=eval_executor,
             )
         for idx, eval_result in zip(eval_indices, eval_results):
-            results[idx] = ("", eval_result.reward, True, eval_result.truncated, {"final": True})
+            results[idx] = ("", eval_result.reward, True, eval_result.truncated, {
+                "final": True,
+                "eval_timeout_count": eval_result.timeout_count,
+            })
 
     for result in results:
         if result is None:

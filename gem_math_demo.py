@@ -4,7 +4,7 @@ Code environment demo using GEM with LLM agent.
 Uses tinker API for sampling.
 
 Usage:
-    python gem_math_demo.py --model Qwen/Qwen3-30B-A3B-Instruct-2507 --difficulty very_hard --problem_index 2 --fast-eval --eval-timeout-s 1.0
+    python gem_math_demo.py --model Qwen/Qwen3-235B-A22B-Instruct-2507 --difficulty very_hard --problem_index 3 --fast-eval --eval-timeout-s 5.0
 
 possible models:
 deepseek-ai/DeepSeek-V3.1
@@ -143,10 +143,14 @@ async def get_llm_action(obs: str, history: list, tokenizer, client, sampling_pa
 
 async def run_episode(env, tokenizer, client, sampling_params, max_steps: int = 5, 
                       fast_eval: bool = False, eval_workers: int = 8, 
-                      eval_batch_size: int = 8, eval_timeout_s: float = 1.0):
+                      eval_batch_size: int = 8, eval_timeout_s: float = 5.0):
     obs, info = env.reset()
     history = [{"role": "system", "content": SYSTEM_PROMPT}]
     total_reward = 0
+    
+    # Track timeouts
+    interaction_timeout_count = 0
+    eval_timeout_count = 0
     
     print(f"[system]\n{SYSTEM_PROMPT}\n")
     print(f"[user]\n{obs}\n")
@@ -166,6 +170,14 @@ async def run_episode(env, tokenizer, client, sampling_params, max_steps: int = 
                 eval_timeout_s=eval_timeout_s,
             )
             obs, reward, terminated, truncated, info = results[0]
+            
+            # Track timeouts from info
+            if info.get("interaction_timed_out", False):
+                interaction_timeout_count += 1
+                print(f"[timeout] Interaction timed out!")
+            if info.get("eval_timeout_count", 0) > 0:
+                eval_timeout_count = info["eval_timeout_count"]
+                print(f"[timeout] {eval_timeout_count} test case(s) timed out during evaluation")
         else:
             obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
@@ -176,6 +188,10 @@ async def run_episode(env, tokenizer, client, sampling_params, max_steps: int = 
         
         if terminated or truncated:
             break
+    
+    # Print timeout summary
+    if interaction_timeout_count > 0 or eval_timeout_count > 0:
+        print(f"\n[timeout summary] Interactions: {interaction_timeout_count}, Eval test cases: {eval_timeout_count}")
     
     return total_reward
 
@@ -207,8 +223,8 @@ async def main():
                         help="Number of parallel evaluator workers (default: 8)")
     parser.add_argument("--eval-batch-size", type=int, default=8,
                         help="Number of responses per evaluator task (default: 8)")
-    parser.add_argument("--eval-timeout-s", type=float, default=1.0,
-                        help="Per-test timeout in seconds for evaluation (default: 5.0)")
+    parser.add_argument("--eval-timeout-s", type=float, default=5.0,
+                        help="Timeout in seconds for interactions and evaluation (default: 5.0)")
     args = parser.parse_args()
     
     service_client = tinker.ServiceClient()
