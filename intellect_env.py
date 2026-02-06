@@ -321,34 +321,31 @@ class IntellectCodeEnv(Env):
         obs = f"<output>\n{output}</output>"
 
         if self.current_turn >= self.max_turns:
-            return obs, 0.0, True, True, {"truncated": True}
+            return obs, 0.0, False, True, {"truncated": True}
 
         return obs, 0.0, False, False, {}
 
     def _handle_requires_interaction(self) -> Tuple[str, float, bool, bool, dict[str, Any]]:
         obs = "<output>You must interact at least once before submitting your final answer. Use <interact> ... your code here ... </interact> to test your code first. Remember to pass in the inputs yourself.</output>"
         if self.current_turn >= self.max_turns:
-            return obs, 0.0, True, True, {"truncated": True}
+            return obs, 0.0, False, True, {"truncated": True}
         return obs, 0.0, False, False, {}
 
     def _handle_invalid(self) -> Tuple[str, float, bool, bool, dict[str, Any]]:
         obs = "<output>No valid code block found. Use <interact></interact> or ```python```.</output>"
         if self.current_turn >= self.max_turns:
-            return obs, 0.0, True, True, {"truncated": True}
+            return obs, 0.0, False, True, {"truncated": True}
         return obs, 0.0, False, False, {}
 
     def _handle_final(self, answer_code: str) -> Tuple[str, float, bool, bool, dict[str, Any]]:
-        # Require at least one interaction before final answer (unless at turn limit)
+        # Require interaction before final answer - no exceptions
         if not self.has_interacted:
-            if self.current_turn >= self.max_turns:
-                # At turn limit - evaluate anyway even without interaction
-                pass
-            else:
-                return self._handle_requires_interaction()
+            # truncated=True, terminated=False (episode cut short, not completed)
+            return "", 0.0, False, True, {"final": True, "no_interaction": True}
 
         # Enforce Solution-only when fn_name exists (align with fast_eval)
         if self.fn_name and "class Solution" not in answer_code:
-            return "", 0.0, True, True, {"final": True, "invalidated": True}
+            return "", 0.0, False, True, {"final": True, "invalidated": True}
 
         reward = self._evaluate(answer_code)
         return "", reward, True, False, {"final": True}
