@@ -222,3 +222,6 @@ artifacts/
 tmp*/
 
 checkpoints/
+
+*.png
+*.pdf
