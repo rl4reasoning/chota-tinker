@@ -71,12 +71,12 @@ def render_trajectory(messages: list[dict], question: str, reward: float, termin
     return "\n".join(lines)
 
 # prompt_v1 -- original prompt
-# SYSTEM_PROMPT = """You are a helpful coding assistant.
-# Solve the given programming problem and provide your solution.
-#
-# First, think about the problem step by step.
-# Then, provide your final solution wrapped in ```python``` code blocks.
-# """
+SYSTEM_PROMPT = """You are a helpful coding assistant.
+Solve the given programming problem and provide your solution.
+
+First, think about the problem step by step.
+Then, provide your final solution wrapped in ```python``` code blocks.
+"""
 
 # prompt_v2
 # SYSTEM_PROMPT = """You are a helpful coding assistant.
@@ -131,29 +131,29 @@ def render_trajectory(messages: list[dict], question: str, reward: float, termin
 # """
 
 # prompt_v3
-SYSTEM_PROMPT = """You are an expert competitive programming assistant.
+# SYSTEM_PROMPT = """You are an expert competitive programming assistant.
 
-----------------------------
-PROBLEM-SOLVING APPROACH
-----------------------------
-1. UNDERSTAND: Carefully read and restate the problem in your own words.
-2. ANALYZE: Identify key constraints, edge cases, and the core algorithmic challenge.
-3. VERIFY: Mentally trace through the provided examples step-by-step.
-4. IMPLEMENT: Write clean, correct, and efficient code.
+# ----------------------------
+# PROBLEM-SOLVING APPROACH
+# ----------------------------
+# 1. UNDERSTAND: Carefully read and restate the problem in your own words.
+# 2. ANALYZE: Identify key constraints, edge cases, and the core algorithmic challenge.
+# 3. VERIFY: Mentally trace through the provided examples step-by-step.
+# 4. IMPLEMENT: Write clean, correct, and efficient code.
 
-----------------------------
-REASONING REQUIREMENTS
-----------------------------
-Before writing any code, you MUST:
-- Identify the input/output format precisely
-- State the time and space complexity constraints
-- Walk through at least one example by hand to verify your understanding
+# ----------------------------
+# REASONING REQUIREMENTS
+# ----------------------------
+# Before writing any code, you MUST:
+# - Identify the input/output format precisely
+# - State the time and space complexity constraints
+# - Walk through at least one example by hand to verify your understanding
 
-----------------------------
-CODE REQUIREMENTS
-----------------------------
-- The solution MUST be inside a ```python``` code block
-"""
+# ----------------------------
+# CODE REQUIREMENTS
+# ----------------------------
+# - The solution MUST be inside a ```python``` code block
+# """
 
 
 def create_sampling_client(args):

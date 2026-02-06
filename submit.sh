@@ -75,18 +75,31 @@ pwd
 #         --resume-from checkpoints/20260203_190405_af3e55b3 \
 #         --push-to-hub bicycleman15/new_prompt_s1_50_100
 
-python collect_trajectories_tinker.py \
+python collect_trajectories_single_turn_tinker.py \
     --dataset bicycleman15/intellect_3_code_very_hard \
-    --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
+    --model Qwen/Qwen3-4B-Instruct-2507 \
+    --start-problem 0 \
     --num-problems 10 \
-    --num-samples 4 \
-    --max-turns 8 \
+    --num-samples 32 \
     \
     --fast-eval \
     --eval-workers 8 \
     --eval-batch-size 8 \
     --eval-timeout-s 5.0 \
-    --push-to-hub bicycleman15/235b_interactions
+    --push-to-hub bicycleman15/235b_single_turn
+
+# python collect_trajectories_tinker.py \
+#     --dataset bicycleman15/intellect_3_code_very_hard \
+#     --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
+#     --num-problems 10 \
+#     --num-samples 4 \
+#     --max-turns 8 \
+#     \
+#     --fast-eval \
+#     --eval-workers 8 \
+#     --eval-batch-size 8 \
+#     --eval-timeout-s 5.0 \
+#     --push-to-hub bicycleman15/235b_interactions
 
 # 100_150_s1 # done!
 # 250_300_s1 # checkpoints/20260119_015555_76d3d6ec
