@@ -160,23 +160,28 @@ def load_and_merge_datasets_with_filter(dataset_configs: list[tuple[str, int]], 
     
     for dataset_name, offset in dataset_configs:
         print(f"Loading {dataset_name} (offset={offset})...")
-        ds = load_dataset(dataset_name, split="train")
-        df = ds.to_pandas()
-        df = df.sort_values(['problem_id', 'trajectory_id'])
-        
-        for _, row in df.iterrows():
-            # Apply offset to get global problem_id
-            problem_id = row['problem_id'] + offset
+        try:
+            ds = load_dataset(dataset_name, split="train")
+            df = ds.to_pandas()
+            df = df.sort_values(['problem_id', 'trajectory_id'])
             
-            # Filter by max_problem_id if specified
-            if max_problem_id is not None and problem_id >= max_problem_id:
-                continue
+            for _, row in df.iterrows():
+                # Apply offset to get global problem_id
+                problem_id = row['problem_id'] + offset
                 
-            final_reward = row['final_reward']
-            
-            if problem_id not in merged_results:
-                merged_results[problem_id] = []
-            merged_results[problem_id].append(final_reward)
+                # Filter by max_problem_id if specified
+                if max_problem_id is not None and problem_id >= max_problem_id:
+                    continue
+                    
+                final_reward = row['final_reward']
+                
+                if problem_id not in merged_results:
+                    merged_results[problem_id] = []
+                merged_results[problem_id].append(final_reward)
+        except Exception as e:
+            print(f"  Warning: Could not load {dataset_name}: {e}")
+            print(f"  Skipping this dataset and continuing...")
+            continue
     
     return merged_results
 
@@ -439,14 +444,37 @@ def main():
 
     
     # Single-turn datasets (higher K, up to 320)
-    # Note: single_50_150 covers 50-150 but we restrict to problem_id < 75
-    single_turn_datasets_1 = [
-        ("bicycleman15/single_0_50", 0),     # problem 0-49
-        ("bicycleman15/single_50_150", 50),  # problem 50-149, filter to < 75
+    # Note: single_50_100 covers 50-100, we use problems 0-99
+    # single_turn_datasets = [
+    #     ("bicycleman15/235b_single_turn", 0),     # problem 0-49
+    #     # ("bicycleman15/30b_single_turn_50_100", 50),  # problem 50-99, filter to < 100
+    # ]
+    single_turn_datasets = [
+        ("anirudhb11/qwen3_4b_instruct_start_0_end_125_single_turn", 0),
+        ("anirudhb11/qwen3_4b_instruct_start_125_end_250_single_turn", 125),
+        ("anirudhb11/qwen3_4b_instruct_start_250_end_375_single_turn", 250),
+        ("anirudhb11/qwen3_4b_instruct_start_375_end_500_single_turn", 375),
+        ("anirudhb11/qwen3_4b_instruct_start_500_end_625_single_turn", 500),
     ]
     # single_turn_datasets_2 = [
-    #     ("bicycleman15/new_prompt_single_turn_0_100", 0),
+    #     ("bicycleman15/prompt_v3_single_turn_0_50", 0),     # problem 0-49
+    #     ("bicycleman15/prompt_v3_single_turn_50_100", 50),  # problem 50-99, filter to < 100
     # ]
+
+    # multi_turn_datasets = [
+    #     # ("bicycleman15/235b_interactions", 0),     # problem 0-49
+    #     # ("bicycleman15/30b_5s_interactions_50_100", 50),  # problem 50-99, filter to < 100
+    # ]
+    multi_turn_datasets = [
+        ("anirudhb11/qwen3_4b_instruct_start_0_end_70_interations_10_turns", 0),
+        ("anirudhb11/qwen3_4b_instruct_start_70_end_140_interations_10_turns", 70),
+        ("anirudhb11/qwen3_4b_instruct_start_140_end_210_interations_10_turns", 140),
+        ("anirudhb11/qwen3_4b_instruct_start_210_end_280_interations_10_turns", 210),
+        ("anirudhb11/qwen3_4b_instruct_start_280_end_350_interations_10_turns", 280),
+        ("anirudhb11/qwen3_4b_instruct_start_350_end_420_interations_10_turns", 350),
+        ("anirudhb11/qwen3_4b_instruct_start_420_end_490_interations_10_turns", 420),
+        ("anirudhb11/qwen3_4b_instruct_start_490_end_560_interations_10_turns", 490),
+    ]
 
     # single_turn_datasets_2 = [
     #     ("bicycleman15/prompt_v2_single_turn_0_25", 0),
@@ -454,9 +482,9 @@ def main():
     #     ("bicycleman15/prompt_v2_single_turn_50_75", 50),
     # ]
 
-    single_turn_datasets_3 = [
-        ("bicycleman15/prompt_v2_single_turn_0_75_rescored", 0),
-    ]
+    # single_turn_datasets_3 = [
+    #     ("bicycleman15/prompt_v2_single_turn_0_75_rescored", 0),
+    # ]
     
     # RSA datasets - 0-75, use split="step_10"
     # rsa_datasets = [
@@ -482,21 +510,37 @@ def main():
     # print("\nLoading S1 datasets 2...")
     # s1_results_2 = load_and_merge_datasets_with_filter(s1_datasets_2, max_problem_id=75)
     
-    print("\nLoading Single-turn datasets 1...")
-    # Use filtered version to restrict to problem_id < 75
-    single_turn_results_1 = load_and_merge_datasets_with_filter(single_turn_datasets_1, max_problem_id=75)
+    print("\nLoading Single-turn datasets (qwen3_4b_instruct single_turn)...")
+    # Use filtered version to restrict to problem_id < 625
+    single_turn_results = load_and_merge_datasets_with_filter(single_turn_datasets, max_problem_id=625)
     
-    # print("\nLoading Single-turn datasets 2...")
-    # single_turn_results_2 = load_and_merge_datasets_with_filter(single_turn_datasets_2, max_problem_id=75)
+    print("\nLoading Multi-turn datasets (qwen3_4b_instruct interactions)...")
+    multi_turn_results = load_and_merge_datasets_with_filter(multi_turn_datasets, max_problem_id=625)
     
-    print("\nLoading Single-turn datasets 3 (using final_reward)...")
-    single_turn_results_3 = load_and_merge_datasets_with_filter(single_turn_datasets_3, max_problem_id=75)
+    # Find intersection of problems present in both datasets
+    single_turn_problems = set(single_turn_results.keys())
+    multi_turn_problems = set(multi_turn_results.keys())
+    intersection_problems = sorted(single_turn_problems & multi_turn_problems)
     
-    # print("\nLoading RSA datasets (all steps)...")
-    # rsa_results_by_step = load_rsa_by_step(rsa_datasets, num_steps=10)
+    print(f"\nProblem Intersection Analysis:")
+    print(f"  Single-turn (qwen3_4b) problems: {len(single_turn_problems)}")
+    print(f"  Multi-turn problems: {len(multi_turn_problems)}")
+    print(f"  Intersection (both datasets): {len(intersection_problems)} problems")
+    
+    if len(intersection_problems) == 0:
+        print("\nERROR: No problems found in both datasets!")
+        return
+    
+    # Filter both datasets to only include intersection problems
+    single_turn_results_filtered = {pid: single_turn_results[pid] for pid in intersection_problems}
+    multi_turn_results_filtered = {pid: multi_turn_results[pid] for pid in intersection_problems}
+    
+    # Update references
+    single_turn_results = single_turn_results_filtered
+    multi_turn_results = multi_turn_results_filtered
     
     # Print dataset info
-    print(f"\nDataset Summary:")
+    print(f"\nDataset Summary (after intersection filtering):")
     # print(f"Multi-turn: {len(interactions_results)} problems")
     # if interactions_results:
     #     sample_counts = [len(v) for v in interactions_results.values()]
@@ -517,19 +561,14 @@ def main():
     #     sample_counts = [len(v) for v in s1_results_2.values()]
     #     print(f"  Samples per problem: min={min(sample_counts)}, max={max(sample_counts)}")
     
-    print(f"Single-turn 1: {len(single_turn_results_1)} problems")
-    if single_turn_results_1:
-        sample_counts = [len(v) for v in single_turn_results_1.values()]
+    print(f"Single-turn (qwen3_4b_instruct single_turn): {len(single_turn_results)} problems")
+    if single_turn_results:
+        sample_counts = [len(v) for v in single_turn_results.values()]
         print(f"  Samples per problem: min={min(sample_counts)}, max={max(sample_counts)}")
     
-    # print(f"Single-turn 2: {len(single_turn_results_2)} problems")
-    # if single_turn_results_2:
-    #     sample_counts = [len(v) for v in single_turn_results_2.values()]
-    #     print(f"  Samples per problem: min={min(sample_counts)}, max={max(sample_counts)}")
-    
-    print(f"Single-turn 3: {len(single_turn_results_3)} problems")
-    if single_turn_results_3:
-        sample_counts = [len(v) for v in single_turn_results_3.values()]
+    print(f"Multi-turn (qwen3_4b_instruct interactions): {len(multi_turn_results)} problems")
+    if multi_turn_results:
+        sample_counts = [len(v) for v in multi_turn_results.values()]
         print(f"  Samples per problem: min={min(sample_counts)}, max={max(sample_counts)}")
     
     # print(f"RSA (by step): {len(rsa_results_by_step)} problems")
@@ -547,41 +586,51 @@ def main():
     # Compute best-of-K for K from 1 to 320 for single-turn
     k_values_320 = list(range(1, 321))
     
+    # Determine max K for single-turn based on available samples
+    if single_turn_results:
+        max_samples_single = min(len(v) for v in single_turn_results.values())
+        k_values_single = list(range(1, max_samples_single + 1))
+    else:
+        k_values_single = k_values_320
+    
+    # Determine max K for multi-turn based on available samples
+    if multi_turn_results:
+        max_samples_multi = min(len(v) for v in multi_turn_results.values())
+        k_values_multi = list(range(1, max_samples_multi + 1))
+    else:
+        k_values_multi = k_values_32
+    
     # Best-of-K scores (continuous rewards)
     # interactions_scores = []
     # interactions_scores_2 = []
     # s1_scores_1 = []
     # s1_scores_2 = []
-    single_turn_scores_1 = []
-    # single_turn_scores_2 = []
-    single_turn_scores_3 = []
+    single_turn_scores = []
+    multi_turn_scores = []
     
     # Mean@K scores
     # interactions_mean_scores = []
     # interactions_mean_scores_2 = []
     # s1_mean_scores_1 = []
     # s1_mean_scores_2 = []
-    single_turn_mean_scores_1 = []
-    # single_turn_mean_scores_2 = []
-    single_turn_mean_scores_3 = []
+    single_turn_mean_scores = []
+    multi_turn_mean_scores = []
     
     # Success rate@K scores (fraction of samples with reward == 1.0)
     # interactions_success_rate_scores = []
     # interactions_success_rate_scores_2 = []
     # s1_success_rate_scores_1 = []
     # s1_success_rate_scores_2 = []
-    single_turn_success_rate_scores_1 = []
-    # single_turn_success_rate_scores_2 = []
-    single_turn_success_rate_scores_3 = []
+    single_turn_success_rate_scores = []
+    multi_turn_success_rate_scores = []
     
     # Pass@K scores (binary: reward == 1.0)
     # interactions_pass_scores = []
     # interactions_pass_scores_2 = []
     # s1_pass_scores_1 = []
     # s1_pass_scores_2 = []
-    single_turn_pass_scores_1 = []
-    # single_turn_pass_scores_2 = []
-    single_turn_pass_scores_3 = []
+    single_turn_pass_scores = []
+    multi_turn_pass_scores = []
     
     print("\n=== Best-of-K Results (Continuous Rewards) ===")
     
@@ -637,44 +686,31 @@ def main():
     #     if k <= len(s1_scores_2):
     #         print(f"  Best@{k}: {s1_scores_2[k-1]:.4f}")
     
-    # Compute for single-turn 1 up to K=320
-    for k in k_values_320:
-        single_turn_score_1 = compute_best_of_k(single_turn_results_1, k)
-        single_turn_scores_1.append(single_turn_score_1)
-        single_turn_pass_scores_1.append(compute_pass_at_k(single_turn_results_1, k))
-        single_turn_mean_scores_1.append(compute_mean_at_k(single_turn_results_1, k))
-        single_turn_success_rate_scores_1.append(compute_success_rate_at_k(single_turn_results_1, k))
+    # Compute for single-turn up to max available K
+    for k in k_values_single:
+        single_turn_score = compute_best_of_k(single_turn_results, k)
+        single_turn_scores.append(single_turn_score)
+        single_turn_pass_scores.append(compute_pass_at_k(single_turn_results, k))
+        single_turn_mean_scores.append(compute_mean_at_k(single_turn_results, k))
+        single_turn_success_rate_scores.append(compute_success_rate_at_k(single_turn_results, k))
     
-    # Compute for single-turn 2 up to K=320
-    # for k in k_values_320:
-    #     single_turn_score_2 = compute_best_of_k(single_turn_results_2, k)
-    #     single_turn_scores_2.append(single_turn_score_2)
-    #     single_turn_pass_scores_2.append(compute_pass_at_k(single_turn_results_2, k))
-    #     single_turn_mean_scores_2.append(compute_mean_at_k(single_turn_results_2, k))
-    #     single_turn_success_rate_scores_2.append(compute_success_rate_at_k(single_turn_results_2, k))
+    # Compute for multi-turn up to max available K
+    for k in k_values_multi:
+        multi_turn_score = compute_best_of_k(multi_turn_results, k)
+        multi_turn_scores.append(multi_turn_score)
+        multi_turn_pass_scores.append(compute_pass_at_k(multi_turn_results, k))
+        multi_turn_mean_scores.append(compute_mean_at_k(multi_turn_results, k))
+        multi_turn_success_rate_scores.append(compute_success_rate_at_k(multi_turn_results, k))
     
-    # Compute for single-turn 3 up to K=320
-    for k in k_values_320:
-        single_turn_score_3 = compute_best_of_k(single_turn_results_3, k)
-        single_turn_scores_3.append(single_turn_score_3)
-        single_turn_pass_scores_3.append(compute_pass_at_k(single_turn_results_3, k))
-        single_turn_mean_scores_3.append(compute_mean_at_k(single_turn_results_3, k))
-        single_turn_success_rate_scores_3.append(compute_success_rate_at_k(single_turn_results_3, k))
-    
-    print(f"\nSingle-turn 1 (up to 320 samples):")
+    print(f"\nSingle-turn (qwen3_4b_instruct single_turn, up to {len(k_values_single)} samples):")
     for k in [1, 8, 32, 64, 128, 256, 320]:
-        if k <= len(single_turn_scores_1):
-            print(f"  Best@{k}: {single_turn_scores_1[k-1]:.4f}")
+        if k <= len(single_turn_scores):
+            print(f"  Best@{k}: {single_turn_scores[k-1]:.4f}")
     
-    # print(f"\nSingle-turn 2 (up to 320 samples):")
-    # for k in [1, 8, 32, 64, 128, 256, 320]:
-    #     if k <= len(single_turn_scores_2):
-    #         print(f"  Best@{k}: {single_turn_scores_2[k-1]:.4f}")
-    
-    print(f"\nSingle-turn 3 (up to 320 samples):")
-    for k in [1, 8, 32, 64, 128, 256, 320]:
-        if k <= len(single_turn_scores_3):
-            print(f"  Best@{k}: {single_turn_scores_3[k-1]:.4f}")
+    print(f"\nMulti-turn (qwen3_4b_instruct interactions, up to {len(k_values_multi)} samples):")
+    for k in [1, 8, 16, 32]:
+        if k <= len(multi_turn_scores):
+            print(f"  Best@{k}: {multi_turn_scores[k-1]:.4f}")
     
     print("\n=== Pass@K Results (Binary: reward == 1.0) ===")
     
@@ -698,30 +734,23 @@ def main():
     #     if k <= len(s1_pass_scores_2):
     #         print(f"  Pass@{k}: {s1_pass_scores_2[k-1]:.4f}")
     
-    print(f"\nSingle-turn 1 (up to 320 samples):")
+    print(f"\nSingle-turn (qwen3_4b_instruct single_turn, up to {len(k_values_single)} samples):")
     for k in [1, 8, 32, 64, 128, 256, 320]:
-        if k <= len(single_turn_pass_scores_1):
-            print(f"  Pass@{k}: {single_turn_pass_scores_1[k-1]:.4f}")
+        if k <= len(single_turn_pass_scores):
+            print(f"  Pass@{k}: {single_turn_pass_scores[k-1]:.4f}")
     
-    # print(f"\nSingle-turn 2 (up to 320 samples):")
-    # for k in [1, 8, 32, 64, 128, 256, 320]:
-    #     if k <= len(single_turn_pass_scores_2):
-    #         print(f"  Pass@{k}: {single_turn_pass_scores_2[k-1]:.4f}")
-    
-    print(f"\nSingle-turn 3 (up to 320 samples):")
-    for k in [1, 8, 32, 64, 128, 256, 320]:
-        if k <= len(single_turn_pass_scores_3):
-            print(f"  Pass@{k}: {single_turn_pass_scores_3[k-1]:.4f}")
+    print(f"\nMulti-turn (qwen3_4b_instruct interactions, up to {len(k_values_multi)} samples):")
+    for k in [1, 8, 16, 32]:
+        if k <= len(multi_turn_pass_scores):
+            print(f"  Pass@{k}: {multi_turn_pass_scores[k-1]:.4f}")
     
     # Create figure with four subplots
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 10))
     
     # Plot 1: Best-of-K (continuous rewards)
-    ax1.plot(k_values_320, single_turn_scores_1, '-', color='#9B59B6', label='Single-turn 1 (K)', 
+    ax1.plot(k_values_single, single_turn_scores, '-', color='#9B59B6', label='Single-turn (qwen3_4b_instruct)', 
              linewidth=1.5)
-    # ax1.plot(k_values_320, single_turn_scores_2, '-', color='#E74C3C', label='Single-turn 2 (K)', 
-    #          linewidth=1.5)
-    ax1.plot(k_values_320, single_turn_scores_3, '-', color='#F39C12', label='Single-turn 3 (K)', 
+    ax1.plot(k_values_multi, multi_turn_scores, '-', color='#E74C3C', label='Multi-turn (qwen3_4b_instruct)', 
              linewidth=1.5)
     # ax1.plot(k_values_32_x, interactions_scores, '-o', color='#2ECC71', label='Multi-turn (K*10 forward passes)', 
     #          markersize=3, linewidth=1.5)
@@ -737,14 +766,17 @@ def main():
     ax1.set_title('Best-of-K (Continuous Rewards)', fontsize=12, style='italic')
     ax1.legend(loc='lower right', frameon=True)
     ax1.grid(True, alpha=0.3)
-    ax1.set_xticks([1, 10, 32, 64, 128, 192, 256, 320])
+    # Set x-axis ticks based on max K values
+    max_k_plot = max(len(k_values_single), len(k_values_multi))
+    if max_k_plot <= 32:
+        ax1.set_xticks([1, 4, 8, 16, 32])
+    else:
+        ax1.set_xticks([1, 10, 32, 64, 128, 192, 256, 320])
     
     # Plot 2: Mean@K
-    ax2.plot(k_values_320, single_turn_mean_scores_1, '-', color='#9B59B6', label='Single-turn 1 (K)', 
+    ax2.plot(k_values_single, single_turn_mean_scores, '-', color='#9B59B6', label='Single-turn (qwen3_4b_instruct)', 
              linewidth=1.5)
-    # ax2.plot(k_values_320, single_turn_mean_scores_2, '-', color='#E74C3C', label='Single-turn 2 (K)', 
-    #          linewidth=1.5)
-    ax2.plot(k_values_320, single_turn_mean_scores_3, '-', color='#F39C12', label='Single-turn 3 (K)', 
+    ax2.plot(k_values_multi, multi_turn_mean_scores, '-', color='#E74C3C', label='Multi-turn (qwen3_4b_instruct)', 
              linewidth=1.5)
     # ax2.plot(k_values_32_x, interactions_mean_scores, '-o', color='#2ECC71', label='Multi-turn (K*10 forward passes)', 
     #          markersize=3, linewidth=1.5)
@@ -760,14 +792,15 @@ def main():
     ax2.set_title('Mean@K (Average Reward)', fontsize=12, style='italic')
     ax2.legend(loc='upper right', frameon=True)
     ax2.grid(True, alpha=0.3)
-    ax2.set_xticks([1, 10, 32, 64, 128, 192, 256, 320])
+    if max_k_plot <= 32:
+        ax2.set_xticks([1, 4, 8, 16, 32])
+    else:
+        ax2.set_xticks([1, 10, 32, 64, 128, 192, 256, 320])
     
     # Plot 3: Pass@K (binary rewards)
-    ax3.plot(k_values_320, single_turn_pass_scores_1, '-', color='#9B59B6', label='Single-turn 1 (K)', 
+    ax3.plot(k_values_single, single_turn_pass_scores, '-', color='#9B59B6', label='Single-turn (qwen3_4b_instruct)', 
              linewidth=1.5)
-    # ax3.plot(k_values_320, single_turn_pass_scores_2, '-', color='#E74C3C', label='Single-turn 2 (K)', 
-    #          linewidth=1.5)
-    ax3.plot(k_values_320, single_turn_pass_scores_3, '-', color='#F39C12', label='Single-turn 3 (K)', 
+    ax3.plot(k_values_multi, multi_turn_pass_scores, '-', color='#E74C3C', label='Multi-turn (qwen3_4b_instruct)', 
              linewidth=1.5)
     # ax3.plot(k_values_32_x, interactions_pass_scores, '-o', color='#2ECC71', label='Multi-turn (K*10 forward passes)', 
     #          markersize=3, linewidth=1.5)
@@ -783,14 +816,15 @@ def main():
     ax3.set_title('Pass@K (Any reward == 1.0)', fontsize=12, style='italic')
     ax3.legend(loc='lower right', frameon=True)
     ax3.grid(True, alpha=0.3)
-    ax3.set_xticks([1, 10, 32, 64, 128, 192, 256, 320])
+    if max_k_plot <= 32:
+        ax3.set_xticks([1, 4, 8, 16, 32])
+    else:
+        ax3.set_xticks([1, 10, 32, 64, 128, 192, 256, 320])
     
     # Plot 4: Success Rate@K (fraction of samples with reward == 1.0)
-    ax4.plot(k_values_320, single_turn_success_rate_scores_1, '-', color='#9B59B6', label='Single-turn 1 (K)', 
+    ax4.plot(k_values_single, single_turn_success_rate_scores, '-', color='#9B59B6', label='Single-turn (qwen3_4b_instruct)', 
              linewidth=1.5)
-    # ax4.plot(k_values_320, single_turn_success_rate_scores_2, '-', color='#E74C3C', label='Single-turn 2 (K)', 
-    #          linewidth=1.5)
-    ax4.plot(k_values_320, single_turn_success_rate_scores_3, '-', color='#F39C12', label='Single-turn 3 (K)', 
+    ax4.plot(k_values_multi, multi_turn_success_rate_scores, '-', color='#E74C3C', label='Multi-turn (qwen3_4b_instruct)', 
              linewidth=1.5)
     # ax4.plot(k_values_32_x, interactions_success_rate_scores, '-o', color='#2ECC71', label='Multi-turn (K*10 forward passes)', 
     #          markersize=3, linewidth=1.5)
@@ -806,7 +840,10 @@ def main():
     ax4.set_title('Success Rate@K (Fraction with reward == 1.0)', fontsize=12, style='italic')
     ax4.legend(loc='upper right', frameon=True)
     ax4.grid(True, alpha=0.3)
-    ax4.set_xticks([1, 10, 32, 64, 128, 192, 256, 320])
+    if max_k_plot <= 32:
+        ax4.set_xticks([1, 4, 8, 16, 32])
+    else:
+        ax4.set_xticks([1, 10, 32, 64, 128, 192, 256, 320])
     
     plt.tight_layout()
     plt.savefig('best_of_k_comparison.png', dpi=150)
@@ -836,23 +873,35 @@ def main():
     # print(f"  Best@8:  {s1_scores_2[7]:.4f}  |  Pass@8:  {s1_pass_scores_2[7]:.4f}")
     # print(f"  Best@32: {s1_scores_2[31]:.4f}  |  Pass@32: {s1_pass_scores_2[31]:.4f}")
     
-    print(f"\nSingle-turn 1 (problems 0-74):")
-    print(f"  Best@1:   {single_turn_scores_1[0]:.4f}  |  Pass@1:   {single_turn_pass_scores_1[0]:.4f}")
-    print(f"  Best@32:  {single_turn_scores_1[31]:.4f}  |  Pass@32:  {single_turn_pass_scores_1[31]:.4f}")
-    if len(single_turn_scores_1) >= 320:
-        print(f"  Best@320: {single_turn_scores_1[319]:.4f}  |  Pass@320: {single_turn_pass_scores_1[319]:.4f}")
+    # Report actual problem ranges
+    if intersection_problems:
+        min_problem = min(intersection_problems)
+        max_problem = max(intersection_problems)
+        print(f"\n=== Problem Ranges ===")
+        print(f"Plotting intersection of problems present in BOTH datasets:")
+        print(f"  Problem ID range: {min_problem} to {max_problem} (inclusive)")
+        print(f"  Total problems: {len(intersection_problems)}")
+        print(f"  Problem IDs: {intersection_problems[:10]}{'...' if len(intersection_problems) > 10 else ''}")
+        if len(intersection_problems) > 10:
+            print(f"  ... and {len(intersection_problems) - 10} more")
     
-    # print(f"\nSingle-turn 2 (problems 0-74):")
-    # print(f"  Best@1:   {single_turn_scores_2[0]:.4f}  |  Pass@1:   {single_turn_pass_scores_2[0]:.4f}")
-    # print(f"  Best@32:  {single_turn_scores_2[31]:.4f}  |  Pass@32:  {single_turn_pass_scores_2[31]:.4f}")
-    # if len(single_turn_scores_2) >= 320:
-    #     print(f"  Best@320: {single_turn_scores_2[319]:.4f}  |  Pass@320: {single_turn_pass_scores_2[319]:.4f}")
+    print(f"\nSingle-turn (qwen3_4b_instruct single_turn):")
+    print(f"  Best@1:   {single_turn_scores[0]:.4f}  |  Pass@1:   {single_turn_pass_scores[0]:.4f}")
+    max_k_single = len(single_turn_scores)
+    if max_k_single >= 32:
+        print(f"  Best@32:  {single_turn_scores[31]:.4f}  |  Pass@32:  {single_turn_pass_scores[31]:.4f}")
+    if max_k_single >= 320:
+        print(f"  Best@320: {single_turn_scores[319]:.4f}  |  Pass@320: {single_turn_pass_scores[319]:.4f}")
+    elif max_k_single > 0:
+        print(f"  Best@{max_k_single}: {single_turn_scores[max_k_single-1]:.4f}  |  Pass@{max_k_single}: {single_turn_pass_scores[max_k_single-1]:.4f}")
     
-    print(f"\nSingle-turn 3 (problems 0-74):")
-    print(f"  Best@1:   {single_turn_scores_3[0]:.4f}  |  Pass@1:   {single_turn_pass_scores_3[0]:.4f}")
-    print(f"  Best@32:  {single_turn_scores_3[31]:.4f}  |  Pass@32:  {single_turn_pass_scores_3[31]:.4f}")
-    if len(single_turn_scores_3) >= 320:
-        print(f"  Best@320: {single_turn_scores_3[319]:.4f}  |  Pass@320: {single_turn_pass_scores_3[319]:.4f}")
+    print(f"\nMulti-turn (qwen3_4b_instruct interactions):")
+    print(f"  Best@1:   {multi_turn_scores[0]:.4f}  |  Pass@1:   {multi_turn_pass_scores[0]:.4f}")
+    if len(multi_turn_scores) >= 32:
+        print(f"  Best@32:  {multi_turn_scores[31]:.4f}  |  Pass@32:  {multi_turn_pass_scores[31]:.4f}")
+    max_k_multi = len(multi_turn_scores)
+    if max_k_multi > 0:
+        print(f"  Best@{max_k_multi}: {multi_turn_scores[max_k_multi-1]:.4f}  |  Pass@{max_k_multi}: {multi_turn_pass_scores[max_k_multi-1]:.4f}")
 
 
 if __name__ == "__main__":
