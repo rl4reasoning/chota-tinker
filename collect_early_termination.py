@@ -237,10 +237,11 @@ def create_sampling_client(args):
         if args.vllm_server_url:
             return ServerSamplingClient(args.vllm_server_url)
         else:
-            kwargs = {"gpu_memory_utilization": args.gpu_memory_utilization}
-            if getattr(args, "max_model_len", None) is not None:
-                kwargs["max_model_len"] = args.max_model_len
-            return SamplingClient(args.model, **kwargs)
+            return SamplingClient(
+                args.model,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+                max_model_len=args.max_model_len,
+            )
 
 
 def create_sampling_params(args, backend: str):
@@ -745,8 +746,8 @@ if __name__ == "__main__":
                         help="Seconds to wait for vLLM servers to be ready.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
                         help="GPU memory utilization for local vLLM or vLLM servers (default: 0.9)")
-    parser.add_argument("--max-model-len", type=int, default=None,
-                        help="Max sequence length for vLLM; lower than model default to reduce KV cache")
+    parser.add_argument("--max-model-len", type=int, default=120000,
+                        help="Max sequence length for vLLM; lower than model default to reduce KV cache (default: 120000)")
     
     # Eval options
     parser.add_argument("--fast-eval", action="store_true",
