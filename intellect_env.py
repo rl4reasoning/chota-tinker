@@ -115,7 +115,7 @@ def _exec_interaction_code_subprocess(code: str, timeout_s: Optional[float]) -> 
         success = result.returncode == 0
         return success, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
-        return False, "", "Execution timed out\n"
+        return False, "", "Execution timed out\n\nMaybe you are doing lots of operations?\nMaybe you are accepting inputs from stdin in interact blocks? (you need to hardcode inputs yourself when doing interactions)\n\nIf you are trying to submit the final answer, use only ```python``` blocks."
     except Exception as e:
         return False, "", f"Subprocess error: {e}\n"
     finally:
@@ -186,7 +186,7 @@ class IntellectCodeEnv(Env):
     """
 
     # Reminder text for interaction mode
-    INTERACTION_REMINDER = "NOTE: You must interact at least once before submitting your final answer. Use <interact> ... your code here ... </interact> to test your code first. Remember to pass in the inputs yourself."
+    INTERACTION_REMINDER = "NOTE: You must interact at least once before submitting your final answer. Use <interact> ... your code here ... </interact> to test your code first. Remember to pass in the inputs yourself. \n\nDo NOT use ```python``` blocks for interaction! You must use <interact> blocks!"
 
     def __init__(
         self,
@@ -326,22 +326,29 @@ class IntellectCodeEnv(Env):
         return obs, 0.0, False, False, {}
 
     def _handle_requires_interaction(self) -> Tuple[str, float, bool, bool, dict[str, Any]]:
-        obs = "<output>You must interact at least once before submitting your final answer. Use <interact> ... your code here ... </interact> to test your code first. Remember to pass in the inputs yourself.</output>"
+        obs = "<output>You must interact at least once before submitting your final answer. Use <interact> ... your code here ... </interact> to test your code first. Remember to pass in the inputs yourself. Do NOT use ```python``` blocks for interaction!</output>"
         if self.current_turn >= self.max_turns:
             return obs, 0.0, False, True, {"truncated": True}
         return obs, 0.0, False, False, {}
 
     def _handle_invalid(self) -> Tuple[str, float, bool, bool, dict[str, Any]]:
-        obs = "<output>No valid code block found. Use <interact></interact> or ```python```.</output>"
+        if self.has_interacted:
+            obs = "<output>No valid code block found. Use <interact></interact> to run your code, or use ```python``` to submit your final answer.</output>"
+        else:
+            obs = "<output>No valid code block found. Use <interact></interact> to run your code. Remember to pass in the inputs yourself. \n\nDo NOT use ```python``` blocks for interaction! You must use <interact> blocks!</output>"
         if self.current_turn >= self.max_turns:
             return obs, 0.0, False, True, {"truncated": True}
         return obs, 0.0, False, False, {}
 
     def _handle_final(self, answer_code: str) -> Tuple[str, float, bool, bool, dict[str, Any]]:
-        # Require interaction before final answer - no exceptions
+        # Require interaction before final answer
         if not self.has_interacted:
-            # truncated=True, terminated=False (episode cut short, not completed)
-            return "", 0.0, False, True, {"final": True, "no_interaction": True}
+            if self.current_turn < self.max_turns:
+                # Turns remaining - give warning, let them try again
+                return self._handle_requires_interaction()
+            else:
+                # At turn limit - truncate without evaluation
+                return "", 0.0, False, True, {"final": True, "no_interaction": True}
 
         # Enforce Solution-only when fn_name exists (align with fast_eval)
         if self.fn_name and "class Solution" not in answer_code:
@@ -472,9 +479,13 @@ def step_batch(
         answer_code = env._extract_answer_code(action)
         if answer_code:
             if not env.has_interacted:
-                # At turn limit - evaluate anyway even without interaction
                 if env.current_turn < env.max_turns:
+                    # Turns remaining - give warning, let them try again
                     results[idx] = env._handle_requires_interaction()
+                    continue
+                else:
+                    # At turn limit - truncate without evaluation
+                    results[idx] = ("", 0.0, False, True, {"final": True, "no_interaction": True})
                     continue
             eval_tasks.append(
                 EvalTask(
@@ -532,7 +543,7 @@ def step_batch(
             info = {"interaction_timed_out": interaction_timed_out}
             if env.current_turn >= env.max_turns:
                 info["truncated"] = True
-                results[idx] = (obs, 0.0, True, True, info)
+                results[idx] = (obs, 0.0, False, True, info)
             else:
                 results[idx] = (obs, 0.0, False, False, info)
 

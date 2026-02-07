@@ -4,10 +4,13 @@ Code environment demo using GEM with LLM agent.
 Uses tinker API for sampling.
 
 Usage:
-    python gem_math_demo.py --model Qwen/Qwen3-235B-A22B-Instruct-2507 --difficulty very_hard --problem_index 5 --fast-eval --eval-timeout-s 5.0
+    python gem_math_demo.py --model Qwen/Qwen3-235B-A22B-Instruct-2507 --difficulty very_hard --problem_index 8 --fast-eval --eval-timeout-s 5.0 --max_tokens 4096 --max_steps 15
 
 possible models:
 deepseek-ai/DeepSeek-V3.1
+Qwen/Qwen3-235B-A22B-Instruct-2507
+Qwen/Qwen3-30B-A3B-Instruct-2507
+Qwen/Qwen3-4B-Instruct-2507
 """
 
 import os
@@ -56,6 +59,7 @@ HARD RULES (NON-NEGOTIABLE)
 ────────────────────────
 EXECUTION ENVIRONMENT (CRITICAL)
 ────────────────────────
+- The execution environment does NOT take input from stdin. You MUST hardcode inputs in your code.
 - The execution environment shows ONLY what you PRINT to stdout.
 - EVERY <interact></interact> MUST include explicit print(...) statements.
 - Do NOT rely on REPL-style expression outputs or implicit returns.
@@ -185,8 +189,12 @@ async def run_episode(env, tokenizer, client, sampling_params, max_steps: int = 
         if obs:
             print(f"[user]\n{obs}\n")
         print(f"[reward] {reward:.3f}\n")
+
+        print(f"[turn {step} ends] terminated={terminated}, truncated={truncated}")
         
         if terminated or truncated:
+            # Print episode end summary
+            print(f"\n[episode end] terminated={terminated}, truncated={truncated}, info={info}")
             break
     
     # Print timeout summary
