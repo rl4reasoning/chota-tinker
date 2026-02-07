@@ -150,6 +150,7 @@ HARD RULES (NON-NEGOTIABLE)
 ────────────────────────
 EXECUTION ENVIRONMENT (CRITICAL)
 ────────────────────────
+- The execution environment does NOT take input from stdin. You MUST hardcode inputs in your code.
 - The execution environment shows ONLY what you PRINT to stdout.
 - EVERY <interact></interact> MUST include explicit print(...) statements.
 - Do NOT rely on REPL-style expression outputs or implicit returns.

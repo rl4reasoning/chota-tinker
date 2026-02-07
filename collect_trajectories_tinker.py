@@ -98,12 +98,13 @@ HARD RULES (NON-NEGOTIABLE)
 ────────────────────────
 EXECUTION ENVIRONMENT (CRITICAL)
 ────────────────────────
+- The execution environment does NOT take input from stdin. You MUST hardcode inputs in your code.
 - The execution environment shows ONLY what you PRINT to stdout.
 - EVERY <interact></interact> MUST include explicit print(...) statements.
 - Do NOT rely on REPL-style expression outputs or implicit returns.
 
 ────────────────────────
-DEFINITION OF "SUCCESSFUL <interact>"
+DEFINITION OF “SUCCESSFUL <interact>”
 ────────────────────────
 An interaction is successful ONLY if ALL of the following hold:
 - The code executes without exceptions, AND
@@ -132,7 +133,7 @@ SOLUTION STRESS TEST (CRITICAL)
   (a) brute force / exhaustive checking for small inputs (e.g., n ≤ 6–8), OR
   (b) randomized testing against a slower but correct oracle.
 - This interaction MUST print either:
-  • "No counterexample found in K tests" (K ≥ 100), OR
+  • “No counterexample found in K tests” (K ≥ 100), OR
   • A concrete counterexample where your approach disagrees with the oracle.
 - If a counterexample is found, you MUST revise your approach and repeat the oracle test.
 
