@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=v3_50_100
+#SBATCH --job-name=prompt_v4_single_turn_top400dataset_150
 #SBATCH --open-mode=append
 #SBATCH --output=/scratch/jp7467/slurm_logs/%j_%x.out
 #SBATCH --error=/scratch/jp7467/slurm_logs/%j_%x.err
 #SBATCH --export=ALL
-#SBATCH --time=6:00:00
-#SBATCH --gres=gpu:h200:0
-#SBATCH --account=torch_pr_235_courant
+#SBATCH --time=12:00:00
+#SBATCH --gres=gpu:h200:1
+#SBATCH --account=torch_pr_235_cds
 #SBATCH --mem=200G
 #SBATCH --cpus-per-task=16
 
@@ -165,13 +165,14 @@ conda activate ct
 #     --start-problem 0 \
 #     --num-problems 50 \
 #     --num-samples 32 \
-#     --max-turns 10 \
+#     --max-turns 20 \
 #     \
 #     --fast-eval \
 #     --eval-workers 8 \
 #     --eval-batch-size 8 \
 #     --eval-timeout-s 5.0 \
-#     --push-to-hub bicycleman15/30b_5s_single_0_50
+#     --push-to-hub bicycleman15/30b_20turns_0 \
+#     --resume-from checkpoints/20260207_024859_5ea526b6
 
 # python collect_trajectories_single_turn.py \
 #     --dataset bicycleman15/intellect_3_code_very_hard \
@@ -202,11 +203,25 @@ conda activate ct
 #     --eval-timeout-s 5.0 \
 #     --push-to-hub bicycleman15/30b_single_turn_50_100
 
-python eval_checkpoint_single_turn.py checkpoints/20260205_135600_f443060c \
-        --eval-workers 16 \
-        --eval-batch-size 8 \
-        --eval-timeout-s 5.0 \
-        --push-to-hub bicycleman15/30b_single_turn_0_50
+# python eval_checkpoint_single_turn.py checkpoints/20260205_135600_f443060c \
+#         --eval-workers 16 \
+#         --eval-batch-size 8 \
+#         --eval-timeout-s 5.0 \
+#         --push-to-hub bicycleman15/30b_single_turn_0_50
+
+python collect_trajectories_single_turn.py \
+    --dataset anirudhb11/intellect_3_code_very_hard_top_400_hardest \
+    --model Qwen/Qwen3-4B-Instruct-2507 \
+    --backend vllm \
+    --start-problem 150 \
+    --num-problems 50 \
+    --num-samples 350 \
+    \
+    --fast-eval \
+    --eval-workers 16 \
+    --eval-batch-size 8 \
+    --eval-timeout-s 5.0 \
+    --push-to-hub bicycleman15/prompt_v4_single_turn_top400dataset_150
 
 # also change file name to `collect_trajectories_budget_forcing.py` to collect s1 scaling
 # change start-problem to 500, so that we collect 

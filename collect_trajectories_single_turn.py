@@ -3,18 +3,18 @@
 Usage:
 
     python collect_trajectories_single_turn.py \
-    --dataset bicycleman15/intellect_3_code_very_hard \
+    --dataset anirudhb11/intellect_3_code_very_hard_top_400_hardest \
     --model Qwen/Qwen3-4B-Instruct-2507 \
     --backend vllm \
     --start-problem 0 \
-    --num-problems 25 \
-    --num-samples 350 \
+    --num-problems 2 \
+    --num-samples 32 \
     \
     --fast-eval \
     --eval-workers 8 \
     --eval-batch-size 8 \
-    --eval-timeout-s 1.0 \
-    --push-to-hub bicycleman15/prompt_v2_single_turn_0_50
+    --eval-timeout-s 5.0 \
+    --push-to-hub bicycleman15/prompt_v4_single_turn_0
 
 Multi-GPU (launches one vLLM server per GPU, shards prompts across them):
     python collect_trajectories_single_turn.py \
@@ -86,6 +86,7 @@ try:
         MultiServerSamplingClient,
         SamplingParams,
         ModelInput,
+        SamplingResult,
     )
     VLLM_AVAILABLE = True
 except ImportError:
@@ -168,6 +169,31 @@ def render_trajectory(messages: list[dict], question: str, reward: float, termin
 # """
 
 # prompt_v3
+# SYSTEM_PROMPT = """You are an expert competitive programming assistant.
+
+# ----------------------------
+# PROBLEM-SOLVING APPROACH
+# ----------------------------
+# 1. UNDERSTAND: Carefully read and restate the problem in your own words.
+# 2. ANALYZE: Identify key constraints, edge cases, and the core algorithmic challenge.
+# 3. VERIFY: Mentally trace through the provided examples step-by-step.
+# 4. IMPLEMENT: Write clean, correct, and efficient code.
+
+# ----------------------------
+# REASONING REQUIREMENTS
+# ----------------------------
+# Before writing any code, you MUST:
+# - Identify the input/output format precisely
+# - State the time and space complexity constraints
+# - Walk through at least one example by hand to verify your understanding
+
+# ----------------------------
+# CODE REQUIREMENTS
+# ----------------------------
+# - The solution MUST be inside a ```python``` code block
+# """
+
+# prompt_v4
 SYSTEM_PROMPT = """You are an expert competitive programming assistant.
 
 ----------------------------
@@ -175,8 +201,9 @@ PROBLEM-SOLVING APPROACH
 ----------------------------
 1. UNDERSTAND: Carefully read and restate the problem in your own words.
 2. ANALYZE: Identify key constraints, edge cases, and the core algorithmic challenge.
-3. VERIFY: Mentally trace through the provided examples step-by-step.
-4. IMPLEMENT: Write clean, correct, and efficient code.
+3. DESIGN: Choose an appropriate algorithm/data structure and justify your choice.
+4. VERIFY: Mentally trace through the provided examples step-by-step.
+5. IMPLEMENT: Write clean, correct, and efficient code.
 
 ----------------------------
 REASONING REQUIREMENTS
@@ -184,12 +211,25 @@ REASONING REQUIREMENTS
 Before writing any code, you MUST:
 - Identify the input/output format precisely
 - State the time and space complexity constraints
+- Consider edge cases (empty input, single element, maximum values, etc.)
 - Walk through at least one example by hand to verify your understanding
 
 ----------------------------
 CODE REQUIREMENTS
 ----------------------------
 - The solution MUST be inside a ```python``` code block
+- The code MUST handle all edge cases mentioned in the problem
+- Use appropriate data structures for the problem's constraints
+
+----------------------------
+COMMON PITFALLS TO AVOID
+----------------------------
+- Off-by-one errors in loops and array indexing
+- Integer overflow (use appropriate types if needed)
+- Not handling edge cases (n=0, n=1, empty strings, etc.)
+- Inefficient algorithms that exceed time limits
+- Incorrect input parsing (watch for multiple test cases, line formats)
+- Forgetting to flush output when required
 """
 
 
@@ -245,22 +285,20 @@ def build_prompt(messages: list[dict], tokenizer) -> list[int]:
     return tokenizer(prompt_text)["input_ids"]
 
 
-async def sample_batch_tinker(client, prompts: list[list[int]], sampling_params, tokenizer) -> list[str]:
-    """Batch sample using tinker (via async gather)."""
+async def sample_batch_tinker(client, prompts: list[list[int]], sampling_params, tokenizer) -> list[SamplingResult]:
+    """Batch sample using tinker (via async gather). Returns list of SamplingResult."""
     async def sample_one(input_ids):
-        result = await client.sample_async(
+        return await client.sample_async(
             prompt=tinker_types.ModelInput.from_ints(input_ids),
             sampling_params=sampling_params,
             num_samples=1,
         )
-        return tokenizer.decode(result.sequences[0].tokens, skip_special_tokens=True)
-    
-    results = await asyncio.gather(*[sample_one(p) for p in prompts])
-    return results
+
+    return list(await asyncio.gather(*[sample_one(p) for p in prompts]))
 
 
-def sample_batch_vllm(client, prompts: list[list[int]], sampling_params, show_progress: bool = False) -> list[str]:
-    """Batch sample using vLLM."""
+def sample_batch_vllm(client, prompts: list[list[int]], sampling_params, show_progress: bool = False) -> list[SamplingResult]:
+    """Batch sample using vLLM. Returns list of SamplingResult."""
     model_inputs = [ModelInput.from_ints(p) for p in prompts]
     # Pass show_progress for MultiServerSamplingClient (ignored by other clients)
     try:
@@ -268,7 +306,12 @@ def sample_batch_vllm(client, prompts: list[list[int]], sampling_params, show_pr
     except TypeError:
         # Fallback for clients that don't support show_progress
         results = client.sample_batch(model_inputs, sampling_params, num_samples=1)
-    return [r.sequences[0].text for r in results]
+    return results
+
+
+def _truncated_by_token_limit(finish_reason: str | None) -> bool:
+    """True if generation stopped due to max token limit."""
+    return (finish_reason or "").lower() in ("length", "length_capped")
 
 
 @dataclass
@@ -281,6 +324,7 @@ class SingleTurnState:
     max_tests: int
     messages: list[dict]
     response: str = ""
+    finish_reason: str | None = None
 
 
 def serialize_single_turn_state(state: SingleTurnState) -> dict:
@@ -293,6 +337,7 @@ def serialize_single_turn_state(state: SingleTurnState) -> dict:
         "max_tests": state.max_tests,
         "messages": [msg.copy() for msg in state.messages],
         "response": state.response,
+        "finish_reason": state.finish_reason,
     }
 
 
@@ -306,6 +351,7 @@ def deserialize_single_turn_state(data: dict) -> SingleTurnState:
         max_tests=data["max_tests"],
         messages=data["messages"],
         response=data["response"],
+        finish_reason=data.get("finish_reason"),
     )
 
 
@@ -319,7 +365,7 @@ def run_batched_rollouts(
     """Run batched single-turn rollouts across all problems and samples."""
     # Load dataset ONCE before creating environments
     print(f"Loading dataset {args.dataset}...")
-    if args.dataset.startswith("bicycleman15/"):
+    if args.dataset.startswith("bicycleman15/") or args.dataset.startswith("anirudhb11/intellect_3"):
         from datasets import load_dataset
         full_dataset = load_dataset(args.dataset, split="train")
     elif args.dataset.__contains__('lcb'):
@@ -405,13 +451,15 @@ def run_batched_rollouts(
         # Batch sample all responses at once
         print(f"Sampling {len(prompts)} responses...")
         if args.backend == "tinker":
-            responses = asyncio.run(sample_batch_tinker(client, prompts, sampling_params, tokenizer))
+            sampling_results = asyncio.run(sample_batch_tinker(client, prompts, sampling_params, tokenizer))
         else:
-            responses = sample_batch_vllm(client, prompts, sampling_params, show_progress=args.vllm_multi_gpu)
-        
-        # Store responses in states
-        for state, response in zip(states, responses):
-            state.response = response
+            sampling_results = sample_batch_vllm(client, prompts, sampling_params, show_progress=args.vllm_multi_gpu)
+
+        # Store response and finish_reason in states
+        for state, result in zip(states, sampling_results):
+            seq = result.sequences[0]
+            state.response = getattr(seq, "text", None) or tokenizer.decode(getattr(seq, "tokens", []), skip_special_tokens=True)
+            state.finish_reason = getattr(seq, "finish_reason", None)
         
         # Save checkpoint BEFORE evaluation (so we can retry if evaluation fails)
         if checkpoint_manager:
@@ -458,6 +506,8 @@ def run_batched_rollouts(
                 "terminated": eval_result.terminated,
                 "truncated": eval_result.truncated,
                 "tests": state.tests,
+                "finish_reason": state.finish_reason,
+                "truncated_by_token_limit": _truncated_by_token_limit(state.finish_reason),
             }
             all_trajectories[state.problem_index].append(traj)
     else:
@@ -486,9 +536,11 @@ def run_batched_rollouts(
                 "terminated": terminated,
                 "truncated": truncated,
                 "tests": state.tests,
+                "finish_reason": state.finish_reason,
+                "truncated_by_token_limit": _truncated_by_token_limit(state.finish_reason),
             }
             all_trajectories[state.problem_index].append(traj)
-    
+
     return all_trajectories
 
 
@@ -563,6 +615,8 @@ def main(args):
                 "terminated": traj["terminated"],
                 "truncated": traj["truncated"],
                 "tests": json.dumps(traj["tests"]),
+                "finish_reason": traj.get("finish_reason"),
+                "truncated_by_token_limit": traj.get("truncated_by_token_limit", False),
                 "is_successful": is_successful,
                 "rendered": render_trajectory(
                     traj["messages"], traj["question"],
@@ -636,7 +690,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Collect single-turn trajectories for code problems")
     parser.add_argument("--dataset", type=str, default="bicycleman15/intellect_3_code_easy_medium",
                         choices=["bicycleman15/intellect_3_code_easy_medium", "bicycleman15/intellect_3_code_hard",
-                                 "bicycleman15/intellect_3_code_very_hard", "PrimeIntellect/INTELLECT-3-RL", "anirudhb11/lcb_v6_feb_may_2025_formatted"])
+                                 "bicycleman15/intellect_3_code_very_hard", "anirudhb11/intellect_3_code_very_hard_top_400_hardest",
+                                 "PrimeIntellect/INTELLECT-3-RL", "anirudhb11/lcb_v6_feb_may_2025_formatted"])
     parser.add_argument("--start-problem", type=int, default=0,
                         help="Starting problem index for dataset slicing (default: 0)")
     parser.add_argument("--num-problems", type=int, default=20)
@@ -666,16 +721,16 @@ if __name__ == "__main__":
                         help="Host to bind vLLM servers (default: 127.0.0.1).")
     parser.add_argument("--vllm-server-startup-timeout-s", type=float, default=300.0,
                         help="Seconds to wait for vLLM servers to be ready.")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8,
-                        help="GPU memory utilization for local vLLM or vLLM servers (default: 0.8)")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
+                        help="GPU memory utilization for local vLLM or vLLM servers (default: 0.9)")
     parser.add_argument("--fast-eval", action="store_true",
                         help="Use parallel fast eval for final answers")
     parser.add_argument("--eval-workers", type=int, default=16,
                         help="Number of parallel evaluator workers (default: min(32, cpu_count))")
     parser.add_argument("--eval-batch-size", type=int, default=8,
                         help="Number of responses per evaluator task (default: 8)")
-    parser.add_argument("--eval-timeout-s", type=float, default=1.0,
-                        help="Per-test timeout in seconds for fast evaluation (default: 1.0)")
+    parser.add_argument("--eval-timeout-s", type=float, default=5.0,
+                        help="Per-test timeout in seconds for fast evaluation (default: 5.0)")
     
     args = parser.parse_args()
     main(args)

@@ -28,6 +28,7 @@ class Sequence:
     """A single generated sequence."""
     tokens: list[int]
     text: str
+    finish_reason: str | None = None  # e.g. "length", "stop" (from backend)
 
 
 @dataclass

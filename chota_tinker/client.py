@@ -74,6 +74,7 @@ class SamplingClient:
             seq = Sequence(
                 tokens=output.token_ids,
                 text=output.text,
+                finish_reason=getattr(output, "finish_reason", None),
             )
             sequences.append(seq)
 
@@ -115,7 +116,11 @@ class SamplingClient:
         results = []
         for output in outputs:
             sequences = [
-                Sequence(tokens=o.token_ids, text=o.text)
+                Sequence(
+                    tokens=o.token_ids,
+                    text=o.text,
+                    finish_reason=getattr(o, "finish_reason", None),
+                )
                 for o in output.outputs
             ]
             results.append(SamplingResult(sequences=sequences))
@@ -266,6 +271,7 @@ class ServerSamplingClient:
             seq = Sequence(
                 tokens=logprobs.get("tokens", []),
                 text=choice["text"],
+                finish_reason=choice.get("finish_reason"),
             )
             sequences.append(seq)
 
@@ -301,6 +307,7 @@ class ServerSamplingClient:
             seq = Sequence(
                 tokens=logprobs.get("tokens", []),
                 text=choice["text"],
+                finish_reason=choice.get("finish_reason"),
             )
             results[idx].append(seq)
 
