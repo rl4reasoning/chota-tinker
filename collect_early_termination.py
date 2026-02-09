@@ -93,12 +93,11 @@ FINAL_PROMPT = """STOP. Do NOT use <interact> anymore. Your interaction budget i
 
 You MUST now output your final solution code wrapped in ```python``` code blocks.
 
-Based on all the information and debugging you have done so far, write your best solution now. The code must:
-- Read inputs from stdin
-- NOT hardcode any inputs
-- Be wrapped in ```python``` delimiters
+Based on all the information and debugging you have done so far, write your best solution now.
 
-Output ONLY the final ```python``` code block. No more <interact> blocks allowed."""
+No more <interact> blocks allowed."""
+# Output ONLY the final ```python``` code block. No more <interact> blocks allowed.
+
 
 
 def render_result(

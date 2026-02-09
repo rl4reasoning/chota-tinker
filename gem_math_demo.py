@@ -4,7 +4,7 @@ Code environment demo using GEM with LLM agent.
 Uses tinker API for sampling.
 
 Usage:
-    python gem_math_demo.py --model openai/gpt-oss-120b --difficulty very_hard --problem_index 8 --fast-eval --eval-timeout-s 5.0 --max_tokens 4096 --max_steps 15
+    python gem_math_demo.py --model Qwen/Qwen3-4B-Instruct-2507 --difficulty very_hard --problem_index 1 --fast-eval --eval-timeout-s 5.0 --max_tokens 4096 --max_steps 4
 
 possible models:
 deepseek-ai/DeepSeek-V3.1
@@ -123,6 +123,14 @@ FINAL CODE REQUIREMENTS
 - Do NOT include <interact></interact> blocks after the final code.
 """
 
+FINAL_PROMPT = """STOP. Do NOT use <interact> anymore. Your interaction budget is exhausted.
+
+You MUST now output your final solution code wrapped in ```python``` code blocks.
+
+Based on all the information and debugging you have done so far, write your best solution now.
+
+No more <interact> blocks allowed."""
+# Output ONLY the final ```python``` code block. No more <interact> blocks allowed.
 
 async def get_llm_action(obs: str, history: list, tokenizer, client, sampling_params) -> str:
     messages = history + [{"role": "user", "content": obs}]
@@ -160,10 +168,19 @@ async def run_episode(env, tokenizer, client, sampling_params, max_steps: int = 
     print(f"[user]\n{obs}\n")
     
     for step in range(max_steps):
-        action = await get_llm_action(obs, history, tokenizer, client, sampling_params)
+        # On the last turn, add the final prompt to force the model to output final code
+        is_last_turn = (step == max_steps - 1)
+        if is_last_turn:
+            obs_for_llm = f"{obs}\n\n{FINAL_PROMPT}" if obs else FINAL_PROMPT
+            print(f"[user] (final turn - termination prompt appended)\n{obs_for_llm}\n")
+        else:
+            obs_for_llm = obs
+        
+        action = await get_llm_action(obs_for_llm, history, tokenizer, client, sampling_params)
         print(f"[assistant]\n{action}\n")
         
-        history.append({"role": "user", "content": obs})
+        # Use obs_for_llm in history to reflect what was actually sent to the model
+        history.append({"role": "user", "content": obs_for_llm})
         history.append({"role": "assistant", "content": action})
         
         if fast_eval:
