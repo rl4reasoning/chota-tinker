@@ -7,7 +7,7 @@ Usage:
     --backend vllm \
     --num-problems 2 \
     --num-samples 8 \
-    --max-turns 10 \
+    --max-turns 3 \
     \
     --fast-eval \
     --eval-workers 8 \
@@ -214,6 +214,14 @@ FINAL CODE REQUIREMENTS
 - Do NOT include <interact></interact> blocks after the final code.
 """
 
+FINAL_PROMPT = """STOP. Do NOT use <interact> anymore. Your interaction budget is exhausted.
+
+You MUST now output your final solution code wrapped in ```python``` code blocks.
+
+Based on all the information and debugging you have done so far, write your best solution now.
+
+Output ONLY the final ```python``` code block. No more <interact> blocks allowed."""
+
 
 @dataclass
 class RolloutState:
@@ -339,9 +347,19 @@ def create_sampling_params(args, backend: str):
         )
 
 
-def build_prompt(state: RolloutState, tokenizer) -> list[int]:
-    """Build tokenized prompt from rollout state."""
-    messages = state.history + [{"role": "user", "content": state.obs}]
+def build_prompt(state: RolloutState, tokenizer, max_turns: int) -> list[int]:
+    """Build tokenized prompt from rollout state.
+    
+    On the last turn (current_turn == max_turns - 1), appends FINAL_PROMPT
+    to force the model to output final code.
+    """
+    is_last_turn = state.env.current_turn == max_turns - 1
+    if is_last_turn:
+        obs_for_prompt = f"{state.obs}\n\n{FINAL_PROMPT}" if state.obs else FINAL_PROMPT
+    else:
+        obs_for_prompt = state.obs
+    
+    messages = state.history + [{"role": "user", "content": obs_for_prompt}]
     prompt_text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
@@ -535,7 +553,8 @@ def run_batched_rollouts(
             print(f"\n[Generation round {generation_round}] Processing {len(active_states)} active states...")
             
             # Build prompts for all active states
-            prompts = [build_prompt(s, tokenizer) for s in active_states]
+            # On the last turn, FINAL_PROMPT is appended to force final code output
+            prompts = [build_prompt(s, tokenizer, args.max_turns) for s in active_states]
             
             # Batch sample
             if args.backend == "tinker":
@@ -549,8 +568,19 @@ def run_batched_rollouts(
             for state, response in zip(active_states, responses):
                 response = postprocess_response(response)
                 
+                # On the last turn, include FINAL_PROMPT in history to reflect what was sent
+                is_last_turn = state.env.current_turn == args.max_turns - 1
+                if is_last_turn:
+                    obs_for_history = f"{state.obs}\n\n{FINAL_PROMPT}" if state.obs else FINAL_PROMPT
+                    # Also update the last user message in messages to include FINAL_PROMPT
+                    # (the obs was already appended to messages in the previous iteration)
+                    if state.messages and state.messages[-1]["role"] == "user":
+                        state.messages[-1]["content"] = obs_for_history
+                else:
+                    obs_for_history = state.obs
+                
                 # Update history and messages
-                state.history.append({"role": "user", "content": state.obs})
+                state.history.append({"role": "user", "content": obs_for_history})
                 state.history.append({"role": "assistant", "content": response})
                 state.messages.append({"role": "assistant", "content": response})
                 processed_responses.append(response)
