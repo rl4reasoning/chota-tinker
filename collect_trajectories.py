@@ -2,7 +2,7 @@
 
 Usage:
     python collect_trajectories.py \
-    --dataset bicycleman15/intellect_3_code_very_hard \
+    --dataset anirudhb11/intellect_3_code_very_hard_top_400_hardest \
     --model Qwen/Qwen3-4B-Instruct-2507 \
     --backend vllm \
     --num-problems 2 \
@@ -12,7 +12,7 @@ Usage:
     --fast-eval \
     --eval-workers 8 \
     --eval-batch-size 8 \
-    --eval-timeout-s 1.0 \
+    --eval-timeout-s 5.0 \
     --push-to-hub bicycleman15/temp
 
 Multi-GPU (launches one vLLM server per GPU, shards prompts across them):
@@ -439,7 +439,7 @@ def run_batched_rollouts(
     """Run batched rollouts across all problems and samples."""
     # Load dataset ONCE before creating environments
     print(f"Loading dataset {args.dataset}...")
-    if args.dataset.startswith("bicycleman15/"):
+    if args.dataset.startswith("bicycleman15/") or args.dataset.startswith("anirudhb11/intellect_"):
         from datasets import load_dataset
         full_dataset = load_dataset(args.dataset, split="train")
     elif args.dataset.__contains__('lcb'):
@@ -823,7 +823,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Collect multi-turn trajectories for code problems")
     parser.add_argument("--dataset", type=str, default="bicycleman15/intellect_3_code_easy_medium",
                         choices=["bicycleman15/intellect_3_code_easy_medium", "bicycleman15/intellect_3_code_hard",
-                                 "bicycleman15/intellect_3_code_very_hard", "PrimeIntellect/INTELLECT-3-RL", "anirudhb11/lcb_v6_feb_may_2025_formatted"])
+                                 "bicycleman15/intellect_3_code_very_hard", "PrimeIntellect/INTELLECT-3-RL", 
+                                 "anirudhb11/lcb_v6_feb_may_2025_formatted", "anirudhb11/intellect_3_code_very_hard_top_400_hardest"])
     parser.add_argument("--start-problem", type=int, default=0,
                         help="Starting problem index for dataset slicing (default: 0)")
     parser.add_argument("--num-problems", type=int, default=20)
