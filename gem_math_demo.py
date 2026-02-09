@@ -4,7 +4,7 @@ Code environment demo using GEM with LLM agent.
 Uses tinker API for sampling.
 
 Usage:
-    python gem_math_demo.py --model Qwen/Qwen3-4B-Instruct-2507 --difficulty very_hard --problem_index 1 --fast-eval --eval-timeout-s 5.0 --max_tokens 4096 --max_steps 4
+    python gem_math_demo.py --model Qwen/Qwen3-4B-Instruct-2507 --difficulty very_hard --problem_index 32 --fast-eval --eval-timeout-s 5.0 --max_tokens 4096 --max_steps 3
 
 possible models:
 deepseek-ai/DeepSeek-V3.1
