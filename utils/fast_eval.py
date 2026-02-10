@@ -337,7 +337,7 @@ def _compare_func_result(exec_outputs, expected_str):
     return tmp_result
 
 def _run_solution_case():
-    global_ns = {{"__name__": "__main__"}}
+    global_ns = {{"__name__": "__solution__"}}
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         exec(_code, global_ns)
     
