@@ -32,6 +32,18 @@ Multi-GPU (launches one vLLM server per GPU, shards prompts across them):
     --eval-timeout-s 1.0 \
     --push-to-hub bicycleman15/temp
 
+For GPT-OSS models (uses Harmony format):
+    python collect_trajectories.py \
+    --dataset bicycleman15/intellect_3_code_very_hard \
+    --model openai/gpt-oss-120b \
+    --backend vllm \
+    --num-problems 10 \
+    --num-samples 8 \
+    --max-turns 5 \
+    --reasoning-effort medium \
+    --fast-eval \
+    --push-to-hub bicycleman15/temp
+
 Resume from checkpoint (if previous run failed):
     python collect_trajectories.py \
         --resume-from checkpoints/20260117_143052 \
@@ -52,13 +64,30 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, date
 from typing import Any, Optional
 
 import requests
 from datasets import Dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
+
+# Harmony library for GPT-OSS models
+from openai_harmony import (
+    load_harmony_encoding,
+    HarmonyEncodingName,
+    Role as HarmonyRole,
+    Message as HarmonyMessage,
+    Conversation,
+    DeveloperContent,
+    SystemContent,
+    ReasoningEffort,
+)
+
+
+def is_gpt_oss_model(model_name: str) -> bool:
+    """Check if the model is a GPT-OSS model that requires Harmony format."""
+    return "gpt-oss" in model_name.lower()
 
 from checkpoint import CheckpointManager, get_checkpoint_dir
 from intellect_env import IntellectCodeEnv, step_batch
@@ -222,6 +251,128 @@ Based on all the information and debugging you have done so far, write your best
 
 Output ONLY the final ```python``` code block. No more <interact> blocks allowed."""
 
+# For Harmony GPT-OSS models, use SYSTEM_PROMPT as DEVELOPER_INSTRUCTIONS
+DEVELOPER_INSTRUCTIONS = SYSTEM_PROMPT
+
+
+# =============================================================================
+# HARMONY FORMAT HELPERS (for GPT-OSS models)
+# =============================================================================
+
+def build_harmony_conversation(history: list, obs: str, encoding) -> Conversation:
+    """
+    Build a Harmony Conversation from the history list and current observation.
+    
+    The history format for Harmony is different:
+    - history[0] is the SystemContent message
+    - history[1] is the DeveloperContent message  
+    - Subsequent entries are user/assistant messages
+    
+    For assistant messages, we track channel info to properly drop analysis on subsequent turns.
+    According to Harmony docs: "you should drop any previous CoT content on subsequent sampling 
+    if the responses by the assistant ended in a message to the final channel."
+    """
+    messages = []
+    
+    for i, entry in enumerate(history):
+        role = entry["role"]
+        content = entry["content"]
+        
+        if role == "system":
+            # This is the Harmony SystemContent
+            messages.append(HarmonyMessage.from_role_and_content(HarmonyRole.SYSTEM, content))
+        elif role == "developer":
+            # This is the Harmony DeveloperContent with our instructions
+            messages.append(HarmonyMessage.from_role_and_content(HarmonyRole.DEVELOPER, content))
+        elif role == "user":
+            messages.append(HarmonyMessage.from_role_and_content(HarmonyRole.USER, content))
+        elif role == "assistant":
+            channel = entry.get("channel", "final")
+            
+            # Check if this is an analysis message that should be dropped
+            # We drop analysis if:
+            # 1. This message is in the analysis channel, AND
+            # 2. The next assistant message (if any) ended in final channel
+            # For simplicity, we only keep analysis messages if they're the last assistant message
+            # and didn't end with a final response
+            should_drop_analysis = False
+            if channel == "analysis":
+                # Look ahead to see if there's a subsequent final message
+                for j in range(i + 1, len(history)):
+                    if history[j]["role"] == "assistant":
+                        if history[j].get("channel") == "final":
+                            should_drop_analysis = True
+                        break
+            
+            if not should_drop_analysis:
+                msg = HarmonyMessage.from_role_and_content(HarmonyRole.ASSISTANT, content)
+                msg = msg.with_channel(channel)
+                messages.append(msg)
+    
+    # Add the current observation as a user message
+    messages.append(HarmonyMessage.from_role_and_content(HarmonyRole.USER, obs))
+    
+    return Conversation.from_messages(messages)
+
+
+def parse_harmony_response(tokens: list, encoding) -> tuple[str, str, Optional[str]]:
+    """
+    Parse the Harmony response tokens and extract content by channel.
+    
+    The model may output:
+    - analysis (chain of thought) followed by final (user-facing response)
+    - Just analysis (if it needs to do a tool call or is still reasoning)
+    - Just final
+    
+    Returns:
+        tuple of (user_facing_content, channel, analysis_content)
+        - user_facing_content: The content to show/use (from 'final' if available, else from other channels)
+        - channel: The channel of the user_facing_content ('final', 'analysis', or 'commentary')  
+        - analysis_content: The chain-of-thought content (if any), for logging purposes only
+    """
+    parsed_messages = encoding.parse_messages_from_completion_tokens(
+        tokens, 
+        role=HarmonyRole.ASSISTANT,
+        strict=False  # Be tolerant of malformed headers
+    )
+    
+    # Collect content by channel
+    analysis_content = None
+    final_content = None
+    commentary_content = None
+    
+    for msg in parsed_messages:
+        channel = msg.channel or "final"
+        # Extract text content from the message
+        text_parts = []
+        for content_item in msg.content:
+            if hasattr(content_item, 'text'):
+                text_parts.append(content_item.text)
+        
+        combined_text = "\n".join(text_parts) if text_parts else ""
+        
+        if channel == "final":
+            final_content = combined_text
+        elif channel == "analysis":
+            analysis_content = combined_text
+        elif channel == "commentary":
+            commentary_content = combined_text
+    
+    # Determine user-facing content (prefer final > commentary > analysis)
+    if final_content:
+        return final_content, "final", analysis_content
+    elif commentary_content:
+        return commentary_content, "commentary", analysis_content
+    elif analysis_content:
+        return analysis_content, "analysis", None
+    else:
+        # Fallback: try to decode raw tokens
+        try:
+            raw_text = encoding.decode(tokens)
+            return raw_text, "unknown", None
+        except Exception:
+            return "", "unknown", None
+
 
 @dataclass
 class RolloutState:
@@ -326,29 +477,54 @@ def create_sampling_client(args):
             kwargs = {"gpu_memory_utilization": args.gpu_memory_utilization}
             if getattr(args, "max_model_len", None) is not None:
                 kwargs["max_model_len"] = args.max_model_len
+            if getattr(args, "tensor_parallel_size", 1) > 1:
+                kwargs["tensor_parallel_size"] = args.tensor_parallel_size
             return SamplingClient(args.model, **kwargs)
 
 
-def create_sampling_params(args, backend: str):
-    """Create sampling params for the chosen backend."""
+def create_sampling_params(args, backend: str, harmony_encoding=None):
+    """Create sampling params for the chosen backend.
+    
+    Args:
+        args: Command line arguments
+        backend: 'tinker' or 'vllm'
+        harmony_encoding: If using Harmony (GPT-OSS), pass the encoding to get stop tokens
+    """
+    stop_sequences = ["</interact>"]
+    stop_token_ids = None
+    
+    # For Harmony models, add Harmony stop tokens
+    if harmony_encoding is not None:
+        stop_token_ids = harmony_encoding.stop_tokens()
+    
     if backend == "tinker":
-        return tinker_types.SamplingParams(
+        params = tinker_types.SamplingParams(
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             top_p=0.95,
-            stop=["</interact>"],
+            stop=stop_sequences,
         )
+        if stop_token_ids:
+            params = tinker_types.SamplingParams(
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                top_p=0.95,
+                stop=stop_sequences,
+                stop_token_ids=stop_token_ids,
+            )
+        return params
     else:
         return SamplingParams(
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             top_p=0.95,
-            stop=["</interact>"],
+            stop=stop_sequences,
+            stop_token_ids=stop_token_ids,
         )
 
 
 def build_prompt(state: RolloutState, tokenizer, max_turns: int) -> list[int]:
-    """Build tokenized prompt from rollout state.
+    """Build tokenized prompt from rollout state (standard HF tokenizer path).
     
     On the last turn (current_turn == max_turns - 1), appends FINAL_PROMPT
     to force the model to output final code.
@@ -364,6 +540,22 @@ def build_prompt(state: RolloutState, tokenizer, max_turns: int) -> list[int]:
         messages, tokenize=False, add_generation_prompt=True
     )
     return tokenizer(prompt_text)["input_ids"]
+
+
+def build_prompt_harmony(state: RolloutState, encoding, max_turns: int) -> list[int]:
+    """Build tokenized prompt from rollout state using Harmony encoding (GPT-OSS path).
+    
+    On the last turn (current_turn == max_turns - 1), appends FINAL_PROMPT
+    to force the model to output final code.
+    """
+    is_last_turn = state.env.current_turn == max_turns - 1
+    if is_last_turn:
+        obs_for_prompt = f"{state.obs}\n\n{FINAL_PROMPT}" if state.obs else FINAL_PROMPT
+    else:
+        obs_for_prompt = state.obs
+    
+    conversation = build_harmony_conversation(state.history, obs_for_prompt, encoding)
+    return encoding.render_conversation_for_completion(conversation, HarmonyRole.ASSISTANT)
 
 
 def postprocess_response(response: str) -> str:
@@ -403,8 +595,8 @@ def maybe_truncate_obs(obs: str, tokenizer, max_interaction_output_tokens: Optio
     return f"<output>\n{truncated}</output>"
 
 
-async def sample_batch_tinker(client, prompts: list[list[int]], sampling_params) -> list[str]:
-    """Batch sample using tinker (via async gather)."""
+async def sample_batch_tinker(client, prompts: list[list[int]], sampling_params) -> list[list[int]]:
+    """Batch sample using tinker (via async gather). Returns token lists."""
     async def sample_one(input_ids):
         result = await client.sample_async(
             prompt=tinker_types.ModelInput.from_ints(input_ids),
@@ -415,6 +607,24 @@ async def sample_batch_tinker(client, prompts: list[list[int]], sampling_params)
     
     results = await asyncio.gather(*[sample_one(p) for p in prompts])
     return results
+
+
+async def sample_batch_tinker_harmony(client, prompts: list[list[int]], sampling_params, encoding) -> list[tuple[str, str, Optional[str]]]:
+    """Batch sample using tinker with Harmony parsing.
+    
+    Returns list of (response_content, channel, analysis_content) tuples.
+    """
+    token_results = await sample_batch_tinker(client, prompts, sampling_params)
+    
+    parsed_results = []
+    for tokens in token_results:
+        content, channel, analysis = parse_harmony_response(tokens, encoding)
+        # Postprocess: if stopped by </interact>, append it back
+        if "<interact>" in content and "</interact>" not in content:
+            content += "</interact>"
+        parsed_results.append((content, channel, analysis))
+    
+    return parsed_results
 
 
 def sample_batch_vllm(client, prompts: list[list[int]], sampling_params, show_progress: bool = False) -> list[str]:
@@ -429,14 +639,50 @@ def sample_batch_vllm(client, prompts: list[list[int]], sampling_params, show_pr
     return [r.sequences[0].text for r in results]
 
 
+def sample_batch_vllm_harmony(client, prompts: list[list[int]], sampling_params, encoding, show_progress: bool = False) -> list[tuple[str, str, Optional[str]]]:
+    """Batch sample using vLLM with Harmony parsing.
+    
+    Returns list of (response_content, channel, analysis_content) tuples.
+    """
+    model_inputs = [ModelInput.from_ints(p) for p in prompts]
+    # Pass show_progress for MultiServerSamplingClient (ignored by other clients)
+    try:
+        results = client.sample_batch(model_inputs, sampling_params, num_samples=1, show_progress=show_progress)
+    except TypeError:
+        # Fallback for clients that don't support show_progress
+        results = client.sample_batch(model_inputs, sampling_params, num_samples=1)
+    
+    parsed_results = []
+    for result in results:
+        # Get tokens from the result for Harmony parsing
+        tokens = result.sequences[0].tokens
+        content, channel, analysis = parse_harmony_response(tokens, encoding)
+        # Postprocess: if stopped by </interact>, append it back
+        if "<interact>" in content and "</interact>" not in content:
+            content += "</interact>"
+        parsed_results.append((content, channel, analysis))
+    
+    return parsed_results
+
+
 def run_batched_rollouts(
     args,
     client,
-    tokenizer,
+    tokenizer_or_encoding,
     sampling_params,
     checkpoint_manager: Optional[CheckpointManager] = None,
+    use_harmony: bool = False,
 ) -> list[list[dict[str, Any]]]:
-    """Run batched rollouts across all problems and samples."""
+    """Run batched rollouts across all problems and samples.
+    
+    Args:
+        args: Command line arguments
+        client: Sampling client (tinker or vLLM)
+        tokenizer_or_encoding: HF tokenizer (standard) or HarmonyEncoding (GPT-OSS)
+        sampling_params: Sampling parameters
+        checkpoint_manager: Optional checkpoint manager for resuming
+        use_harmony: If True, use Harmony format for GPT-OSS models
+    """
     # Load dataset ONCE before creating environments
     print(f"Loading dataset {args.dataset}...")
     if args.dataset.startswith("bicycleman15/") or args.dataset.startswith("anirudhb11/intellect_"):
@@ -460,6 +706,18 @@ def run_batched_rollouts(
     if actual_num_problems < args.num_problems:
         print(f"Warning: Requested {args.num_problems} problems but only {actual_num_problems} available in slice.")
         args.num_problems = actual_num_problems
+    
+    # For Harmony, build the system and developer content once
+    if use_harmony:
+        harmony_system_content = (
+            SystemContent.new()
+            .with_reasoning_effort(ReasoningEffort[args.reasoning_effort.upper()])
+            .with_conversation_start_date(date.today().isoformat())
+        )
+        harmony_developer_content = (
+            DeveloperContent.new()
+            .with_instructions(DEVELOPER_INSTRUCTIONS)
+        )
     
     # Track generation round for checkpointing
     generation_round = 0
@@ -512,12 +770,30 @@ def run_batched_rollouts(
                     dataset=shared_dataset,  # Pass pre-loaded dataset
                 )
                 obs, info = env.reset()
+                
+                if use_harmony:
+                    # Harmony format: system content + developer content (instructions)
+                    history = [
+                        {"role": "system", "content": harmony_system_content},
+                        {"role": "developer", "content": harmony_developer_content},
+                    ]
+                    # For messages (user-facing record), we store a simplified version
+                    messages = [
+                        {"role": "system", "content": f"[Harmony format] Reasoning effort: {args.reasoning_effort}"},
+                        {"role": "developer", "content": DEVELOPER_INSTRUCTIONS},
+                        {"role": "user", "content": obs},
+                    ]
+                else:
+                    # Standard format: single system message with all instructions
+                    history = [{"role": "system", "content": SYSTEM_PROMPT}]
+                    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": obs}]
+                
                 state = RolloutState(
                     problem_index=problem_idx,
                     sample_index=sample_idx,
                     env=env,
-                    history=[{"role": "system", "content": SYSTEM_PROMPT}],
-                    messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": obs}],
+                    history=history,
+                    messages=messages,
                     obs=obs,
                 )
                 active_states.append(state)
@@ -554,19 +830,41 @@ def run_batched_rollouts(
             
             # Build prompts for all active states
             # On the last turn, FINAL_PROMPT is appended to force final code output
-            prompts = [build_prompt(s, tokenizer, args.max_turns) for s in active_states]
+            if use_harmony:
+                prompts = [build_prompt_harmony(s, tokenizer_or_encoding, args.max_turns) for s in active_states]
+            else:
+                prompts = [build_prompt(s, tokenizer_or_encoding, args.max_turns) for s in active_states]
             
             # Batch sample
-            if args.backend == "tinker":
+            if use_harmony:
+                # Harmony path: parse tokens with Harmony encoding
+                if args.backend == "tinker":
+                    harmony_results = asyncio.run(sample_batch_tinker_harmony(
+                        client, prompts, sampling_params, tokenizer_or_encoding
+                    ))
+                else:
+                    harmony_results = sample_batch_vllm_harmony(
+                        client, prompts, sampling_params, tokenizer_or_encoding, show_progress=args.vllm_multi_gpu
+                    )
+                # harmony_results is list of (content, channel, analysis)
+                responses = harmony_results  # Keep as tuples for now
+            elif args.backend == "tinker":
                 token_results = asyncio.run(sample_batch_tinker(client, prompts, sampling_params))
-                responses = [tokenizer.decode(tokens, skip_special_tokens=True) for tokens in token_results]
+                responses = [tokenizer_or_encoding.decode(tokens, skip_special_tokens=True) for tokens in token_results]
             else:
                 responses = sample_batch_vllm(client, prompts, sampling_params, show_progress=args.vllm_multi_gpu)
             
             # Process responses and step environments
             processed_responses = []
-            for state, response in zip(active_states, responses):
-                response = postprocess_response(response)
+            for i, state in enumerate(active_states):
+                if use_harmony:
+                    # Unpack Harmony result
+                    response, channel, analysis = responses[i]
+                else:
+                    response = responses[i]
+                    response = postprocess_response(response)
+                    channel = None
+                    analysis = None
                 
                 # On the last turn, include FINAL_PROMPT in history to reflect what was sent
                 is_last_turn = state.env.current_turn == args.max_turns - 1
@@ -581,8 +879,26 @@ def run_batched_rollouts(
                 
                 # Update history and messages
                 state.history.append({"role": "user", "content": obs_for_history})
-                state.history.append({"role": "assistant", "content": response})
-                state.messages.append({"role": "assistant", "content": response})
+                
+                if use_harmony:
+                    # For Harmony, track channel info in history
+                    # If we have both analysis and final, add both to history
+                    if analysis and channel == "final":
+                        state.history.append({"role": "assistant", "content": analysis, "channel": "analysis"})
+                    state.history.append({"role": "assistant", "content": response, "channel": channel})
+                    
+                    # For messages (user-facing record), include analysis as a note if present
+                    if analysis:
+                        state.messages.append({
+                            "role": "assistant", 
+                            "content": f"[Analysis (internal CoT)]\n{analysis}\n\n[Response (channel: {channel})]\n{response}"
+                        })
+                    else:
+                        state.messages.append({"role": "assistant", "content": response})
+                else:
+                    state.history.append({"role": "assistant", "content": response})
+                    state.messages.append({"role": "assistant", "content": response})
+                
                 processed_responses.append(response)
 
             # Save checkpoint BEFORE code execution (so we can retry if execution fails)
@@ -625,8 +941,9 @@ def run_batched_rollouts(
                 state.eval_timeout_count = info["eval_timeout_count"]
             
             # Truncate interaction output if over limit (guardrail against huge terminal output)
-            if obs and max_out_tokens is not None and max_out_tokens > 0:
-                obs = maybe_truncate_obs(obs, tokenizer, max_out_tokens)
+            # For Harmony models, skip truncation (tokenizer_or_encoding is not a HF tokenizer)
+            if obs and max_out_tokens is not None and max_out_tokens > 0 and not use_harmony:
+                obs = maybe_truncate_obs(obs, tokenizer_or_encoding, max_out_tokens)
             
             # Update interactions (truncation already applied to obs that goes into history)
             if state.env.history and len(state.env.history) > len(state.interactions):
@@ -679,6 +996,9 @@ def main(args):
     print(f"  Dataset: {args.dataset}")
     print(f"  Model: {args.model}")
     print(f"  Backend: {args.backend}")
+    if is_gpt_oss_model(args.model):
+        print(f"  Format: Harmony (GPT-OSS)")
+        print(f"  Reasoning effort: {args.reasoning_effort}")
     print(f"  Problem range: {args.start_problem} to {args.start_problem + args.num_problems - 1} ({args.num_problems} problems)")
     print(f"  Samples per problem: {args.num_samples}")
     print(f"  Max turns: {args.max_turns}")
@@ -709,11 +1029,28 @@ def main(args):
         }
     )
     
+    # Detect if we're using a GPT-OSS model that requires Harmony format
+    use_harmony = is_gpt_oss_model(args.model)
+    
+    if use_harmony:
+        print(f"\nDetected GPT-OSS model: {args.model}")
+        print(f"Using Harmony format with reasoning effort: {args.reasoning_effort}")
+        
+        # Load Harmony encoding instead of HuggingFace tokenizer
+        encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+        tokenizer_or_encoding = encoding
+        
+        # Create sampling params with Harmony stop tokens
+        sampling_params = create_sampling_params(args, args.backend, harmony_encoding=encoding)
+
+    else:
+        print(f"\nUsing standard model: {args.model}")
+        tokenizer_or_encoding = AutoTokenizer.from_pretrained(args.model)
+        sampling_params = create_sampling_params(args, args.backend)
+    
     # Initialize client based on backend
     print(f"\nInitializing {args.backend} client...")
     sampling_client = create_sampling_client(args)
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    sampling_params = create_sampling_params(args, args.backend)
     
     print(f"\nCollecting trajectories for {args.num_problems} problems (batched)...")
     
@@ -721,9 +1058,10 @@ def main(args):
     all_trajectories = run_batched_rollouts(
         args=args,
         client=sampling_client,
-        tokenizer=tokenizer,
+        tokenizer_or_encoding=tokenizer_or_encoding,
         sampling_params=sampling_params,
         checkpoint_manager=checkpoint_manager,
+        use_harmony=use_harmony,
     )
     
     # Flatten into rows (one per trajectory)
@@ -824,7 +1162,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="bicycleman15/intellect_3_code_easy_medium",
                         choices=["bicycleman15/intellect_3_code_easy_medium", "bicycleman15/intellect_3_code_hard",
                                  "bicycleman15/intellect_3_code_very_hard", "PrimeIntellect/INTELLECT-3-RL", 
-                                 "anirudhb11/lcb_v6_feb_may_2025_formatted", "anirudhb11/intellect_3_code_very_hard_top_400_hardest"])
+                                 "anirudhb11/lcb_v6_feb_may_2025_formatted", "anirudhb11/intellect_3_code_very_hard_top_400_hardest", "anirudhb11/qwen3_4b_instruct_top_400_hardest_interations_10_turns"])
     parser.add_argument("--start-problem", type=int, default=0,
                         help="Starting problem index for dataset slicing (default: 0)")
     parser.add_argument("--num-problems", type=int, default=20)
@@ -856,9 +1194,11 @@ if __name__ == "__main__":
     parser.add_argument("--vllm-server-startup-timeout-s", type=float, default=300.0,
                         help="Seconds to wait for vLLM servers to be ready.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
-                        help="GPU memory utilization for local vLLM or vLLM servers (default: 0.8)")
+                        help="GPU memory utilization for local vLLM or vLLM servers (default: 0.9)")
     parser.add_argument("--max-model-len", type=int, default=None,
-                        help="Max sequence length for vLLM; lower than model default to reduce KV cache (e.g. 16384 or 143104)")
+                        help="Max sequence length for vLLM; lower than model default to reduce KV cache (e.g. 16384 or 131072)")
+    parser.add_argument("--tensor-parallel-size", type=int, default=1,
+                        help="Number of GPUs for tensor parallelism (default: 1). Use >1 to shard large models across GPUs.")
     parser.add_argument("--fast-eval", action="store_true",
                         help="Use parallel fast eval for final answers")
     parser.add_argument("--eval-workers", type=int, default=16,
@@ -869,6 +1209,11 @@ if __name__ == "__main__":
                         help="Per-test timeout in seconds for fast evaluation (default: 5.0)")
     parser.add_argument("--max-interaction-output-tokens", type=int, default=4000,
                         help="Truncate terminal output in <output> to this many tokens (keep tail); prepend 'Output too long, showing only last X tokens' to avoid context overflow (default: 4000).")
+    
+    # Harmony/GPT-OSS options
+    parser.add_argument("--reasoning-effort", type=str, default="high",
+                        choices=["low", "medium", "high"],
+                        help="Reasoning effort for GPT-OSS models using Harmony format (default: high)")
     
     args = parser.parse_args()
     main(args)

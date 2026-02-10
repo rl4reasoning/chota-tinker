@@ -59,6 +59,7 @@ class SamplingClient:
             top_p=sampling_params.top_p,
             top_k=sampling_params.top_k if sampling_params.top_k > 0 else -1,
             stop=sampling_params.stop,
+            stop_token_ids=sampling_params.stop_token_ids,
             n=num_samples,
         )
 
@@ -103,6 +104,7 @@ class SamplingClient:
             top_p=sampling_params.top_p,
             top_k=sampling_params.top_k if sampling_params.top_k > 0 else -1,
             stop=sampling_params.stop,
+            stop_token_ids=sampling_params.stop_token_ids,
             n=num_samples,
         )
 
@@ -253,17 +255,17 @@ class ServerSamplingClient:
         num_samples: int = 1,
     ) -> SamplingResult:
         """Sample from the model via the server."""
-        data = self._post_json(
-            "/v1/completions",
-            {
-                "prompt": prompt.token_ids,
-                "max_tokens": sampling_params.max_tokens,
-                "temperature": sampling_params.temperature,
-                "top_p": sampling_params.top_p,
-                "n": num_samples,
-                "stop": sampling_params.stop,
-            },
-        )
+        request_data = {
+            "prompt": prompt.token_ids,
+            "max_tokens": sampling_params.max_tokens,
+            "temperature": sampling_params.temperature,
+            "top_p": sampling_params.top_p,
+            "n": num_samples,
+            "stop": sampling_params.stop,
+        }
+        if sampling_params.stop_token_ids:
+            request_data["stop_token_ids"] = sampling_params.stop_token_ids
+        data = self._post_json("/v1/completions", request_data)
 
         sequences = []
         for choice in data["choices"]:
@@ -285,17 +287,17 @@ class ServerSamplingClient:
     ) -> list[SamplingResult]:
         """Sample from the model for multiple prompts."""
         # vLLM server supports batch via list of prompts
-        data = self._post_json(
-            "/v1/completions",
-            {
-                "prompt": [p.token_ids for p in prompts],
-                "max_tokens": sampling_params.max_tokens,
-                "temperature": sampling_params.temperature,
-                "top_p": sampling_params.top_p,
-                "n": num_samples,
-                "stop": sampling_params.stop,
-            },
-        )
+        request_data = {
+            "prompt": [p.token_ids for p in prompts],
+            "max_tokens": sampling_params.max_tokens,
+            "temperature": sampling_params.temperature,
+            "top_p": sampling_params.top_p,
+            "n": num_samples,
+            "stop": sampling_params.stop,
+        }
+        if sampling_params.stop_token_ids:
+            request_data["stop_token_ids"] = sampling_params.stop_token_ids
+        data = self._post_json("/v1/completions", request_data)
 
         # Group choices by prompt index
         results = [[] for _ in prompts]

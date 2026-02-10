@@ -11,6 +11,7 @@ class SamplingParams:
     top_p: float = 1.0
     top_k: int = -1  # -1 means disabled
     stop: list[str] | None = None
+    stop_token_ids: list[int] | None = None  # Stop on these token IDs (e.g., Harmony stop tokens)
 
 
 @dataclass

@@ -227,3 +227,5 @@ checkpoints/
 *.pdf
 
 *.md
+
+logs/

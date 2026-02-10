@@ -745,8 +745,8 @@ if __name__ == "__main__":
                         help="Seconds to wait for vLLM servers to be ready.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
                         help="GPU memory utilization for local vLLM or vLLM servers (default: 0.9)")
-    parser.add_argument("--max-model-len", type=int, default=120000,
-                        help="Max sequence length for vLLM; lower than model default to reduce KV cache (default: 120000)")
+    parser.add_argument("--max-model-len", type=int, default=None,
+                        help="Max sequence length for vLLM; lower than model default to reduce KV cache (default: None)")
     
     # Eval options
     parser.add_argument("--fast-eval", action="store_true",
