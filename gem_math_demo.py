@@ -497,9 +497,11 @@ async def main():
         tokenizer_or_encoding = encoding
         
         # Get stop tokens from Harmony encoding
-        # For GPT-OSS: <|return|> (200002) and <|call|> (200012) are stop tokens
+        # Use stop_tokens_for_assistant_actions() which returns only <|return|> and <|call|>
+        # Do NOT use stop_tokens() which includes <|end|> - that marks the end of ONE message,
+        # but the model outputs multiple messages (analysis channel -> final channel)
         # We also need to stop on </interact> for our interaction format
-        harmony_stop_tokens = encoding.stop_tokens()
+        harmony_stop_tokens = encoding.stop_tokens_for_assistant_actions()
         # Convert to strings for the sampling params (we'll also add </interact>)
         stop_sequences = ["</interact>"]
         

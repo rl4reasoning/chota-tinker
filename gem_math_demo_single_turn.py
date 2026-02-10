@@ -360,7 +360,10 @@ async def main():
         tokenizer_or_encoding = encoding
         
         # Get stop tokens from Harmony encoding
-        harmony_stop_tokens = encoding.stop_tokens()
+        # Use stop_tokens_for_assistant_actions() which returns only <|return|> and <|call|>
+        # Do NOT use stop_tokens() which includes <|end|> - that marks the end of ONE message,
+        # but the model outputs multiple messages (analysis channel -> final channel)
+        harmony_stop_tokens = encoding.stop_tokens_for_assistant_actions()
         
         sampling_params = types.SamplingParams(
             max_tokens=args.max_tokens,

@@ -433,7 +433,10 @@ def create_sampling_params(args, backend: str, harmony_encoding=None):
     
     # For Harmony models, add Harmony stop tokens
     if harmony_encoding is not None:
-        stop_token_ids = harmony_encoding.stop_tokens()
+        # Use stop_tokens_for_assistant_actions() which returns only <|return|> and <|call|>
+        # Do NOT use stop_tokens() which includes <|end|> - that marks the end of ONE message,
+        # but the model outputs multiple messages (analysis channel -> final channel)
+        stop_token_ids = harmony_encoding.stop_tokens_for_assistant_actions()
     
     if backend == "tinker":
         params = tinker_types.SamplingParams(
