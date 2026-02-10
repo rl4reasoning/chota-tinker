@@ -19,21 +19,25 @@ DEFAULT_RETRY_STATUSES = {429, 500, 502, 503, 504}
 class SamplingClient:
     """Minimal sampling client wrapping vLLM with sleep/wake support."""
 
-    def __init__(self, model_name: str, **vllm_kwargs):
+    def __init__(self, model_name: str, llm: Optional[LLM] = None, **vllm_kwargs):
         """
         Initialize the sampling client.
 
         Args:
             model_name: HuggingFace model name or path
+            llm: Optional pre-created vLLM LLM instance. If provided, vllm_kwargs are ignored.
             **vllm_kwargs: Additional kwargs passed to vLLM LLM()
                 e.g. tensor_parallel_size, gpu_memory_utilization, etc.
         """
         self.model_name = model_name
-        # Enable prefix caching by default for multi-turn efficiency
-        vllm_kwargs.setdefault("enable_prefix_caching", True)
-        # Enable sleep mode for memory management during training
-        vllm_kwargs.setdefault("enable_sleep_mode", True)
-        self.llm = LLM(model=model_name, **vllm_kwargs)
+        if llm is not None:
+            self.llm = llm
+        else:
+            # Enable prefix caching by default for multi-turn efficiency
+            vllm_kwargs.setdefault("enable_prefix_caching", True)
+            # Enable sleep mode for memory management during training
+            vllm_kwargs.setdefault("enable_sleep_mode", True)
+            self.llm = LLM(model=model_name, **vllm_kwargs)
 
     def sample(
         self,

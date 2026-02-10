@@ -33,6 +33,18 @@ Multi-GPU (launches one vLLM server per GPU, shards prompts across them):
     --eval-timeout-s 1.0 \
     --push-to-hub bicycleman15/qwen3_4b_instruct_easy_medium_single_turn
 
+For GPT-OSS models (uses Harmony format):
+    python collect_trajectories_single_turn.py \
+    --dataset bicycleman15/intellect_3_code_very_hard \
+    --model openai/gpt-oss-120b \
+    --backend vllm \
+    --tensor-parallel-size 4 \
+    --num-problems 10 \
+    --num-samples 32 \
+    --reasoning-effort medium \
+    --fast-eval \
+    --push-to-hub anirudhb11/oss_120b_single_turn
+
 Resume from checkpoint (if previous run failed during evaluation):
     python collect_trajectories_single_turn.py \
         --resume-from checkpoints/20260117_143052 \
@@ -52,12 +64,26 @@ import argparse
 import asyncio
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date
 from typing import Any, Optional
 
 from datasets import Dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
+
+# Harmony utilities for GPT-OSS models
+from utils.harmony_utils import (
+    is_gpt_oss_model,
+    parse_harmony_response,
+    load_harmony_encoding,
+    HarmonyEncodingName,
+    HarmonyRole,
+    HarmonyMessage,
+    Conversation,
+    DeveloperContent,
+    SystemContent,
+    ReasoningEffort,
+)
 
 from checkpoint import CheckpointManager, get_checkpoint_dir
 from intellect_env import IntellectCodeEnv
@@ -232,6 +258,51 @@ COMMON PITFALLS TO AVOID
 - Forgetting to flush output when required
 """
 
+# For Harmony GPT-OSS models, use SYSTEM_PROMPT as DEVELOPER_INSTRUCTIONS
+DEVELOPER_INSTRUCTIONS = SYSTEM_PROMPT
+
+
+# =============================================================================
+# HARMONY FORMAT HELPERS (for GPT-OSS models)
+# =============================================================================
+
+def build_harmony_conversation(messages: list, encoding) -> Conversation:
+    """
+    Build a Harmony Conversation from messages list for single-turn.
+    
+    For single-turn:
+    - messages[0] is the system content (becomes Harmony SystemContent)
+    - messages[1] is the developer content (becomes Harmony DeveloperContent)
+    - messages[2] is the user content (the problem)
+    """
+    harmony_messages = []
+    
+    for entry in messages:
+        role = entry["role"]
+        content = entry["content"]
+        
+        if role == "system":
+            # This is the Harmony SystemContent
+            harmony_messages.append(HarmonyMessage.from_role_and_content(HarmonyRole.SYSTEM, content))
+        elif role == "developer":
+            # This is the Harmony DeveloperContent with our instructions
+            harmony_messages.append(HarmonyMessage.from_role_and_content(HarmonyRole.DEVELOPER, content))
+        elif role == "user":
+            harmony_messages.append(HarmonyMessage.from_role_and_content(HarmonyRole.USER, content))
+        elif role == "assistant":
+            channel = entry.get("channel", "final")
+            harmony_msg = HarmonyMessage.from_role_and_content(HarmonyRole.ASSISTANT, content)
+            harmony_msg = harmony_msg.with_channel(channel)
+            harmony_messages.append(harmony_msg)
+    
+    return Conversation.from_messages(harmony_messages)
+
+
+def build_prompt_harmony(messages: list, encoding) -> list[int]:
+    """Build tokenized prompt from messages using Harmony encoding (GPT-OSS path)."""
+    conversation = build_harmony_conversation(messages, encoding)
+    return encoding.render_conversation_for_completion(conversation, HarmonyRole.ASSISTANT)
+
 
 def create_sampling_client(args):
     """Create sampling client based on backend choice."""
@@ -258,22 +329,49 @@ def create_sampling_client(args):
         if args.vllm_server_url:
             return ServerSamplingClient(args.vllm_server_url)
         else:
+            # Support tensor parallelism for large models like GPT-OSS-120B
+            tensor_parallel_size = getattr(args, 'tensor_parallel_size', 1)
+            if tensor_parallel_size > 1:
+                # Import LLM directly to pass tensor_parallel_size
+                from vllm import LLM
+                llm = LLM(
+                    model=args.model,
+                    gpu_memory_utilization=args.gpu_memory_utilization,
+                    tensor_parallel_size=tensor_parallel_size,
+                )
+                return SamplingClient(args.model, llm=llm)
             return SamplingClient(args.model, gpu_memory_utilization=args.gpu_memory_utilization)
 
 
-def create_sampling_params(args, backend: str):
-    """Create sampling params for the chosen backend."""
+def create_sampling_params(args, backend: str, harmony_encoding=None):
+    """Create sampling params for the chosen backend.
+    
+    Args:
+        args: Command line arguments
+        backend: 'tinker' or 'vllm'
+        harmony_encoding: If using Harmony (GPT-OSS), pass the encoding to get stop tokens
+    """
+    stop_token_ids = None
+    
+    # For Harmony models, add Harmony stop tokens
+    if harmony_encoding is not None:
+        stop_token_ids = harmony_encoding.stop_tokens()
+    
     if backend == "tinker":
-        return tinker_types.SamplingParams(
+        params = tinker_types.SamplingParams(
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             top_p=0.95,
         )
+        if stop_token_ids:
+            params.stop_token_ids = stop_token_ids
+        return params
     else:
         return SamplingParams(
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             top_p=0.95,
+            stop_token_ids=stop_token_ids,
         )
 
 
@@ -309,6 +407,40 @@ def sample_batch_vllm(client, prompts: list[list[int]], sampling_params, show_pr
     return results
 
 
+async def sample_batch_tinker_harmony(client, prompts: list[list[int]], sampling_params, encoding) -> list[tuple[str, str, Optional[str]]]:
+    """Batch sample using tinker with Harmony parsing.
+    
+    Returns list of (response_content, channel, analysis_content) tuples.
+    """
+    token_results = await sample_batch_tinker(client, prompts, sampling_params, None)
+    parsed_results = []
+    for result in token_results:
+        tokens = result.sequences[0].tokens
+        content, channel, analysis = parse_harmony_response(tokens, encoding)
+        parsed_results.append((content, channel, analysis))
+    return parsed_results
+
+
+def sample_batch_vllm_harmony(client, prompts: list[list[int]], sampling_params, encoding, show_progress: bool = False) -> list[tuple[str, str, Optional[str]]]:
+    """Batch sample using vLLM with Harmony parsing.
+    
+    Returns list of (response_content, channel, analysis_content) tuples.
+    """
+    model_inputs = [ModelInput.from_ints(p) for p in prompts]
+    try:
+        results = client.sample_batch(model_inputs, sampling_params, num_samples=1, show_progress=show_progress)
+    except TypeError:
+        results = client.sample_batch(model_inputs, sampling_params, num_samples=1)
+    
+    parsed_results = []
+    for result in results:
+        # Get tokens from the result for Harmony parsing
+        tokens = result.sequences[0].tokens
+        content, channel, analysis = parse_harmony_response(tokens, encoding)
+        parsed_results.append((content, channel, analysis))
+    return parsed_results
+
+
 def _truncated_by_token_limit(finish_reason: str | None) -> bool:
     """True if generation stopped due to max token limit."""
     return (finish_reason or "").lower() in ("length", "length_capped")
@@ -322,27 +454,40 @@ class SingleTurnState:
     question: str
     tests: list
     max_tests: int
-    messages: list[dict]
+    messages: list[dict]  # For prompt building (may contain Harmony objects)
+    messages_for_record: list[dict] | None = None  # For JSON serialization (simplified for Harmony)
     response: str = ""
     finish_reason: str | None = None
 
 
 def serialize_single_turn_state(state: SingleTurnState) -> dict:
-    """Serialize a SingleTurnState to a dictionary for checkpointing."""
+    """Serialize a SingleTurnState to a dictionary for checkpointing.
+    
+    Note: For Harmony states, we serialize messages_for_record since the
+    actual messages contain non-serializable Harmony objects.
+    """
+    # Use messages_for_record for serialization if available (Harmony case)
+    serializable_messages = state.messages_for_record or state.messages
     return {
         "problem_index": state.problem_index,
         "sample_index": state.sample_index,
         "question": state.question,
         "tests": state.tests,
         "max_tests": state.max_tests,
-        "messages": [msg.copy() for msg in state.messages],
+        "messages": [msg.copy() for msg in serializable_messages],
+        "messages_for_record": [msg.copy() for msg in serializable_messages],
         "response": state.response,
         "finish_reason": state.finish_reason,
     }
 
 
 def deserialize_single_turn_state(data: dict) -> SingleTurnState:
-    """Deserialize a dictionary back to a SingleTurnState."""
+    """Deserialize a dictionary back to a SingleTurnState.
+    
+    Note: For resumed Harmony states, both messages and messages_for_record
+    will be the serializable version. This is fine since we've already
+    generated the response before checkpointing.
+    """
     return SingleTurnState(
         problem_index=data["problem_index"],
         sample_index=data["sample_index"],
@@ -350,6 +495,7 @@ def deserialize_single_turn_state(data: dict) -> SingleTurnState:
         tests=data["tests"],
         max_tests=data["max_tests"],
         messages=data["messages"],
+        messages_for_record=data.get("messages_for_record"),
         response=data["response"],
         finish_reason=data.get("finish_reason"),
     )
@@ -358,11 +504,21 @@ def deserialize_single_turn_state(data: dict) -> SingleTurnState:
 def run_batched_rollouts(
     args,
     client,
-    tokenizer,
+    tokenizer_or_encoding,
     sampling_params,
     checkpoint_manager: Optional[CheckpointManager] = None,
+    use_harmony: bool = False,
 ) -> list[list[dict[str, Any]]]:
-    """Run batched single-turn rollouts across all problems and samples."""
+    """Run batched single-turn rollouts across all problems and samples.
+    
+    Args:
+        args: Command line arguments
+        client: Sampling client (tinker or vLLM)
+        tokenizer_or_encoding: HF tokenizer (standard) or HarmonyEncoding (GPT-OSS)
+        sampling_params: Sampling parameters
+        checkpoint_manager: Optional checkpoint manager for resuming
+        use_harmony: If True, use Harmony format for GPT-OSS models
+    """
     # Load dataset ONCE before creating environments
     print(f"Loading dataset {args.dataset}...")
     if args.dataset.startswith("bicycleman15/") or args.dataset.startswith("anirudhb11/intellect_3"):
@@ -386,6 +542,20 @@ def run_batched_rollouts(
     if actual_num_problems < args.num_problems:
         print(f"Warning: Only {actual_num_problems} problems available from index {args.start_problem}")
         args.num_problems = actual_num_problems
+    
+    # For Harmony, build the system and developer content once
+    harmony_system_content = None
+    harmony_developer_content = None
+    if use_harmony:
+        harmony_system_content = (
+            SystemContent.new()
+            .with_reasoning_effort(ReasoningEffort[args.reasoning_effort.upper()])
+            .with_conversation_start_date(date.today().isoformat())
+        )
+        harmony_developer_content = (
+            DeveloperContent.new()
+            .with_instructions(DEVELOPER_INSTRUCTIONS)
+        )
     
     states: list[SingleTurnState] = []
     skip_generation = False
@@ -429,10 +599,28 @@ def run_batched_rollouts(
                 obs, info = env.reset()
                 env.has_interacted = True  # Single-turn mode
                 
-                messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": obs}
-                ]
+                if use_harmony:
+                    # Harmony format: system content + developer content (instructions) + user
+                    # We store two versions:
+                    # - messages: contains actual Harmony objects for prompt building
+                    # - messages_for_record: simplified version for JSON serialization
+                    messages = [
+                        {"role": "system", "content": harmony_system_content},
+                        {"role": "developer", "content": harmony_developer_content},
+                        {"role": "user", "content": obs},
+                    ]
+                    # Store serializable version in state for output
+                    messages_for_record = [
+                        {"role": "system", "content": f"[Harmony format] Reasoning effort: {args.reasoning_effort}"},
+                        {"role": "developer", "content": DEVELOPER_INSTRUCTIONS},
+                        {"role": "user", "content": obs},
+                    ]
+                else:
+                    messages = [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": obs}
+                    ]
+                    messages_for_record = messages
                 
                 state = SingleTurnState(
                     problem_index=problem_idx,
@@ -441,25 +629,44 @@ def run_batched_rollouts(
                     tests=env.tests,
                     max_tests=env.max_tests,
                     messages=messages,
+                    messages_for_record=messages_for_record,
                 )
                 states.append(state)
     
     # Generation phase (skip if resuming from checkpoint)
     if not skip_generation:
-        prompts = [build_prompt(state.messages, tokenizer) for state in states]
+        # Build prompts for all states
+        if use_harmony:
+            prompts = [build_prompt_harmony(state.messages, tokenizer_or_encoding) for state in states]
+        else:
+            prompts = [build_prompt(state.messages, tokenizer_or_encoding) for state in states]
         
         # Batch sample all responses at once
         print(f"Sampling {len(prompts)} responses...")
-        if args.backend == "tinker":
-            sampling_results = asyncio.run(sample_batch_tinker(client, prompts, sampling_params, tokenizer))
+        if use_harmony:
+            # Harmony path: parse tokens with Harmony encoding
+            if args.backend == "tinker":
+                harmony_results = asyncio.run(sample_batch_tinker_harmony(
+                    client, prompts, sampling_params, tokenizer_or_encoding
+                ))
+            else:
+                harmony_results = sample_batch_vllm_harmony(
+                    client, prompts, sampling_params, tokenizer_or_encoding, show_progress=args.vllm_multi_gpu
+                )
+            # Store response in states (harmony_results is list of (content, channel, analysis))
+            for state, (content, channel, analysis) in zip(states, harmony_results):
+                state.response = content
+                state.finish_reason = None  # Harmony doesn't expose finish_reason
         else:
-            sampling_results = sample_batch_vllm(client, prompts, sampling_params, show_progress=args.vllm_multi_gpu)
-
-        # Store response and finish_reason in states
-        for state, result in zip(states, sampling_results):
-            seq = result.sequences[0]
-            state.response = getattr(seq, "text", None) or tokenizer.decode(getattr(seq, "tokens", []), skip_special_tokens=True)
-            state.finish_reason = getattr(seq, "finish_reason", None)
+            if args.backend == "tinker":
+                sampling_results = asyncio.run(sample_batch_tinker(client, prompts, sampling_params, tokenizer_or_encoding))
+            else:
+                sampling_results = sample_batch_vllm(client, prompts, sampling_params, show_progress=args.vllm_multi_gpu)
+            # Store response and finish_reason in states
+            for state, result in zip(states, sampling_results):
+                seq = result.sequences[0]
+                state.response = getattr(seq, "text", None) or tokenizer_or_encoding.decode(getattr(seq, "tokens", []), skip_special_tokens=True)
+                state.finish_reason = getattr(seq, "finish_reason", None)
         
         # Save checkpoint BEFORE evaluation (so we can retry if evaluation fails)
         if checkpoint_manager:
@@ -496,12 +703,13 @@ def run_batched_rollouts(
         )
 
         for state, eval_result in zip(states, eval_results):
-            messages = state.messages.copy()
-            messages.append({"role": "assistant", "content": state.response})
+            # Use messages_for_record (serializable) if available, otherwise messages
+            output_messages = (state.messages_for_record or state.messages).copy()
+            output_messages.append({"role": "assistant", "content": state.response})
 
             traj = {
                 "question": state.question,
-                "messages": messages,
+                "messages": output_messages,
                 "final_reward": eval_result.reward,
                 "terminated": eval_result.terminated,
                 "truncated": eval_result.truncated,
@@ -526,12 +734,13 @@ def run_batched_rollouts(
             
             obs, reward, terminated, truncated, info = env.step(state.response)
             
-            messages = state.messages.copy()
-            messages.append({"role": "assistant", "content": state.response})
+            # Use messages_for_record (serializable) if available, otherwise messages
+            output_messages = (state.messages_for_record or state.messages).copy()
+            output_messages.append({"role": "assistant", "content": state.response})
 
             traj = {
                 "question": state.question,
-                "messages": messages,
+                "messages": output_messages,
                 "final_reward": reward,
                 "terminated": terminated,
                 "truncated": truncated,
@@ -550,6 +759,9 @@ def main(args):
     print(f"  Dataset: {args.dataset}")
     print(f"  Model: {args.model}")
     print(f"  Backend: {args.backend}")
+    if is_gpt_oss_model(args.model):
+        print(f"  Format: Harmony (GPT-OSS)")
+        print(f"  Reasoning effort: {args.reasoning_effort}")
     print(f"  Problem range: {args.start_problem} to {args.start_problem + args.num_problems - 1} ({args.num_problems} problems)")
     print(f"  Samples per problem: {args.num_samples}")
     print(f"  Output: {args.output_dir}")
@@ -578,11 +790,27 @@ def main(args):
         }
     )
     
+    # Detect if we're using a GPT-OSS model that requires Harmony format
+    use_harmony = is_gpt_oss_model(args.model)
+    
+    if use_harmony:
+        print(f"\nDetected GPT-OSS model: {args.model}")
+        print(f"Using Harmony format with reasoning effort: {args.reasoning_effort}")
+        
+        # Load Harmony encoding instead of HuggingFace tokenizer
+        encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+        tokenizer_or_encoding = encoding
+        
+        # Create sampling params with Harmony stop tokens
+        sampling_params = create_sampling_params(args, args.backend, harmony_encoding=encoding)
+    else:
+        # Standard path: load HuggingFace tokenizer
+        tokenizer_or_encoding = AutoTokenizer.from_pretrained(args.model)
+        sampling_params = create_sampling_params(args, args.backend)
+    
     # Initialize client based on backend
     print(f"\nInitializing {args.backend} client...")
     sampling_client = create_sampling_client(args)
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    sampling_params = create_sampling_params(args, args.backend)
     
     print(f"\nCollecting trajectories for {args.num_problems} problems (batched)...")
     
@@ -590,9 +818,10 @@ def main(args):
     all_trajectories = run_batched_rollouts(
         args=args,
         client=sampling_client,
-        tokenizer=tokenizer,
+        tokenizer_or_encoding=tokenizer_or_encoding,
         sampling_params=sampling_params,
         checkpoint_manager=checkpoint_manager,
+        use_harmony=use_harmony,
     )
     
     # Flatten into rows (one per trajectory)
@@ -731,6 +960,15 @@ if __name__ == "__main__":
                         help="Number of responses per evaluator task (default: 8)")
     parser.add_argument("--eval-timeout-s", type=float, default=5.0,
                         help="Per-test timeout in seconds for fast evaluation (default: 5.0)")
+    
+    # Harmony/GPT-OSS options
+    parser.add_argument("--reasoning-effort", type=str, default="high",
+                        choices=["low", "medium", "high"],
+                        help="Reasoning effort for GPT-OSS models using Harmony format (default: high)")
+    
+    # Tensor parallelism for large models
+    parser.add_argument("--tensor-parallel-size", type=int, default=1,
+                        help="Number of GPUs for tensor parallelism (for large models like GPT-OSS-120B). Default: 1")
     
     args = parser.parse_args()
     main(args)
