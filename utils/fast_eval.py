@@ -337,6 +337,11 @@ def _compare_func_result(exec_outputs, expected_str):
     return tmp_result
 
 def _run_solution_case():
+    # Previously we used "__main__" as the eval harness namespace, but this caused
+    # `if __name__ == "__main__":` blocks to execute during class extraction. Models may
+    # generate main blocks alongside Solution classes (especially gpt-oss), and these can crash
+    # when run with empty stdin. Using "__solution__" prevents the main block from running
+    # while still allowing the Solution class to be extracted.
     global_ns = {{"__name__": "__solution__"}}
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         exec(_code, global_ns)
