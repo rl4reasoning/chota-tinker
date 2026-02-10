@@ -24,6 +24,9 @@ dependencies = [
     
     # GEM environment for agentic LLMs
     "gem-llm",
+    "tinker",
+    "verifiers",
+    "openai-harmony",
 ]
 
 [project.optional-dependencies]
