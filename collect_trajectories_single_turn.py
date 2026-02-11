@@ -3,18 +3,20 @@
 Usage:
 
     python collect_trajectories_single_turn.py \
-    --dataset anirudhb11/intellect_3_code_very_hard_top_400_hardest \
-    --model Qwen/Qwen3-4B-Instruct-2507 \
+    --dataset anirudhb11/lcb_v6_feb_may_2025_formatted \
+    --model openai/gpt-oss-120b \
     --backend vllm \
     --start-problem 0 \
     --num-problems 2 \
     --num-samples 32 \
+    --max-tokens 8192 \
+    --gpu-memory-utilization 0.8 \
     \
     --fast-eval \
     --eval-workers 8 \
     --eval-batch-size 8 \
     --eval-timeout-s 5.0 \
-    --push-to-hub bicycleman15/prompt_v4_single_turn_0
+    --push-to-hub bicycleman15/temp
 
 Multi-GPU (launches one vLLM server per GPU, shards prompts across them):
     python collect_trajectories_single_turn.py \
@@ -135,12 +137,12 @@ def render_trajectory(messages: list[dict], question: str, reward: float, termin
     return "\n".join(lines)
 
 # prompt_v1 -- original prompt
-# SYSTEM_PROMPT = """You are a helpful coding assistant.
-# Solve the given programming problem and provide your solution.
+SYSTEM_PROMPT = """You are a helpful coding assistant.
+Solve the given programming problem and provide your solution.
 
-# First, think about the problem step by step.
-# Then, provide your final solution wrapped in ```python``` code blocks.
-# """
+First, think about the problem step by step.
+Then, provide your final solution wrapped in ```python``` code blocks.
+"""
 
 # prompt_v2
 # SYSTEM_PROMPT = """You are a helpful coding assistant.
@@ -220,43 +222,43 @@ def render_trajectory(messages: list[dict], question: str, reward: float, termin
 # """
 
 # prompt_v4
-SYSTEM_PROMPT = """You are an expert competitive programming assistant.
+# SYSTEM_PROMPT = """You are an expert competitive programming assistant.
 
-----------------------------
-PROBLEM-SOLVING APPROACH
-----------------------------
-1. UNDERSTAND: Carefully read and restate the problem in your own words.
-2. ANALYZE: Identify key constraints, edge cases, and the core algorithmic challenge.
-3. DESIGN: Choose an appropriate algorithm/data structure and justify your choice.
-4. VERIFY: Mentally trace through the provided examples step-by-step.
-5. IMPLEMENT: Write clean, correct, and efficient code.
+# ----------------------------
+# PROBLEM-SOLVING APPROACH
+# ----------------------------
+# 1. UNDERSTAND: Carefully read and restate the problem in your own words.
+# 2. ANALYZE: Identify key constraints, edge cases, and the core algorithmic challenge.
+# 3. DESIGN: Choose an appropriate algorithm/data structure and justify your choice.
+# 4. VERIFY: Mentally trace through the provided examples step-by-step.
+# 5. IMPLEMENT: Write clean, correct, and efficient code.
 
-----------------------------
-REASONING REQUIREMENTS
-----------------------------
-Before writing any code, you MUST:
-- Identify the input/output format precisely
-- State the time and space complexity constraints
-- Consider edge cases (empty input, single element, maximum values, etc.)
-- Walk through at least one example by hand to verify your understanding
+# ----------------------------
+# REASONING REQUIREMENTS
+# ----------------------------
+# Before writing any code, you MUST:
+# - Identify the input/output format precisely
+# - State the time and space complexity constraints
+# - Consider edge cases (empty input, single element, maximum values, etc.)
+# - Walk through at least one example by hand to verify your understanding
 
-----------------------------
-CODE REQUIREMENTS
-----------------------------
-- The solution MUST be inside a ```python``` code block
-- The code MUST handle all edge cases mentioned in the problem
-- Use appropriate data structures for the problem's constraints
+# ----------------------------
+# CODE REQUIREMENTS
+# ----------------------------
+# - The solution MUST be inside a ```python``` code block
+# - The code MUST handle all edge cases mentioned in the problem
+# - Use appropriate data structures for the problem's constraints
 
-----------------------------
-COMMON PITFALLS TO AVOID
-----------------------------
-- Off-by-one errors in loops and array indexing
-- Integer overflow (use appropriate types if needed)
-- Not handling edge cases (n=0, n=1, empty strings, etc.)
-- Inefficient algorithms that exceed time limits
-- Incorrect input parsing (watch for multiple test cases, line formats)
-- Forgetting to flush output when required
-"""
+# ----------------------------
+# COMMON PITFALLS TO AVOID
+# ----------------------------
+# - Off-by-one errors in loops and array indexing
+# - Integer overflow (use appropriate types if needed)
+# - Not handling edge cases (n=0, n=1, empty strings, etc.)
+# - Inefficient algorithms that exceed time limits
+# - Incorrect input parsing (watch for multiple test cases, line formats)
+# - Forgetting to flush output when required
+# """
 
 # For Harmony GPT-OSS models, use SYSTEM_PROMPT as DEVELOPER_INSTRUCTIONS
 DEVELOPER_INSTRUCTIONS = SYSTEM_PROMPT
@@ -965,9 +967,9 @@ if __name__ == "__main__":
                         help="Per-test timeout in seconds for fast evaluation (default: 5.0)")
     
     # Harmony/GPT-OSS options
-    parser.add_argument("--reasoning-effort", type=str, default="high",
+    parser.add_argument("--reasoning-effort", type=str, default="medium",
                         choices=["low", "medium", "high"],
-                        help="Reasoning effort for GPT-OSS models using Harmony format (default: high)")
+                        help="Reasoning effort for GPT-OSS models using Harmony format (default: medium)")
     
     # Tensor parallelism for large models
     parser.add_argument("--tensor-parallel-size", type=int, default=1,

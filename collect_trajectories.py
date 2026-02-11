@@ -2,15 +2,17 @@
 
 Usage:
     python collect_trajectories.py \
-    --dataset anirudhb11/intellect_3_code_very_hard_top_400_hardest \
-    --model Qwen/Qwen3-4B-Instruct-2507 \
+    --dataset anirudhb11/lcb_v6_feb_may_2025_formatted \
+    --model openai/gpt-oss-120b \
     --backend vllm \
+    --start-problem 0 \
     --num-problems 2 \
     --num-samples 8 \
-    --max-turns 3 \
+    --max-turns 10 \
+    --gpu-memory-utilization 0.8 \
     \
     --fast-eval \
-    --eval-workers 8 \
+    --eval-workers 16 \
     --eval-batch-size 8 \
     --eval-timeout-s 5.0 \
     --push-to-hub bicycleman15/temp
@@ -1181,9 +1183,9 @@ if __name__ == "__main__":
                         help="Truncate terminal output in <output> to this many tokens (keep tail); prepend 'Output too long, showing only last X tokens' to avoid context overflow (default: 4000).")
     
     # Harmony/GPT-OSS options
-    parser.add_argument("--reasoning-effort", type=str, default="high",
+    parser.add_argument("--reasoning-effort", type=str, default="medium",
                         choices=["low", "medium", "high"],
-                        help="Reasoning effort for GPT-OSS models using Harmony format (default: high)")
+                        help="Reasoning effort for GPT-OSS models using Harmony format (default: medium)")
     
     args = parser.parse_args()
     main(args)

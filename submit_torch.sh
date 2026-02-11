@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=restart
+#SBATCH --job-name=gpt_mt_5_65
 #SBATCH --open-mode=append
 #SBATCH --output=/scratch/jp7467/slurm_logs/%j_%x.out
 #SBATCH --error=/scratch/jp7467/slurm_logs/%j_%x.err
 #SBATCH --export=ALL
-#SBATCH --time=6:00:00
-#SBATCH --gres=gpu:h200:0
+#SBATCH --time=12:00:00
+#SBATCH --gres=gpu:h200:1
 #SBATCH --account=torch_pr_235_cds
 #SBATCH --mem=200G
 #SBATCH --cpus-per-task=16
@@ -18,6 +18,67 @@ source ~/.bashrc # so that we can read HF_AUTH_TOKEN :)
 
 conda activate
 conda activate ct
+
+python collect_trajectories.py \
+    --dataset anirudhb11/lcb_v6_feb_may_2025_formatted \
+    --model openai/gpt-oss-120b \
+    --backend vllm \
+    --start-problem 65 \
+    --num-problems 66 \
+    --num-samples 64 \
+    --max-turns 5 \
+    --gpu-memory-utilization 0.8 \
+    \
+    --fast-eval \
+    --eval-workers 16 \
+    --eval-batch-size 8 \
+    --eval-timeout-s 5.0 \
+    --push-to-hub bicycleman15/lcb_gpt_mt_5_65
+
+# python collect_trajectories_single_turn.py \
+# --dataset anirudhb11/lcb_v6_feb_may_2025_formatted \
+# --model openai/gpt-oss-120b \
+# --backend vllm \
+# --start-problem 0 \
+# --num-problems 65 \
+# --num-samples 170 \
+# --max-tokens 8192 \
+# --gpu-memory-utilization 0.8 \
+# \
+# --fast-eval \
+# --eval-workers 16 \
+# --eval-batch-size 8 \
+# --eval-timeout-s 5.0 \
+# --push-to-hub bicycleman15/lcb_gpt_st8k_0
+
+# python collect_trajectories.py \
+#     --dataset anirudhb11/lcb_v6_feb_may_2025_formatted \
+#     --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+#     --backend vllm \
+#     --start-problem 0 \
+#     --num-problems 65 \
+#     --num-samples 70 \
+#     --max-turns 5 \
+#     \
+#     --fast-eval \
+#     --eval-workers 16 \
+#     --eval-batch-size 8 \
+#     --eval-timeout-s 5.0 \
+#     --push-to-hub bicycleman15/lcb_30b_mt_5_0
+
+# python collect_trajectories_single_turn.py \
+#     --dataset anirudhb11/lcb_v6_feb_may_2025_formatted \
+#     --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+#     --backend vllm \
+#     --start-problem 65 \
+#     --num-problems 66 \
+#     --num-samples 350 \
+#     \
+#     --fast-eval \
+#     --eval-workers 16 \
+#     --eval-batch-size 8 \
+#     --eval-timeout-s 5.0 \
+#     --push-to-hub bicycleman15/lcb_30b_st_65
 
 # python collect_trajectories_single_turn.py \
 #     --dataset anirudhb11/intellect_3_code_very_hard_top_400_hardest \
@@ -34,11 +95,11 @@ conda activate ct
 #     --push-to-hub bicycleman15/prompt_v4_single_turn_top400dataset_150 \
 #     --resume-from checkpoints/20260208_175126_a78b2dfc
 
-python eval_checkpoint_single_turn.py checkpoints/20260208_175126_a78b2dfc \
-        --eval-workers 16 \
-        --eval-batch-size 8 \
-        --eval-timeout-s 5.0 \
-        --push-to-hub bicycleman15/prompt_v4_single_turn_top400dataset_150
+# python eval_checkpoint_single_turn.py checkpoints/20260208_175126_a78b2dfc \
+#         --eval-workers 16 \
+#         --eval-batch-size 8 \
+#         --eval-timeout-s 5.0 \
+#         --push-to-hub bicycleman15/prompt_v4_single_turn_top400dataset_150
 
 # checkpoints/20260208_172417_bee66f7a -- 0
 # checkpoints/20260208_172425_e76a5312 -- 50
