@@ -508,29 +508,59 @@ def postprocess_response(response: str) -> str:
 
 def truncate_interaction_output(
     output_text: str,
-    tokenizer,
+    tokenizer_or_encoding,
     max_tokens: int,
+    use_harmony: bool = False,
 ) -> str:
-    """If output_text has more than max_tokens tokens, keep only the last max_tokens and prepend a notice."""
+    """If output_text has more than max_tokens tokens, keep only the last max_tokens and prepend a notice.
+    
+    Args:
+        output_text: The text to potentially truncate
+        tokenizer_or_encoding: HF tokenizer (standard) or HarmonyEncoding (GPT-OSS)
+        max_tokens: Maximum tokens to keep (from the end)
+        use_harmony: If True, use HarmonyEncoding API; otherwise use HF tokenizer API
+    """
     if not output_text or max_tokens <= 0:
         return output_text
-    ids = tokenizer.encode(output_text, add_special_tokens=False)
+    
+    if use_harmony:
+        # HarmonyEncoding API: disallowed_special=() to encode special token strings as regular text
+        ids = tokenizer_or_encoding.encode(output_text, disallowed_special=())
+    else:
+        # HF tokenizer API
+        ids = tokenizer_or_encoding.encode(output_text, add_special_tokens=False)
+    
     if len(ids) <= max_tokens:
         return output_text
+    
     keep = ids[-max_tokens:]
-    tail_text = tokenizer.decode(keep, skip_special_tokens=False)
+    
+    if use_harmony:
+        # HarmonyEncoding decode
+        tail_text = tokenizer_or_encoding.decode(keep)
+    else:
+        # HF tokenizer decode
+        tail_text = tokenizer_or_encoding.decode(keep, skip_special_tokens=False)
+    
     return f"Output too long, showing only last {max_tokens} tokens.\n{tail_text}"
 
 
-def maybe_truncate_obs(obs: str, tokenizer, max_interaction_output_tokens: Optional[int]) -> str:
-    """If obs is <output>...</output> and body exceeds max_interaction_output_tokens, truncate to tail and prepend notice."""
+def maybe_truncate_obs(obs: str, tokenizer_or_encoding, max_interaction_output_tokens: Optional[int], use_harmony: bool = False) -> str:
+    """If obs is <output>...</output> and body exceeds max_interaction_output_tokens, truncate to tail and prepend notice.
+    
+    Args:
+        obs: The observation string (typically <output>...</output>)
+        tokenizer_or_encoding: HF tokenizer (standard) or HarmonyEncoding (GPT-OSS)
+        max_interaction_output_tokens: Maximum tokens to keep in the output body
+        use_harmony: If True, use HarmonyEncoding API; otherwise use HF tokenizer API
+    """
     if obs is None or not obs or max_interaction_output_tokens is None or max_interaction_output_tokens <= 0:
         return obs
     match = re.match(r"^<output>\n(.*)</output>\s*$", obs, re.DOTALL)
     if not match:
         return obs
     body = match.group(1)
-    truncated = truncate_interaction_output(body, tokenizer, max_interaction_output_tokens)
+    truncated = truncate_interaction_output(body, tokenizer_or_encoding, max_interaction_output_tokens, use_harmony=use_harmony)
     if truncated is body:
         return obs
     return f"<output>\n{truncated}</output>"
@@ -882,9 +912,8 @@ def run_batched_rollouts(
                 state.eval_timeout_count = info["eval_timeout_count"]
             
             # Truncate interaction output if over limit (guardrail against huge terminal output)
-            # For Harmony models, skip truncation (tokenizer_or_encoding is not a HF tokenizer)
-            if obs and max_out_tokens is not None and max_out_tokens > 0 and not use_harmony:
-                obs = maybe_truncate_obs(obs, tokenizer_or_encoding, max_out_tokens)
+            if obs and max_out_tokens is not None and max_out_tokens > 0:
+                obs = maybe_truncate_obs(obs, tokenizer_or_encoding, max_out_tokens, use_harmony=use_harmony)
             
             # Update interactions (truncation already applied to obs that goes into history)
             if state.env.history and len(state.env.history) > len(state.interactions):

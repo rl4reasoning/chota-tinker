@@ -229,3 +229,5 @@ checkpoints/
 *.md
 
 logs/
+
+analyze*
