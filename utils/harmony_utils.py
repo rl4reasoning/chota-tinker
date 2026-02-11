@@ -56,11 +56,21 @@ def parse_harmony_response(tokens: list, encoding) -> tuple[str, str, Optional[s
         - channel: The channel of the user_facing_content ('final', 'analysis', or 'commentary')  
         - analysis_content: The chain-of-thought content (if any), for logging purposes only
     """
-    parsed_messages = encoding.parse_messages_from_completion_tokens(
-        tokens, 
-        role=HarmonyRole.ASSISTANT,
-        strict=False  # Be tolerant of malformed headers
-    )
+    try:
+        parsed_messages = encoding.parse_messages_from_completion_tokens(
+            tokens, 
+            role=HarmonyRole.ASSISTANT,
+            strict=False  # Be tolerant of malformed headers
+        )
+    except Exception as e:
+        # Handle cases where the model output is completely unparseable
+        # (e.g., EOS before message header complete, truncated output)
+        print(f"Error parsing Harmony response: {e}")
+        try:
+            raw_text = encoding.decode(tokens)
+            return raw_text, "parse_error", None
+        except Exception:
+            return "", "parse_error", None
     
     # Collect content by channel
     analysis_content = None
