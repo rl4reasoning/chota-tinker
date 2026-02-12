@@ -7,10 +7,10 @@ Usage:
     --model openai/gpt-oss-120b \
     --backend vllm \
     --start-problem 0 \
-    --num-problems 2 \
+    --num-problems 10 \
     --num-samples 32 \
     --max-tokens 8192 \
-    --gpu-memory-utilization 0.8 \
+    --gpu-memory-utilization 0.75 \
     \
     --fast-eval \
     --eval-workers 8 \
@@ -90,6 +90,7 @@ from utils.harmony_utils import (
 from checkpoint import CheckpointManager, get_checkpoint_dir
 from intellect_env import IntellectCodeEnv
 from utils.fast_eval import EvalTask, evaluate_tasks
+from utils.gpu_keepalive import GPUKeepAlive
 from utils.pass_at_k import compute_pass_at_k
 from utils.vllm_multi_gpu import (
     resolve_vllm_gpu_ids,
@@ -686,74 +687,76 @@ def run_batched_rollouts(
         print(f"\n[Resuming] Skipping generation, going directly to evaluation...")
     
     # Evaluation phase
+    # Use GPUKeepAlive to prevent SLURM from killing job due to idle GPU during CPU-bound eval
     print(f"Evaluating {len(states)} responses...")
     all_trajectories: list[list[dict]] = [[] for _ in range(args.num_problems)]
 
-    if args.fast_eval:
-        eval_tasks = [
-            EvalTask(
-                response=state.response,
-                tests=state.tests,
-                max_tests=state.max_tests,
-                timeout_s=args.eval_timeout_s,
-                require_solution_class=True,
+    with GPUKeepAlive():
+        if args.fast_eval:
+            eval_tasks = [
+                EvalTask(
+                    response=state.response,
+                    tests=state.tests,
+                    max_tests=state.max_tests,
+                    timeout_s=args.eval_timeout_s,
+                    require_solution_class=True,
+                )
+                for state in states
+            ]
+            eval_results = evaluate_tasks(
+                eval_tasks,
+                max_workers=args.eval_workers,
+                batch_size=args.eval_batch_size,
+                show_progress=True,
             )
-            for state in states
-        ]
-        eval_results = evaluate_tasks(
-            eval_tasks,
-            max_workers=args.eval_workers,
-            batch_size=args.eval_batch_size,
-            show_progress=True,
-        )
 
-        for state, eval_result in zip(states, eval_results):
-            # Use messages_for_record (serializable) if available, otherwise messages
-            output_messages = (state.messages_for_record or state.messages).copy()
-            output_messages.append({"role": "assistant", "content": state.response})
+            for state, eval_result in zip(states, eval_results):
+                # Use messages_for_record (serializable) if available, otherwise messages
+                output_messages = (state.messages_for_record or state.messages).copy()
+                output_messages.append({"role": "assistant", "content": state.response})
 
-            traj = {
-                "question": state.question,
-                "messages": output_messages,
-                "final_reward": eval_result.reward,
-                "terminated": eval_result.terminated,
-                "truncated": eval_result.truncated,
-                "tests": state.tests,
-                "finish_reason": state.finish_reason,
-                "truncated_by_token_limit": _truncated_by_token_limit(state.finish_reason),
-            }
-            all_trajectories[state.problem_index].append(traj)
-    else:
-        # Sequential evaluation using IntellectCodeEnv
-        for state in tqdm(states, desc="Evaluating"):
-            env = IntellectCodeEnv(
-                system_prompt="",
-                dataset_name=args.dataset,
-                problem_index=state.problem_index,
-                max_turns=1,
-                dataset=shared_dataset,
-                interaction_mode=False,
-            )
-            env.reset()
-            env.has_interacted = True  # Single-turn mode
-            
-            obs, reward, terminated, truncated, info = env.step(state.response)
-            
-            # Use messages_for_record (serializable) if available, otherwise messages
-            output_messages = (state.messages_for_record or state.messages).copy()
-            output_messages.append({"role": "assistant", "content": state.response})
+                traj = {
+                    "question": state.question,
+                    "messages": output_messages,
+                    "final_reward": eval_result.reward,
+                    "terminated": eval_result.terminated,
+                    "truncated": eval_result.truncated,
+                    "tests": state.tests,
+                    "finish_reason": state.finish_reason,
+                    "truncated_by_token_limit": _truncated_by_token_limit(state.finish_reason),
+                }
+                all_trajectories[state.problem_index].append(traj)
+        else:
+            # Sequential evaluation using IntellectCodeEnv
+            for state in tqdm(states, desc="Evaluating"):
+                env = IntellectCodeEnv(
+                    system_prompt="",
+                    dataset_name=args.dataset,
+                    problem_index=state.problem_index,
+                    max_turns=1,
+                    dataset=shared_dataset,
+                    interaction_mode=False,
+                )
+                env.reset()
+                env.has_interacted = True  # Single-turn mode
+                
+                obs, reward, terminated, truncated, info = env.step(state.response)
+                
+                # Use messages_for_record (serializable) if available, otherwise messages
+                output_messages = (state.messages_for_record or state.messages).copy()
+                output_messages.append({"role": "assistant", "content": state.response})
 
-            traj = {
-                "question": state.question,
-                "messages": output_messages,
-                "final_reward": reward,
-                "terminated": terminated,
-                "truncated": truncated,
-                "tests": state.tests,
-                "finish_reason": state.finish_reason,
-                "truncated_by_token_limit": _truncated_by_token_limit(state.finish_reason),
-            }
-            all_trajectories[state.problem_index].append(traj)
+                traj = {
+                    "question": state.question,
+                    "messages": output_messages,
+                    "final_reward": reward,
+                    "terminated": terminated,
+                    "truncated": truncated,
+                    "tests": state.tests,
+                    "finish_reason": state.finish_reason,
+                    "truncated_by_token_limit": _truncated_by_token_limit(state.finish_reason),
+                }
+                all_trajectories[state.problem_index].append(traj)
 
     return all_trajectories
 

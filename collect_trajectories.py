@@ -7,9 +7,9 @@ Usage:
     --backend vllm \
     --start-problem 0 \
     --num-problems 2 \
-    --num-samples 8 \
-    --max-turns 10 \
-    --gpu-memory-utilization 0.8 \
+    --num-samples 4 \
+    --max-turns 2 \
+    --gpu-memory-utilization 0.75 \
     \
     --fast-eval \
     --eval-workers 16 \
@@ -90,6 +90,7 @@ from utils.harmony_utils import (
 
 from checkpoint import CheckpointManager, get_checkpoint_dir
 from intellect_env import IntellectCodeEnv, step_batch
+from utils.gpu_keepalive import GPUKeepAlive
 from utils.pass_at_k import compute_pass_at_k
 from utils.vllm_multi_gpu import (
     resolve_vllm_gpu_ids,
@@ -885,17 +886,19 @@ def run_batched_rollouts(
 
         still_active = []
 
-        if args.fast_eval:
-            step_results = step_batch(
-                [s.env for s in active_states],
-                processed_responses,
-                eval_workers=args.eval_workers,
-                eval_batch_size=args.eval_batch_size,
-                eval_timeout_s=args.eval_timeout_s,
-                show_progress=True,
-            )
-        else:
-            step_results = [s.env.step(r) for s, r in zip(active_states, processed_responses)]
+        # Use GPUKeepAlive during code execution/evaluation to prevent SLURM idle GPU termination
+        with GPUKeepAlive():
+            if args.fast_eval:
+                step_results = step_batch(
+                    [s.env for s in active_states],
+                    processed_responses,
+                    eval_workers=args.eval_workers,
+                    eval_batch_size=args.eval_batch_size,
+                    eval_timeout_s=args.eval_timeout_s,
+                    show_progress=True,
+                )
+            else:
+                step_results = [s.env.step(r) for s, r in zip(active_states, processed_responses)]
 
         max_out_tokens = getattr(args, "max_interaction_output_tokens", None)
         for state, _response, (obs, reward, terminated, truncated, info) in zip(
