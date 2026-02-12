@@ -7,7 +7,7 @@ Usage:
     python gem_math_demo.py --model Qwen/Qwen3-4B-Instruct-2507 --difficulty very_hard --problem_index 32 --fast-eval --eval-timeout-s 5.0 --max_tokens 4096 --max_steps 3
 
     # For GPT-OSS models (uses Harmony format):
-    python gem_math_demo.py --model openai/gpt-oss-120b --difficulty very_hard --problem_index 32 --fast-eval --eval-timeout-s 5.0 --max_tokens 4096 --max_steps 3 --reasoning-effort medium
+    python gem_math_demo.py --model openai/gpt-oss-120b --difficulty very_hard --problem_index 10 --fast-eval --eval-timeout-s 5.0 --max_tokens 4096 --max_steps 10 --reasoning-effort medium
 
 possible models:
 deepseek-ai/DeepSeek-V3.1
@@ -391,8 +391,8 @@ async def run_episode(env, tokenizer_or_encoding, client, sampling_params, max_s
             
             # Log the chain-of-thought if present (for debugging, not user-facing)
             if analysis:
-                print(f"[assistant] (channel: analysis) [INTERNAL COT - not shown to user]")
-                print(f"{analysis[:500]}{'...' if len(analysis) > 500 else ''}\n")
+                print(f"[assistant] (channel: analysis) [Internal CoT - not shown to user]")
+                print(f"{analysis}\n")
             
             print(f"[assistant] (channel: {channel})\n{action}\n")
             
