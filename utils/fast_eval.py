@@ -440,6 +440,12 @@ def _parse_harness_output(stdout: str) -> tuple[float, int, tuple[int, ...]]:
         return 0.0, 0, ()
     try:
         payload = json.loads(stdout.strip().splitlines()[-1])
+        # json.loads can parse non-dict JSON literals (e.g. floats, strings, lists).
+        # If the model generated code prints a number as the last line before the harness outputs
+        # its JSON result, we may parse that instead of the expected dict, causing
+        # AttributeError when calling .get(). Guard against that here.
+        if not isinstance(payload, dict):
+            return 0.0, 0, ()
         total = int(payload.get("total", 0))
         timeout_count = int(payload.get("timeouts", 0) or 0)
         raw_indices = payload.get("timeout_indices") or []
