@@ -273,6 +273,16 @@ def create_sampling_client(args):
         if args.vllm_server_url:
             return ServerSamplingClient(args.vllm_server_url)
         else:
+            tensor_parallel_size = getattr(args, 'tensor_parallel_size', 1)
+            if tensor_parallel_size > 1:
+                from vllm import LLM
+                llm = LLM(
+                    model=args.model,
+                    gpu_memory_utilization=args.gpu_memory_utilization,
+                    max_model_len=args.max_model_len,
+                    tensor_parallel_size=tensor_parallel_size,
+                )
+                return SamplingClient(args.model, llm=llm)
             return SamplingClient(
                 args.model,
                 gpu_memory_utilization=args.gpu_memory_utilization,
@@ -875,6 +885,8 @@ if __name__ == "__main__":
     # Backend options
     parser.add_argument("--backend", type=str, default="vllm", choices=["tinker", "vllm"],
                         help="Inference backend: 'tinker' or 'vllm' (default: vllm)")
+    parser.add_argument("--tensor-parallel-size", type=int, default=1,
+                        help="Number of GPUs for tensor parallelism (default: 1)")
     parser.add_argument("--vllm-server-url", type=str, default=None,
                         help="URL for vLLM server (e.g. http://localhost:8000). If not set, uses local vLLM.")
     parser.add_argument("--vllm-multi-gpu", action="store_true",

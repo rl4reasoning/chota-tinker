@@ -309,6 +309,16 @@ def create_sampling_client(args):
         if args.vllm_server_url:
             return ServerSamplingClient(args.vllm_server_url)
         else:
+            tensor_parallel_size = getattr(args, 'tensor_parallel_size', 1)
+            if tensor_parallel_size > 1:
+                from vllm import LLM
+                llm = LLM(
+                    model=args.model,
+                    gpu_memory_utilization=args.gpu_memory_utilization,
+                    max_model_len=args.max_model_len,
+                    tensor_parallel_size=tensor_parallel_size,
+                )
+                return SamplingClient(args.model, llm=llm)
             return SamplingClient(
                 args.model,
                 gpu_memory_utilization=args.gpu_memory_utilization,
@@ -367,15 +377,17 @@ def run_batched_rollouts_with_budget_forcing(
     checkpoint_manager: Optional[CheckpointManager] = None,
 ) -> list[list[dict[str, Any]]]:
     """Run batched single-turn rollouts with budget forcing."""
-    # Load dataset ONCE before creating environments
-    print(f"Loading dataset {args.dataset}...")
-    if args.dataset.startswith("bicycleman15/"):
+    print(f"Loading dataset for evaluation...")
+    if args.dataset.startswith("bicycleman15/") or args.dataset.startswith("anirudhb11/intellect_"):
         from datasets import load_dataset
         full_dataset = load_dataset(args.dataset, split="train")
+    elif "lcb" in args.dataset:
+        from datasets import load_dataset
+        full_dataset = load_dataset(args.dataset, split="test")
     else:
         from datasets import load_dataset
         full_dataset = load_dataset(args.dataset, "code", split="train")
-    
+
     # Select slice based on start_problem and num_problems
     end_problem = min(args.start_problem + args.num_problems, len(full_dataset))
     shared_dataset = full_dataset.select(range(args.start_problem, end_problem))
@@ -736,6 +748,8 @@ if __name__ == "__main__":
     # Backend options
     parser.add_argument("--backend", type=str, default="vllm", choices=["tinker", "vllm"],
                         help="Inference backend: 'tinker' or 'vllm' (default: vllm)")
+    parser.add_argument("--tensor-parallel-size", type=int, default=1,
+                        help="Number of GPUs for tensor parallelism (default: 1)")
     parser.add_argument("--vllm-server-url", type=str, default=None,
                         help="URL for vLLM server (e.g. http://localhost:8000). If not set, uses local vLLM.")
     parser.add_argument("--vllm-multi-gpu", action="store_true",
