@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=gpt_mt_5_65
+#SBATCH --job-name=i3_gpt_mt_5_300
 #SBATCH --open-mode=append
 #SBATCH --output=/scratch/jp7467/slurm_logs/%j_%x.out
 #SBATCH --error=/scratch/jp7467/slurm_logs/%j_%x.err
@@ -7,8 +7,8 @@
 #SBATCH --time=12:00:00
 #SBATCH --gres=gpu:h200:1
 #SBATCH --account=torch_pr_235_cds
-#SBATCH --mem=200G
-#SBATCH --cpus-per-task=16
+#SBATCH --mem=400G
+#SBATCH --cpus-per-task=8
 
 START_TIME=$(date +%s)
 echo "Job started at: $(date)"
@@ -20,37 +20,87 @@ conda activate
 conda activate ct
 
 python collect_trajectories.py \
-    --dataset anirudhb11/lcb_v6_feb_may_2025_formatted \
+    --dataset anirudhb11/intellect_3_code_very_hard_top_400_hardest \
     --model openai/gpt-oss-120b \
     --backend vllm \
-    --start-problem 65 \
-    --num-problems 66 \
+    --start-problem 300 \
+    --num-problems 100 \
     --num-samples 64 \
     --max-turns 5 \
-    --gpu-memory-utilization 0.8 \
+    --gpu-memory-utilization 0.7 \
     \
     --fast-eval \
-    --eval-workers 16 \
+    --eval-workers 8 \
     --eval-batch-size 8 \
     --eval-timeout-s 5.0 \
-    --push-to-hub bicycleman15/lcb_gpt_mt_5_65
+    --push-to-hub bicycleman15/i3_gpt_mt_5_300
 
 # python collect_trajectories_single_turn.py \
 # --dataset anirudhb11/lcb_v6_feb_may_2025_formatted \
 # --model openai/gpt-oss-120b \
 # --backend vllm \
-# --start-problem 0 \
-# --num-problems 65 \
-# --num-samples 170 \
-# --max-tokens 8192 \
-# --gpu-memory-utilization 0.8 \
+# --start-problem 65 \
+# --num-problems 66 \
+# --num-samples 80 \
+# --max-tokens 16384 \
+# --gpu-memory-utilization 0.7 \
 # \
 # --fast-eval \
-# --eval-workers 16 \
+# --eval-workers 8 \
 # --eval-batch-size 8 \
 # --eval-timeout-s 5.0 \
-# --push-to-hub bicycleman15/lcb_gpt_st8k_0
+# --push-to-hub bicycleman15/lcb_gpt_st16k_65
 
+# gpt-oss st after fix !!!
+# python eval_checkpoint_single_turn.py \
+#     checkpoints/20260211_150212_bac4e507 \
+#     --eval-workers 16 \
+#     --eval-batch-size 8 \
+#     --eval-timeout-s 5.0 \
+#     --push-to-hub bicycleman15/lcb_gpt_st8k_0
+
+# single-turn 30b 0
+# python eval_checkpoint_single_turn.py \
+#     checkpoints/20260211_135945_e066b0ec \
+#     --eval-workers 8 \
+#     --eval-batch-size 8 \
+#     --eval-timeout-s 5.0 \
+#     --push-to-hub bicycleman15/30b_lcb_st_0
+
+# single-turn 30b 65
+# python eval_checkpoint_single_turn.py \
+#     checkpoints/20260211_140030_fbc52a0b \
+#     --eval-workers 8 \
+#     --eval-batch-size 8 \
+#     --eval-timeout-s 5.0 \
+#     --push-to-hub bicycleman15/30b_lcb_st_65
+
+# multi-turn 30b 10turns 0
+# python eval_checkpoint_single_turn.py \
+#     checkpoints/20260211_140030_fbc52a0b \
+#     --eval-workers 16 \
+#     --eval-batch-size 8 \
+#     --eval-timeout-s 5.0 \
+#     --push-to-hub bicycleman15/30b_lcb_st_65
+
+
+# python collect_trajectories.py \
+#     --dataset anirudhb11/lcb_v6_feb_may_2025_formatted \
+#     --model openai/gpt-oss-120b \
+#     --backend vllm \
+#     --start-problem 0 \
+#     --num-problems 65 \
+#     --num-samples 32 \
+#     --max-turns 10 \
+#     --gpu-memory-utilization 0.7 \
+#     \
+#     --fast-eval \
+#     --eval-workers 8 \
+#     --eval-batch-size 8 \
+#     --eval-timeout-s 5.0 \
+#     --push-to-hub bicycleman15/lcb_gpt_mt_10_0
+
+# 30b mt 5 turns 0
 # python collect_trajectories.py \
 #     --dataset anirudhb11/lcb_v6_feb_may_2025_formatted \
 #     --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
@@ -64,7 +114,8 @@ python collect_trajectories.py \
 #     --eval-workers 16 \
 #     --eval-batch-size 8 \
 #     --eval-timeout-s 5.0 \
-#     --push-to-hub bicycleman15/lcb_30b_mt_5_0
+#     --push-to-hub bicycleman15/lcb_30b_mt_5_0 \
+#     --resume-from checkpoints/20260211_141225_966a06d4
 
 # python collect_trajectories_single_turn.py \
 #     --dataset anirudhb11/lcb_v6_feb_may_2025_formatted \
