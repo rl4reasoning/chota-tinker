@@ -679,9 +679,12 @@ def main(args):
     
     # Load dataset for evaluation
     print(f"Loading dataset for evaluation...")
-    if args.dataset.startswith("bicycleman15/"):
+    if args.dataset.startswith("bicycleman15/") or args.dataset.startswith("anirudhb11/intellect_"):
         from datasets import load_dataset
         full_dataset = load_dataset(args.dataset, split="train")
+    elif "lcb" in args.dataset:
+        from datasets import load_dataset
+        full_dataset = load_dataset(args.dataset, split="test")
     else:
         from datasets import load_dataset
         full_dataset = load_dataset(args.dataset, "code", split="train")
