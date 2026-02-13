@@ -19,7 +19,7 @@ source ~/.bashrc # so that we can read HF_AUTH_TOKEN :)
 conda activate
 conda activate ct
 
-python collect_trajectories.py \
+VLLM_MXFP4_USE_MARLIN=1 python collect_trajectories.py \
     --dataset anirudhb11/intellect_3_code_very_hard_top_400_hardest \
     --model openai/gpt-oss-120b \
     --backend vllm \
@@ -27,7 +27,7 @@ python collect_trajectories.py \
     --num-problems 100 \
     --num-samples 64 \
     --max-turns 5 \
-    --gpu-memory-utilization 0.7 \
+    --gpu-memory-utilization 0.9 \
     \
     --fast-eval \
     --eval-workers 8 \
@@ -35,7 +35,9 @@ python collect_trajectories.py \
     --eval-timeout-s 5.0 \
     --push-to-hub bicycleman15/i3_gpt_mt_5_300
 
-# python collect_trajectories_single_turn.py \
+        # --max-model-len 85000 \
+
+# VLLM_MXFP4_USE_MARLIN=1 python collect_trajectories_single_turn.py \
 # --dataset anirudhb11/lcb_v6_feb_may_2025_formatted \
 # --model openai/gpt-oss-120b \
 # --backend vllm \
@@ -43,7 +45,7 @@ python collect_trajectories.py \
 # --num-problems 66 \
 # --num-samples 80 \
 # --max-tokens 16384 \
-# --gpu-memory-utilization 0.7 \
+# --gpu-memory-utilization 0.9 \
 # \
 # --fast-eval \
 # --eval-workers 8 \
