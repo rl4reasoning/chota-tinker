@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=i3_gpt_mt_5_300
+#SBATCH --job-name=test
 #SBATCH --open-mode=append
 #SBATCH --output=/scratch/jp7467/slurm_logs/%j_%x.out
 #SBATCH --error=/scratch/jp7467/slurm_logs/%j_%x.err
@@ -20,38 +20,40 @@ conda activate
 conda activate ct
 
 VLLM_MXFP4_USE_MARLIN=1 python collect_trajectories.py \
-    --dataset anirudhb11/intellect_3_code_very_hard_top_400_hardest \
+    --dataset anirudhb11/lcb_v6_feb_may_2025_formatted_hardest_to_easiest \
     --model openai/gpt-oss-120b \
     --backend vllm \
-    --start-problem 300 \
-    --num-problems 100 \
-    --num-samples 64 \
-    --max-turns 5 \
+    --start-problem 0 \
+    --num-problems 20 \
+    --num-samples 8 \
+    --max-turns 20 \
+    --max-tokens 16384 \
     --gpu-memory-utilization 0.9 \
     \
     --fast-eval \
     --eval-workers 8 \
     --eval-batch-size 8 \
     --eval-timeout-s 5.0 \
-    --push-to-hub bicycleman15/i3_gpt_mt_5_300
+    --interact-timeout-s 10.0 \
+    --push-to-hub bicycleman15/gpt_mt_8x16kx20
 
         # --max-model-len 85000 \
 
 # VLLM_MXFP4_USE_MARLIN=1 python collect_trajectories_single_turn.py \
-# --dataset anirudhb11/lcb_v6_feb_may_2025_formatted \
+# --dataset anirudhb11/lcb_v6_feb_may_2025_formatted_hardest_to_easiest \
 # --model openai/gpt-oss-120b \
 # --backend vllm \
-# --start-problem 65 \
-# --num-problems 66 \
-# --num-samples 80 \
-# --max-tokens 16384 \
+# --start-problem 0 \
+# --num-problems 20 \
+# --num-samples 320 \
+# --max-tokens 4096 \
 # --gpu-memory-utilization 0.9 \
 # \
 # --fast-eval \
 # --eval-workers 8 \
 # --eval-batch-size 8 \
 # --eval-timeout-s 5.0 \
-# --push-to-hub bicycleman15/lcb_gpt_st16k_65
+# --push-to-hub bicycleman15/test_gpt_4k
 
 # gpt-oss st after fix !!!
 # python eval_checkpoint_single_turn.py \

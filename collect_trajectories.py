@@ -14,7 +14,8 @@ Usage:
     --fast-eval \
     --eval-workers 16 \
     --eval-batch-size 8 \
-    --eval-timeout-s 5.0 \
+    --eval-timeout-s 1.0 \
+    --interact-timeout-s 5.0 \
     --push-to-hub bicycleman15/temp
 
 Multi-GPU (launches one vLLM server per GPU, shards prompts across them):
@@ -32,6 +33,7 @@ Multi-GPU (launches one vLLM server per GPU, shards prompts across them):
     --eval-workers 8 \
     --eval-batch-size 8 \
     --eval-timeout-s 1.0 \
+    --interact-timeout-s 5.0 \
     --push-to-hub bicycleman15/temp
 
 For GPT-OSS models (uses Harmony format):
@@ -927,6 +929,7 @@ def run_batched_rollouts(
                     eval_batch_size=args.eval_batch_size,
                     eval_timeout_s=args.eval_timeout_s,
                     show_progress=True,
+                    interact_timeout_s=args.interact_timeout_s,
                 )
             else:
                 step_results = [s.env.step(r) for s, r in zip(active_states, processed_responses)]
@@ -1224,7 +1227,9 @@ if __name__ == "__main__":
     parser.add_argument("--eval-batch-size", type=int, default=8,
                         help="Number of responses per evaluator task (default: 8)")
     parser.add_argument("--eval-timeout-s", type=float, default=1.0,
-                        help="Per-test timeout in seconds for fast evaluation (default: 5.0)")
+                        help="Per-test timeout in seconds for final answer evaluation (default: 1.0)")
+    parser.add_argument("--interact-timeout-s", type=float, default=5.0,
+                        help="Timeout in seconds for <interact> code execution during turns (default: 5.0)")
     parser.add_argument("--max-interaction-output-tokens", type=int, default=4000,
                         help="Truncate terminal output in <output> to this many tokens (keep tail); prepend 'Output too long, showing only last X tokens' to avoid context overflow (default: 4000).")
     

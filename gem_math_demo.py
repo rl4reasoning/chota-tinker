@@ -4,10 +4,17 @@ Code environment demo using GEM with LLM agent.
 Uses tinker API for sampling.
 
 Usage:
-    python gem_math_demo.py --model Qwen/Qwen3-4B-Instruct-2507 --difficulty very_hard --problem_index 32 --fast-eval --eval-timeout-s 5.0 --max_tokens 4096 --max_steps 3
+    # Batch mode (default)
+    python gem_math_demo.py --model Qwen/Qwen3-4B-Instruct-2507 --difficulty very_hard --problem_index 32 --fast-eval --eval-timeout-s 1.0 --interact-timeout-s 5.0 --max_tokens 4096 --max_steps 3
 
-    # For GPT-OSS models (uses Harmony format):
-    python gem_math_demo.py --model openai/gpt-oss-120b --difficulty very_hard --problem_index 10 --fast-eval --eval-timeout-s 5.0 --max_tokens 4096 --max_steps 10 --reasoning-effort medium
+    # Streaming mode (requires checkpoint)
+    python gem_math_demo.py --model Qwen/Qwen3-4B-Instruct-2507 --difficulty very_hard --problem_index 32 --fast-eval --max_tokens 4096 --max_steps 3 --stream
+
+    # For GPT-OSS models (uses Harmony format, streaming not supported):
+    python gem_math_demo.py --model openai/gpt-oss-120b --difficulty very_hard --problem_index 10 --fast-eval --eval-timeout-s 5.0 --interact-timeout-s 10.0 --max_tokens 8192 --max_steps 15 --reasoning-effort medium
+
+For streaming, first create a checkpoint (one-time per model):
+    python create_checkpoint.py --model Qwen/Qwen3-4B-Instruct-2507
 
 possible models:
 deepseek-ai/DeepSeek-V3.1
@@ -15,6 +22,7 @@ Qwen/Qwen3-235B-A22B-Instruct-2507
 Qwen/Qwen3-30B-A3B-Instruct-2507
 Qwen/Qwen3-4B-Instruct-2507
 openai/gpt-oss-120b (uses Harmony format)
+openai/gpt-oss-20b (uses Harmony format)
 """
 
 import os
@@ -22,13 +30,16 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import argparse
 import asyncio
+import sys
 from datetime import date
 from typing import Optional
 
 import tinker
 from tinker import types
+from openai import OpenAI
 from transformers import AutoTokenizer
 from intellect_env import IntellectCodeEnv, step_batch
+from create_checkpoint import get_checkpoint
 
 # Harmony library for GPT-OSS models
 from openai_harmony import (
@@ -304,7 +315,7 @@ async def get_llm_action_harmony(obs: str, history: list, encoding, client, samp
     return response_content, channel, analysis_content
 
 
-async def get_llm_action(obs: str, history: list, tokenizer, client, sampling_params) -> str:
+async def get_llm_action(obs: str, history: list, tokenizer, client, sampling_params, stream: bool = False, model: str = None, oai_client: OpenAI = None) -> str:
     """Get LLM action using standard chat template (non-Harmony models)."""
     messages = history + [{"role": "user", "content": obs}]
     prompt_text = tokenizer.apply_chat_template(
@@ -312,12 +323,31 @@ async def get_llm_action(obs: str, history: list, tokenizer, client, sampling_pa
     )
     
     input_ids = tokenizer(prompt_text)["input_ids"]
-    result = await client.sample_async(
-        prompt=types.ModelInput.from_ints(input_ids),
-        sampling_params=sampling_params,
-        num_samples=1,
-    )
-    response = tokenizer.decode(result.sequences[0].tokens, skip_special_tokens=True)
+    
+    if stream and oai_client is not None and model is not None:
+        # Streaming mode using OpenAI-compatible API
+        response = ""
+        for chunk in oai_client.completions.create(
+            model=model,
+            prompt=prompt_text,
+            max_tokens=sampling_params.max_tokens,
+            temperature=sampling_params.temperature,
+            top_p=0.95,
+            stop=["</interact>"],
+            stream=True,
+        ):
+            text = chunk.choices[0].text
+            print(text, end="", flush=True)
+            response += text
+        print()  # newline after streaming
+    else:
+        # Batch mode
+        result = await client.sample_async(
+            prompt=types.ModelInput.from_ints(input_ids),
+            sampling_params=sampling_params,
+            num_samples=1,
+        )
+        response = tokenizer.decode(result.sequences[0].tokens, skip_special_tokens=True)
     
     # if stopped by </interact>, append it back so regex can match
     if "<interact>" in response and "</interact>" not in response:
@@ -328,8 +358,10 @@ async def get_llm_action(obs: str, history: list, tokenizer, client, sampling_pa
 
 async def run_episode(env, tokenizer_or_encoding, client, sampling_params, max_steps: int = 5, 
                       fast_eval: bool = False, eval_workers: int = 8, 
-                      eval_batch_size: int = 8, eval_timeout_s: float = 5.0,
-                      use_harmony: bool = False, reasoning_effort: str = "high"):
+                      eval_batch_size: int = 8, eval_timeout_s: float = 1.0,
+                      interact_timeout_s: float = 5.0,
+                      use_harmony: bool = False, reasoning_effort: str = "high",
+                      stream: bool = False, model: str = None, oai_client: OpenAI = None):
     """
     Run a single episode.
     
@@ -406,8 +438,16 @@ async def run_episode(env, tokenizer_or_encoding, client, sampling_params, max_s
                 history.append({"role": "assistant", "content": analysis, "channel": "analysis"})
             history.append({"role": "assistant", "content": action, "channel": channel})
         else:
-            action = await get_llm_action(obs_for_llm, history, tokenizer_or_encoding, client, sampling_params)
-            print(f"[assistant]\n{action}\n")
+            if stream:
+                print(f"[assistant] (streaming)")
+            action = await get_llm_action(
+                obs_for_llm, history, tokenizer_or_encoding, client, sampling_params,
+                stream=stream, model=model, oai_client=oai_client
+            )
+            if not stream:
+                print(f"[assistant]\n{action}\n")
+            else:
+                print()  # extra newline after streamed response
             
             # Use obs_for_llm in history to reflect what was actually sent to the model
             history.append({"role": "user", "content": obs_for_llm})
@@ -419,6 +459,7 @@ async def run_episode(env, tokenizer_or_encoding, client, sampling_params, max_s
                 eval_workers=eval_workers,
                 eval_batch_size=eval_batch_size,
                 eval_timeout_s=eval_timeout_s,
+                interact_timeout_s=interact_timeout_s,
             )
             obs, reward, terminated, truncated, info = results[0]
             
@@ -478,15 +519,44 @@ async def main():
                         help="Number of parallel evaluator workers (default: 8)")
     parser.add_argument("--eval-batch-size", type=int, default=8,
                         help="Number of responses per evaluator task (default: 8)")
-    parser.add_argument("--eval-timeout-s", type=float, default=5.0,
-                        help="Timeout in seconds for interactions and evaluation (default: 5.0)")
+    parser.add_argument("--eval-timeout-s", type=float, default=1.0,
+                        help="Per-test timeout in seconds for final answer evaluation (default: 1.0)")
+    parser.add_argument("--interact-timeout-s", type=float, default=5.0,
+                        help="Timeout in seconds for <interact> code execution during turns (default: 5.0)")
     parser.add_argument("--reasoning-effort", type=str, default="high",
                         choices=["low", "medium", "high"],
                         help="Reasoning effort for GPT-OSS models (default: high)")
+    parser.add_argument("--stream", action="store_true",
+                        help="Enable streaming output (requires checkpoint, not supported for Harmony models)")
     args = parser.parse_args()
     
     # Detect if we're using a GPT-OSS model that requires Harmony format
     use_harmony = is_gpt_oss_model(args.model)
+    
+    # Streaming setup
+    oai_client = None
+    model_path = None
+    stream = args.stream
+    
+    if stream:
+        if use_harmony:
+            print("Warning: Streaming is not supported for Harmony (GPT-OSS) models. Falling back to batch mode.", file=sys.stderr)
+            stream = False
+        else:
+            # Get cached checkpoint for streaming
+            model_path = get_checkpoint(args.model)
+            if not model_path:
+                print(f"No cached checkpoint found for {args.model}.", file=sys.stderr)
+                print(f"Run: python create_checkpoint.py --model {args.model}", file=sys.stderr)
+                sys.exit(1)
+            
+            print(f"[Streaming enabled, using checkpoint: {model_path}]")
+            
+            # Setup OpenAI-compatible client for streaming
+            oai_client = OpenAI(
+                base_url="https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1",
+                api_key=os.environ.get("TINKER_API_KEY", ""),
+            )
     
     if use_harmony:
         print(f"Detected GPT-OSS model: {args.model}")
@@ -542,8 +612,12 @@ async def main():
             eval_workers=args.eval_workers,
             eval_batch_size=args.eval_batch_size,
             eval_timeout_s=args.eval_timeout_s,
+            interact_timeout_s=args.interact_timeout_s,
             use_harmony=use_harmony,
             reasoning_effort=args.reasoning_effort,
+            stream=stream,
+            model=model_path,
+            oai_client=oai_client,
         )
         rewards.append(r)
     
