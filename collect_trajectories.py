@@ -331,6 +331,7 @@ class RolloutState:
     truncated: bool = False
     interaction_timeout_count: int = 0  # Number of interactions that timed out
     eval_timeout_count: int = 0  # Number of test cases that timed out during final eval
+    turn_wise_finish_reasons: list = field(default_factory=list)  # finish_reason per assistant turn (for HF columns)
 
 
 def serialize_rollout_state(state: RolloutState) -> dict:
@@ -348,6 +349,7 @@ def serialize_rollout_state(state: RolloutState) -> dict:
         "truncated": state.truncated,
         "interaction_timeout_count": state.interaction_timeout_count,
         "eval_timeout_count": state.eval_timeout_count,
+        "turn_wise_finish_reasons": list(state.turn_wise_finish_reasons),
         # Env-related data needed for reconstruction
         "question": state.env.question,
         "tests": state.env.tests,
@@ -386,6 +388,7 @@ def deserialize_rollout_state(data: dict, shared_dataset, args) -> RolloutState:
         truncated=data["truncated"],
         interaction_timeout_count=data.get("interaction_timeout_count", 0),
         eval_timeout_count=data.get("eval_timeout_count", 0),
+        turn_wise_finish_reasons=data.get("turn_wise_finish_reasons", []),
     )
     return state
 
@@ -509,6 +512,11 @@ def postprocess_response(response: str) -> str:
     return response
 
 
+def _truncated_by_token_limit(finish_reason: str | None) -> bool:
+    """True if generation stopped due to max token limit."""
+    return (finish_reason or "").lower() in ("length", "length_capped", "max_tokens")
+
+
 def truncate_interaction_output(
     output_text: str,
     tokenizer_or_encoding,
@@ -569,73 +577,93 @@ def maybe_truncate_obs(obs: str, tokenizer_or_encoding, max_interaction_output_t
     return f"<output>\n{truncated}</output>"
 
 
-async def sample_batch_tinker(client, prompts: list[list[int]], sampling_params) -> list[list[int]]:
-    """Batch sample using tinker (via async gather). Returns token lists."""
+async def sample_batch_tinker(client, prompts: list[list[int]], sampling_params) -> list[tuple[list[int], Optional[str]]]:
+    """Batch sample using tinker (via async gather). Returns list of (tokens, finish_reason)."""
+    max_tokens = getattr(sampling_params, "max_tokens", None)
+
     async def sample_one(input_ids):
         result = await client.sample_async(
             prompt=tinker_types.ModelInput.from_ints(input_ids),
             sampling_params=sampling_params,
             num_samples=1,
         )
-        return result.sequences[0].tokens
-    
+        seq = result.sequences[0]
+        tokens = seq.tokens
+        fr = getattr(seq, "finish_reason", None)
+        if fr is None and max_tokens is not None and len(tokens) >= max_tokens:
+            fr = "length"
+        return (tokens, fr)
+
     results = await asyncio.gather(*[sample_one(p) for p in prompts])
     return results
 
 
-async def sample_batch_tinker_harmony(client, prompts: list[list[int]], sampling_params, encoding) -> list[tuple[str, str, Optional[str]]]:
+async def sample_batch_tinker_harmony(client, prompts: list[list[int]], sampling_params, encoding) -> list[tuple[str, str, Optional[str], Optional[str]]]:
     """Batch sample using tinker with Harmony parsing.
-    
-    Returns list of (response_content, channel, analysis_content) tuples.
+
+    Returns list of (response_content, channel, analysis_content, finish_reason) tuples.
     """
     token_results = await sample_batch_tinker(client, prompts, sampling_params)
-    
+
     parsed_results = []
-    for tokens in token_results:
+    for tokens, finish_reason in token_results:
         content, channel, analysis = parse_harmony_response(tokens, encoding)
         # Postprocess: if stopped by </interact>, append it back
         if "<interact>" in content and "</interact>" not in content:
             content += "</interact>"
-        parsed_results.append((content, channel, analysis))
-    
+        parsed_results.append((content, channel, analysis, finish_reason))
+
     return parsed_results
 
 
-def sample_batch_vllm(client, prompts: list[list[int]], sampling_params, show_progress: bool = False) -> list[str]:
-    """Batch sample using vLLM."""
+def sample_batch_vllm(client, prompts: list[list[int]], sampling_params, show_progress: bool = False) -> list[tuple[str, Optional[str]]]:
+    """Batch sample using vLLM. Returns list of (text, finish_reason)."""
     model_inputs = [ModelInput.from_ints(p) for p in prompts]
+    max_tokens = getattr(sampling_params, "max_tokens", None)
     # Pass show_progress for MultiServerSamplingClient (ignored by other clients)
     try:
         results = client.sample_batch(model_inputs, sampling_params, num_samples=1, show_progress=show_progress)
     except TypeError:
         # Fallback for clients that don't support show_progress
         results = client.sample_batch(model_inputs, sampling_params, num_samples=1)
-    return [r.sequences[0].text for r in results]
+    out = []
+    for r in results:
+        seq = r.sequences[0]
+        text = seq.text
+        fr = getattr(seq, "finish_reason", None)
+        if fr is None and max_tokens is not None and len(seq.tokens) >= max_tokens:
+            fr = "length"
+        out.append((text, fr))
+    return out
 
 
-def sample_batch_vllm_harmony(client, prompts: list[list[int]], sampling_params, encoding, show_progress: bool = False) -> list[tuple[str, str, Optional[str]]]:
+def sample_batch_vllm_harmony(client, prompts: list[list[int]], sampling_params, encoding, show_progress: bool = False) -> list[tuple[str, str, Optional[str], Optional[str]]]:
     """Batch sample using vLLM with Harmony parsing.
-    
-    Returns list of (response_content, channel, analysis_content) tuples.
+
+    Returns list of (response_content, channel, analysis_content, finish_reason) tuples.
     """
     model_inputs = [ModelInput.from_ints(p) for p in prompts]
+    max_tokens = getattr(sampling_params, "max_tokens", None)
     # Pass show_progress for MultiServerSamplingClient (ignored by other clients)
     try:
         results = client.sample_batch(model_inputs, sampling_params, num_samples=1, show_progress=show_progress)
     except TypeError:
         # Fallback for clients that don't support show_progress
         results = client.sample_batch(model_inputs, sampling_params, num_samples=1)
-    
+
     parsed_results = []
     for result in results:
-        # Get tokens from the result for Harmony parsing
-        tokens = result.sequences[0].tokens
+        seq = result.sequences[0]
+        tokens = seq.tokens
+        fr = getattr(seq, "finish_reason", None)
+        if fr is None and max_tokens is not None and len(tokens) >= max_tokens:
+            fr = "length"
         content, channel, analysis = parse_harmony_response(tokens, encoding)
         # Postprocess: if stopped by </interact>, append it back
         if "<interact>" in content and "</interact>" not in content:
             content += "</interact>"
-        parsed_results.append((content, channel, analysis))
-    
+        parsed_results.append((content, channel, analysis, fr))
+
     return parsed_results
 
 
@@ -820,11 +848,11 @@ def run_batched_rollouts(
                     harmony_results = sample_batch_vllm_harmony(
                         client, prompts, sampling_params, tokenizer_or_encoding, show_progress=args.vllm_multi_gpu
                     )
-                # harmony_results is list of (content, channel, analysis)
-                responses = harmony_results  # Keep as tuples for now
+                # harmony_results is list of (content, channel, analysis, finish_reason)
+                responses = harmony_results
             elif args.backend == "tinker":
                 token_results = asyncio.run(sample_batch_tinker(client, prompts, sampling_params))
-                responses = [tokenizer_or_encoding.decode(tokens, skip_special_tokens=True) for tokens in token_results]
+                responses = [(tokenizer_or_encoding.decode(tokens, skip_special_tokens=True), fr) for tokens, fr in token_results]
             else:
                 responses = sample_batch_vllm(client, prompts, sampling_params, show_progress=args.vllm_multi_gpu)
             
@@ -832,13 +860,16 @@ def run_batched_rollouts(
             processed_responses = []
             for i, state in enumerate(active_states):
                 if use_harmony:
-                    # Unpack Harmony result
-                    response, channel, analysis = responses[i]
+                    # Unpack Harmony result (content, channel, analysis, finish_reason)
+                    response, channel, analysis, finish_reason = responses[i]
                 else:
-                    response = responses[i]
+                    response, finish_reason = responses[i]
                     response = postprocess_response(response)
                     channel = None
                     analysis = None
+                
+                # Record finish_reason for this assistant turn (for HF columns)
+                state.turn_wise_finish_reasons.append(finish_reason)
                 
                 # On the last turn, include FINAL_PROMPT in history to reflect what was sent
                 is_last_turn = state.env.current_turn == args.max_turns - 1
@@ -949,6 +980,10 @@ def run_batched_rollouts(
     # Organize results by problem
     all_trajectories: list[list[dict]] = [[] for _ in range(args.num_problems)]
     for state in completed_states:
+        turn_wise_finish_reason = list(state.turn_wise_finish_reasons)
+        turn_wise_truncated_by_token_limit = [_truncated_by_token_limit(fr) for fr in state.turn_wise_finish_reasons]
+        num_assistant_messages_truncated = sum(turn_wise_truncated_by_token_limit)
+        num_assistant_messages_not_truncated = len(turn_wise_truncated_by_token_limit) - num_assistant_messages_truncated
         traj = {
             "question": state.env.question,
             "messages": state.messages,
@@ -960,6 +995,10 @@ def run_batched_rollouts(
             "tests": state.env.tests,
             "interaction_timeout_count": state.interaction_timeout_count,
             "eval_timeout_count": state.eval_timeout_count,
+            "turn_wise_finish_reason": turn_wise_finish_reason,
+            "turn_wise_truncated_by_token_limit": turn_wise_truncated_by_token_limit,
+            "num_assistant_messages_truncated": num_assistant_messages_truncated,
+            "num_assistant_messages_not_truncated": num_assistant_messages_not_truncated,
         }
         all_trajectories[state.problem_index].append(traj)
     
@@ -1064,6 +1103,10 @@ def main(args):
                 "is_successful": is_successful,
                 "interaction_timeout_count": traj["interaction_timeout_count"],
                 "eval_timeout_count": traj["eval_timeout_count"],
+                "turn_wise_finish_reason": traj["turn_wise_finish_reason"],
+                "turn_wise_truncated_by_token_limit": traj["turn_wise_truncated_by_token_limit"],
+                "num_assistant_messages_truncated": traj["num_assistant_messages_truncated"],
+                "num_assistant_messages_not_truncated": traj["num_assistant_messages_not_truncated"],
                 "rendered": render_trajectory(
                     traj["messages"], traj["interactions"], traj["question"],
                     traj["final_reward"], traj["num_turns"], traj["terminated"], traj["truncated"]
@@ -1137,7 +1180,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="bicycleman15/intellect_3_code_easy_medium",
                         choices=["bicycleman15/intellect_3_code_easy_medium", "bicycleman15/intellect_3_code_hard",
                                  "bicycleman15/intellect_3_code_very_hard", "PrimeIntellect/INTELLECT-3-RL", 
-                                 "anirudhb11/lcb_v6_feb_may_2025_formatted", "anirudhb11/intellect_3_code_very_hard_top_400_hardest", "anirudhb11/qwen3_4b_instruct_top_400_hardest_interations_10_turns"])
+                                 "anirudhb11/lcb_v6_feb_may_2025_formatted", "anirudhb11/lcb_v6_feb_may_2025_formatted_hardest_to_easiest", "anirudhb11/intellect_3_code_very_hard_top_400_hardest", "anirudhb11/qwen3_4b_instruct_top_400_hardest_interations_10_turns"])
     parser.add_argument("--start-problem", type=int, default=0,
                         help="Starting problem index for dataset slicing (default: 0)")
     parser.add_argument("--num-problems", type=int, default=20)

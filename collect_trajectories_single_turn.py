@@ -413,43 +413,53 @@ def sample_batch_vllm(client, prompts: list[list[int]], sampling_params, show_pr
     return results
 
 
-async def sample_batch_tinker_harmony(client, prompts: list[list[int]], sampling_params, encoding) -> list[tuple[str, str, Optional[str]]]:
+async def sample_batch_tinker_harmony(client, prompts: list[list[int]], sampling_params, encoding) -> list[tuple[str, str, Optional[str], Optional[str]]]:
     """Batch sample using tinker with Harmony parsing.
     
-    Returns list of (response_content, channel, analysis_content) tuples.
+    Returns list of (response_content, channel, analysis_content, finish_reason) tuples.
+    finish_reason is inferred from backend or from token count >= max_tokens when backend doesn't expose it.
     """
     token_results = await sample_batch_tinker(client, prompts, sampling_params, None)
+    max_tokens = getattr(sampling_params, "max_tokens", None)
     parsed_results = []
     for result in token_results:
-        tokens = result.sequences[0].tokens
+        seq = result.sequences[0]
+        tokens = seq.tokens
         content, channel, analysis = parse_harmony_response(tokens, encoding)
-        parsed_results.append((content, channel, analysis))
+        finish_reason = getattr(seq, "finish_reason", None)
+        if finish_reason is None and max_tokens is not None and len(tokens) >= max_tokens:
+            finish_reason = "length"
+        parsed_results.append((content, channel, analysis, finish_reason))
     return parsed_results
 
 
-def sample_batch_vllm_harmony(client, prompts: list[list[int]], sampling_params, encoding, show_progress: bool = False) -> list[tuple[str, str, Optional[str]]]:
+def sample_batch_vllm_harmony(client, prompts: list[list[int]], sampling_params, encoding, show_progress: bool = False) -> list[tuple[str, str, Optional[str], Optional[str]]]:
     """Batch sample using vLLM with Harmony parsing.
     
-    Returns list of (response_content, channel, analysis_content) tuples.
+    Returns list of (response_content, channel, analysis_content, finish_reason) tuples.
+    finish_reason is inferred from backend or from token count >= max_tokens when backend doesn't expose it.
     """
     model_inputs = [ModelInput.from_ints(p) for p in prompts]
     try:
         results = client.sample_batch(model_inputs, sampling_params, num_samples=1, show_progress=show_progress)
     except TypeError:
         results = client.sample_batch(model_inputs, sampling_params, num_samples=1)
-    
+    max_tokens = getattr(sampling_params, "max_tokens", None)
     parsed_results = []
     for result in results:
-        # Get tokens from the result for Harmony parsing
-        tokens = result.sequences[0].tokens
+        seq = result.sequences[0]
+        tokens = seq.tokens
         content, channel, analysis = parse_harmony_response(tokens, encoding)
-        parsed_results.append((content, channel, analysis))
+        finish_reason = getattr(seq, "finish_reason", None)
+        if finish_reason is None and max_tokens is not None and len(tokens) >= max_tokens:
+            finish_reason = "length"
+        parsed_results.append((content, channel, analysis, finish_reason))
     return parsed_results
 
 
 def _truncated_by_token_limit(finish_reason: str | None) -> bool:
     """True if generation stopped due to max token limit."""
-    return (finish_reason or "").lower() in ("length", "length_capped")
+    return (finish_reason or "").lower() in ("length", "length_capped", "max_tokens")
 
 
 @dataclass
@@ -659,20 +669,22 @@ def run_batched_rollouts(
                 harmony_results = sample_batch_vllm_harmony(
                     client, prompts, sampling_params, tokenizer_or_encoding, show_progress=args.vllm_multi_gpu
                 )
-            # Store response in states (harmony_results is list of (content, channel, analysis))
-            for state, (content, channel, analysis) in zip(states, harmony_results):
+            # Store response and finish_reason (inferred from backend or token count >= max_tokens)
+            for state, (content, channel, analysis, finish_reason) in zip(states, harmony_results):
                 state.response = content
-                state.finish_reason = None  # Harmony doesn't expose finish_reason
+                state.finish_reason = finish_reason
         else:
             if args.backend == "tinker":
                 sampling_results = asyncio.run(sample_batch_tinker(client, prompts, sampling_params, tokenizer_or_encoding))
             else:
                 sampling_results = sample_batch_vllm(client, prompts, sampling_params, show_progress=args.vllm_multi_gpu)
-            # Store response and finish_reason in states
+            # Store response and finish_reason in states (infer "length" from token count when backend doesn't set it)
             for state, result in zip(states, sampling_results):
                 seq = result.sequences[0]
                 state.response = getattr(seq, "text", None) or tokenizer_or_encoding.decode(getattr(seq, "tokens", []), skip_special_tokens=True)
                 state.finish_reason = getattr(seq, "finish_reason", None)
+                if state.finish_reason is None and len(seq.tokens) >= args.max_tokens:
+                    state.finish_reason = "length"
         
         # Save checkpoint BEFORE evaluation (so we can retry if evaluation fails)
         if checkpoint_manager:
@@ -928,7 +940,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="bicycleman15/intellect_3_code_easy_medium",
                         choices=["bicycleman15/intellect_3_code_easy_medium", "bicycleman15/intellect_3_code_hard",
                                  "bicycleman15/intellect_3_code_very_hard", "anirudhb11/intellect_3_code_very_hard_top_400_hardest",
-                                 "PrimeIntellect/INTELLECT-3-RL", "anirudhb11/lcb_v6_feb_may_2025_formatted"])
+                                 "PrimeIntellect/INTELLECT-3-RL", "anirudhb11/lcb_v6_feb_may_2025_formatted", "anirudhb11/lcb_v6_feb_may_2025_formatted_hardest_to_easiest"])
     parser.add_argument("--start-problem", type=int, default=0,
                         help="Starting problem index for dataset slicing (default: 0)")
     parser.add_argument("--num-problems", type=int, default=20)
