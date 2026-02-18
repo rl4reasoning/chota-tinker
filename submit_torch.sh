@@ -17,7 +17,7 @@ echo "Job started at: $(date)"
 source ~/.bashrc # so that we can read HF_AUTH_TOKEN :)
 
 conda activate
-conda activate ct
+conda activate ct 
 
 # VLLM_MXFP4_USE_MARLIN=1 python collect_trajectories.py \
 #     --dataset anirudhb11/lcb_v6_feb_may_2025_formatted_hardest_to_easiest \
