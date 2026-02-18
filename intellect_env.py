@@ -285,18 +285,35 @@ class IntellectCodeEnv(Env):
 
     @staticmethod
     def _extract_interact_code(text: str) -> Optional[str]:
-        # match <interact>...</interact> for interactive execution
-        pattern = r"<interact>(.*?)</interact>"
-        matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
-        if matches:
-            content = matches[-1].strip()
-            # handle case where code is wrapped in ```python``` inside <interact>
-            code_pattern = r"```(?:python)?\n?(.*?)```"
-            code_matches = re.findall(code_pattern, content, re.DOTALL | re.IGNORECASE)
-            if code_matches:
-                return code_matches[-1].strip()
-            return content
-        return None
+        # Find the LAST <interact>...</interact> block to avoid false matches
+        # when the model mentions <interact> in explanatory text before the actual code
+        # the algorithm is: 
+        # (1) Find the last <interact> opening tag
+        # (2) Find the first </interact> closing tag after the last <interact>
+        
+        # Find the last <interact> opening tag
+        last_open_match = None
+        for match in re.finditer(r"<interact>", text, re.IGNORECASE):
+            last_open_match = match
+        
+        if not last_open_match:
+            return None
+        
+        # Find the </interact> closing tag after the last <interact>
+        remaining_text = text[last_open_match.end():]
+        close_match = re.search(r"</interact>", remaining_text, re.IGNORECASE)
+        
+        if not close_match:
+            return None
+        
+        content = remaining_text[:close_match.start()].strip()
+        
+        # Handle case where code is wrapped in ```python``` inside <interact>
+        code_pattern = r"```(?:python)?\n?(.*?)```"
+        code_matches = re.findall(code_pattern, content, re.DOTALL | re.IGNORECASE)
+        if code_matches:
+            return code_matches[-1].strip()
+        return content
 
     @staticmethod
     def _extract_answer_code(text: str) -> Optional[str]:
