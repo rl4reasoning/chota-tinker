@@ -11,6 +11,15 @@ Usage:
         --problem_id 2 \
         --trajectory_id 32 \
         --turn_index 2
+
+    # For GPT-OSS models (uses Harmony format):
+    python gem_math_demo_early_termination.py \
+        --dataset anirudhb11/qwen3_4b_instruct_start_425_end_450_interations_10_turns \
+        --model openai/gpt-oss-120b \
+        --problem_id 2 \
+        --trajectory_id 32 \
+        --turn_index 2 \
+        --reasoning-effort medium
 """
 
 import os
@@ -19,7 +28,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
 import asyncio
 import json
-from typing import Any, List, Dict
+from datetime import date
+from typing import Any, List, Dict, Optional
 
 import tinker
 from tinker import types
@@ -28,6 +38,20 @@ from datasets import load_dataset
 
 from utils.fast_eval import _evaluate_code
 from code_env.code_env.utils.deepcoder_utils import extract_code_from_model
+
+# Harmony utilities for GPT-OSS models
+from utils.harmony_utils import (
+    is_gpt_oss_model,
+    parse_harmony_response,
+    load_harmony_encoding,
+    HarmonyEncodingName,
+    HarmonyRole,
+    HarmonyMessage,
+    Conversation,
+    DeveloperContent,
+    SystemContent,
+    ReasoningEffort,
+)
 
 
 FINAL_PROMPT = """STOP. Do NOT use <interact> anymore. Your interaction budget is exhausted.
@@ -100,6 +124,77 @@ async def get_llm_action(messages: List[Dict], tokenizer, client, sampling_param
     return response
 
 
+def build_harmony_conversation_from_messages(
+    messages: List[Dict], 
+    encoding, 
+    reasoning_effort: str = "medium"
+) -> Conversation:
+    """Build a Harmony Conversation from a list of message dictionaries.
+    
+    For Harmony format, we need to:
+    1. Add a SystemContent with reasoning effort and date
+    2. Convert system messages to developer messages with DeveloperContent
+    3. Handle user/assistant messages normally
+    """
+    harmony_messages = []
+    
+    # First, add a system message with reasoning effort
+    system_content = (
+        SystemContent.new()
+        .with_reasoning_effort(ReasoningEffort[reasoning_effort.upper()])
+        .with_conversation_start_date(date.today().isoformat())
+    )
+    harmony_messages.append(HarmonyMessage.from_role_and_content(HarmonyRole.SYSTEM, system_content))
+    
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+        
+        if role == "system":
+            # Convert system to developer for Harmony
+            developer_content = DeveloperContent.new().with_instructions(content)
+            harmony_messages.append(HarmonyMessage.from_role_and_content(HarmonyRole.DEVELOPER, developer_content))
+        elif role == "developer":
+            # Already a developer message
+            if isinstance(content, str):
+                developer_content = DeveloperContent.new().with_instructions(content)
+                harmony_messages.append(HarmonyMessage.from_role_and_content(HarmonyRole.DEVELOPER, developer_content))
+            else:
+                harmony_messages.append(HarmonyMessage.from_role_and_content(HarmonyRole.DEVELOPER, content))
+        elif role == "user":
+            harmony_messages.append(HarmonyMessage.from_role_and_content(HarmonyRole.USER, content))
+        elif role == "assistant":
+            channel = msg.get("channel", "final")
+            h_msg = HarmonyMessage.from_role_and_content(HarmonyRole.ASSISTANT, content)
+            h_msg = h_msg.with_channel(channel)
+            harmony_messages.append(h_msg)
+    
+    return Conversation.from_messages(harmony_messages)
+
+
+async def get_llm_action_harmony(
+    messages: List[Dict], 
+    encoding, 
+    client, 
+    sampling_params,
+    reasoning_effort: str = "medium"
+) -> tuple[str, str, Optional[str]]:
+    """Get LLM response using Harmony format for GPT-OSS models."""
+    conversation = build_harmony_conversation_from_messages(messages, encoding, reasoning_effort)
+    input_ids = encoding.render_conversation_for_completion(conversation, HarmonyRole.ASSISTANT)
+    
+    result = await client.sample_async(
+        prompt=types.ModelInput.from_ints(input_ids),
+        sampling_params=sampling_params,
+        num_samples=1,
+    )
+    
+    response_tokens = result.sequences[0].tokens
+    response_content, channel, analysis_content = parse_harmony_response(response_tokens, encoding)
+    
+    return response_content, channel, analysis_content
+
+
 async def run_demo(args):
     # Load trajectory dataset
     print(f"Loading dataset: {args.dataset}")
@@ -133,6 +228,13 @@ async def run_demo(args):
     print(f"Original num_turns: {num_turns}, Terminated: {terminated}")
     print()
     
+    # Detect if model is a GPT-OSS model (requires Harmony format)
+    use_harmony = is_gpt_oss_model(args.model)
+    if use_harmony:
+        print(f"[INFO] Detected GPT-OSS model: {args.model}")
+        print(f"[INFO] Using Harmony format with reasoning_effort={args.reasoning_effort}")
+        print()
+    
     # Check if trajectory already ended within turn budget (BEFORE capping turn_index)
     # (either terminated with answer OR truncated at max turns)
     already_ended = num_turns <= args.turn_index
@@ -164,24 +266,55 @@ async def run_demo(args):
         # Initialize model
         service_client = tinker.ServiceClient()
         client = service_client.create_sampling_client(base_model=args.model)
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
         
-        sampling_params = types.SamplingParams(
-            max_tokens=args.max_tokens,
-            temperature=args.temperature,
-            top_p=0.95,
-            stop=[],  # No stop - we want full response
-        )
-        
-        # Print full prompt sent to model
-        full_prompt = tokenizer.apply_chat_template(
-            truncated_messages, tokenize=False, add_generation_prompt=True
-        )
-        print(f"[full_prompt]\n{full_prompt}\n")
-        
-        # Run inference
-        response = await get_llm_action(truncated_messages, tokenizer, client, sampling_params)
-        print(f"[assistant]\n{response}\n")
+        if use_harmony:
+            # GPT-OSS model: use Harmony encoding
+            encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+            
+            # Get stop token IDs from encoding
+            # Use stop_tokens_for_assistant_actions() which returns only <|return|> and <|call|>
+            # Do NOT use stop_tokens() which includes <|end|> - that marks the end of ONE message,
+            # but the model outputs multiple messages (analysis channel -> final channel)
+            stop_token_ids = encoding.stop_tokens_for_assistant_actions()
+            
+            sampling_params = types.SamplingParams(
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                stop_token_ids=stop_token_ids,
+            )
+            
+            print(f"[system] (Harmony format)")
+            print(f"  Reasoning effort: {args.reasoning_effort}")
+            print(f"  Date: {date.today().isoformat()}\n")
+            
+            # Run inference with Harmony format
+            response, channel, analysis_content = await get_llm_action_harmony(
+                truncated_messages, encoding, client, sampling_params, args.reasoning_effort
+            )
+            if analysis_content:
+                print(f"[analysis]\n{analysis_content}\n")
+            print(f"[assistant (channel: {channel})]\n{response}\n")
+        else:
+            # Standard model: use tokenizer
+            tokenizer = AutoTokenizer.from_pretrained(args.model)
+            
+            sampling_params = types.SamplingParams(
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                stop=[],  # No stop - we want full response
+            )
+            
+            # Print full prompt sent to model
+            full_prompt = tokenizer.apply_chat_template(
+                truncated_messages, tokenize=False, add_generation_prompt=True
+            )
+            print(f"[full_prompt]\n{full_prompt}\n")
+            
+            # Run inference
+            response = await get_llm_action(truncated_messages, tokenizer, client, sampling_params)
+            print(f"[assistant]\n{response}\n")
         
         # Extract code from response
         code = extract_code_from_model(response)
@@ -229,8 +362,16 @@ async def main():
                         help="Model name")
     parser.add_argument("--max_tokens", type=int, default=4096,
                         help="Max tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.0,
-                        help="Sampling temperature (0 for greedy)")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Sampling temperature")
+    parser.add_argument("--top-p", type=float, default=1.0, dest="top_p",
+                        help="Top-p sampling")
+    
+    # Harmony-specific arguments (for GPT-OSS models)
+    parser.add_argument("--reasoning-effort", type=str, default="medium",
+                        choices=["none", "low", "medium", "high"],
+                        help="Reasoning effort level for Harmony models (default: medium)")
+    
     args = parser.parse_args()
     
     print(f"Using dataset: {args.dataset}")

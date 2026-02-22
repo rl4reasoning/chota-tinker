@@ -450,14 +450,14 @@ def create_sampling_params(args, backend: str, harmony_encoding=None):
         params = tinker_types.SamplingParams(
             max_tokens=args.max_tokens,
             temperature=args.temperature,
-            top_p=0.95,
+            top_p=args.top_p,
             stop=stop_sequences,
         )
         if stop_token_ids:
             params = tinker_types.SamplingParams(
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
-                top_p=0.95,
+                top_p=args.top_p,
                 stop=stop_sequences,
                 stop_token_ids=stop_token_ids,
             )
@@ -466,7 +466,7 @@ def create_sampling_params(args, backend: str, harmony_encoding=None):
         return SamplingParams(
             max_tokens=args.max_tokens,
             temperature=args.temperature,
-            top_p=0.95,
+            top_p=args.top_p,
             stop=stop_sequences,
             stop_token_ids=stop_token_ids,
         )
@@ -1043,6 +1043,7 @@ def main(args):
             "max_turns": args.max_turns,
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
+            "top_p": args.top_p,
         }
     )
     
@@ -1142,6 +1143,7 @@ def main(args):
         "max_turns": args.max_turns,
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
+        "top_p": args.top_p,
         "timestamp": datetime.now().isoformat(),
         "pass_at_1": pass_at_1,
         "pass_at_2": pass_at_2,
@@ -1190,7 +1192,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-samples", type=int, default=8)
     parser.add_argument("--max-turns", type=int, default=5)
     parser.add_argument("--max-tokens", type=int, default=4096)
-    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-p", type=float, default=1.0, dest="top_p")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
     parser.add_argument("--output-dir", type=str, default="artifacts/trajectories")
     parser.add_argument("--push-to-hub", type=str, default=None, help="HF repo to push to (e.g. username/repo-name)")

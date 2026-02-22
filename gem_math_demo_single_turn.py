@@ -337,7 +337,8 @@ async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen3-4B-Instruct-2507")
     parser.add_argument("--max_tokens", type=int, default=2048)
-    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-p", type=float, default=1.0, dest="top_p")
     parser.add_argument("--difficulty", type=str, default="original",
                         choices=["original", "easy_medium", "hard", "very_hard"],
                         help="Problem difficulty: easy_medium (0.3-1.0), hard (0.1-0.3), very_hard (0.0-0.1), or original (all)")
@@ -368,7 +369,7 @@ async def main():
         sampling_params = types.SamplingParams(
             max_tokens=args.max_tokens,
             temperature=args.temperature,
-            top_p=0.95,
+            top_p=args.top_p,
             stop_token_ids=harmony_stop_tokens,
         )
     else:
@@ -378,7 +379,7 @@ async def main():
         sampling_params = types.SamplingParams(
             max_tokens=args.max_tokens,
             temperature=args.temperature,
-            top_p=0.95,
+            top_p=args.top_p,
         )
 
     service_client = tinker.ServiceClient()

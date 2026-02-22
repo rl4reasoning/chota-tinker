@@ -37,6 +37,15 @@ Usage:
         --steps 3 \
         --difficulty easy_medium \
         --problem_index 0
+
+    # For GPT-OSS models (uses Harmony format, tinker backend required):
+    python gem_math_demo_rsa.py \
+        --model openai/gpt-oss-120b \
+        --backend tinker \
+        --population 4 \
+        --k 2 \
+        --steps 3 \
+        --reasoning-effort medium
 """
 
 import os
@@ -45,12 +54,27 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
 import asyncio
 import random
+from datetime import date
 from typing import Optional
 
 from transformers import AutoTokenizer
 
 from intellect_env import IntellectCodeEnv
 from utils.fast_eval import EvalTask, evaluate_tasks
+
+# Harmony utilities for GPT-OSS models
+from utils.harmony_utils import (
+    is_gpt_oss_model,
+    parse_harmony_response,
+    load_harmony_encoding,
+    HarmonyEncodingName,
+    HarmonyRole,
+    HarmonyMessage,
+    Conversation,
+    DeveloperContent,
+    SystemContent,
+    ReasoningEffort,
+)
 
 # Backend imports (conditional)
 try:
@@ -78,6 +102,9 @@ Solve the given programming problem and provide your solution.
 First, think about the problem step by step.
 Then, provide your final solution wrapped in ```python``` code blocks.
 """
+
+# For Harmony format, use the same instructions
+DEVELOPER_INSTRUCTIONS = SYSTEM_PROMPT
 
 
 def aggregate_prompt(question: str, candidates: list[str]) -> str:
@@ -153,6 +180,46 @@ def tokenize_messages(messages: list[dict], tokenizer) -> list[int]:
 
 
 # -----------------------------------------------------------------------------
+# Harmony format helpers (for GPT-OSS models)
+# -----------------------------------------------------------------------------
+
+def build_harmony_messages_for_rsa(
+    prompt: str, 
+    use_system: bool = True,
+    reasoning_effort: str = "medium"
+) -> list[HarmonyMessage]:
+    """Build Harmony messages for RSA prompts.
+    
+    Args:
+        prompt: The user prompt
+        use_system: Whether to include system/developer instructions
+        reasoning_effort: The reasoning effort level (none/low/medium/high)
+    """
+    messages = []
+    
+    # Always add system message with reasoning effort
+    system_content = (
+        SystemContent.new()
+        .with_reasoning_effort(ReasoningEffort[reasoning_effort.upper()])
+        .with_conversation_start_date(date.today().isoformat())
+    )
+    messages.append(HarmonyMessage.from_role_and_content(HarmonyRole.SYSTEM, system_content))
+    
+    if use_system:
+        developer_content = DeveloperContent.new().with_instructions(DEVELOPER_INSTRUCTIONS)
+        messages.append(HarmonyMessage.from_role_and_content(HarmonyRole.DEVELOPER, developer_content))
+    
+    messages.append(HarmonyMessage.from_role_and_content(HarmonyRole.USER, prompt))
+    return messages
+
+
+def tokenize_messages_harmony(messages: list[HarmonyMessage], encoding) -> list[int]:
+    """Tokenize Harmony messages for completion."""
+    conversation = Conversation.from_messages(messages)
+    return encoding.render_conversation_for_completion(conversation, HarmonyRole.ASSISTANT)
+
+
+# -----------------------------------------------------------------------------
 # Tinker backend functions
 # -----------------------------------------------------------------------------
 
@@ -185,6 +252,37 @@ async def sample_batch_tinker(
     return await asyncio.gather(*tasks)
 
 
+async def sample_one_tinker_harmony(
+    input_ids: list[int],
+    client,
+    sampling_params,
+    encoding,
+) -> str:
+    """Sample a single response using tinker backend with Harmony format."""
+    result = await client.sample_async(
+        prompt=tinker_types.ModelInput.from_ints(input_ids),
+        sampling_params=sampling_params,
+        num_samples=1,
+    )
+    response_tokens = result.sequences[0].tokens
+    response_content, channel, analysis_content = parse_harmony_response(response_tokens, encoding)
+    return response_content
+
+
+async def sample_batch_tinker_harmony(
+    prompts: list[list[int]],
+    client,
+    sampling_params,
+    encoding,
+) -> list[str]:
+    """Sample multiple responses in parallel using tinker backend with Harmony format."""
+    tasks = [
+        sample_one_tinker_harmony(p, client, sampling_params, encoding)
+        for p in prompts
+    ]
+    return await asyncio.gather(*tasks)
+
+
 # -----------------------------------------------------------------------------
 # vLLM backend functions
 # -----------------------------------------------------------------------------
@@ -203,6 +301,110 @@ def sample_batch_vllm(
 # -----------------------------------------------------------------------------
 # RSA Algorithm
 # -----------------------------------------------------------------------------
+
+async def run_rsa_tinker_harmony(
+    question: str,
+    encoding,
+    client,
+    sampling_params,
+    population: int,
+    k: int,
+    steps: int,
+    verbose: bool = True,
+    show_raw_outputs: bool = True,
+    reasoning_effort: str = "medium",
+) -> list[str]:
+    """
+    Run RSA algorithm using tinker backend with Harmony format for GPT-OSS models.
+    
+    Args:
+        question: The coding problem
+        encoding: Harmony encoding for the model
+        client: Tinker sampling client
+        sampling_params: Sampling parameters
+        population: N - number of candidates in population
+        k: K - number of candidates to aggregate per generation
+        steps: T - number of RSA steps
+        verbose: Whether to print progress
+        show_raw_outputs: Whether to print raw inputs/outputs at every step
+        reasoning_effort: Reasoning effort level (none/low/medium/high)
+        
+    Returns:
+        Final population of candidate solutions
+    """
+    if verbose:
+        print(f"[RSA-Harmony] Starting with N={population}, K={k}, T={steps}")
+        print(f"[RSA-Harmony] Reasoning effort: {reasoning_effort}")
+    
+    # Step 1: Initialize population P_1
+    if verbose:
+        print(f"[RSA-Harmony] Step 1/{steps}: Initializing population with {population} candidates...")
+    
+    initial_prompt = build_initial_prompt(question)
+    messages = build_harmony_messages_for_rsa(initial_prompt, use_system=True, reasoning_effort=reasoning_effort)
+    input_ids = tokenize_messages_harmony(messages, encoding)
+    
+    # Generate N initial candidates
+    prompts = [input_ids] * population
+    candidates = await sample_batch_tinker_harmony(prompts, client, sampling_params, encoding)
+    
+    if verbose:
+        print(f"[RSA-Harmony] Initialized {len(candidates)} candidates")
+    
+    # Show input-output pairs for initial generation
+    if show_raw_outputs:
+        print("\n" + "=" * 80)
+        print(f"STEP 1/{steps} - Initial Generation (Harmony)")
+        print("=" * 80)
+        for i, cand in enumerate(candidates):
+            print(f"\n{'#' * 80}")
+            print(f"# CANDIDATE {i+1}/{population}")
+            print(f"{'#' * 80}")
+            print("\n[OUTPUT]")
+            print(cand)
+            print("-" * 80)
+    
+    # Steps 2 to T: Iterative aggregation
+    for t in range(2, steps + 1):
+        if verbose:
+            print(f"\n[RSA-Harmony] Step {t}/{steps}: Aggregating with K={k}...")
+        
+        agg_prompts = []
+        subsets_used = []  # Track which candidates were aggregated
+        
+        for i in range(population):
+            # Subsample K candidates without replacement
+            subset_indices = random.sample(range(len(candidates)), k)
+            subset = [candidates[idx] for idx in subset_indices]
+            subsets_used.append(subset_indices)
+            # Build aggregation prompt
+            agg_prompt_text = aggregate_prompt(question, subset)
+            messages = build_harmony_messages_for_rsa(agg_prompt_text, use_system=False, reasoning_effort=reasoning_effort)
+            input_ids = tokenize_messages_harmony(messages, encoding)
+            agg_prompts.append(input_ids)
+        
+        # Generate all N new candidates in parallel
+        new_candidates = await sample_batch_tinker_harmony(agg_prompts, client, sampling_params, encoding)
+        candidates = new_candidates
+        
+        if verbose:
+            print(f"[RSA-Harmony] Generated {len(candidates)} aggregated candidates")
+        
+        # Show input-output pairs for this aggregation step
+        if show_raw_outputs:
+            print("\n" + "=" * 80)
+            print(f"STEP {t}/{steps} - Aggregation (Harmony)")
+            print("=" * 80)
+            for i, cand in enumerate(candidates):
+                print(f"\n{'#' * 80}")
+                print(f"# CANDIDATE {i+1}/{population} (aggregated from indices {subsets_used[i]})")
+                print(f"{'#' * 80}")
+                print("\n[OUTPUT]")
+                print(cand)
+                print("-" * 80)
+    
+    return candidates
+
 
 async def run_rsa_tinker(
     question: str,
@@ -514,15 +716,40 @@ def create_sampling_params(args, backend: str):
 
 async def main_tinker(args):
     """Main function for tinker backend."""
+    # Detect if model is a GPT-OSS model (requires Harmony format)
+    use_harmony = is_gpt_oss_model(args.model)
+    
     service_client = tinker.ServiceClient()
     client = service_client.create_sampling_client(base_model=args.model)
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
     
-    sampling_params = tinker_types.SamplingParams(
-        max_tokens=args.max_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-    )
+    if use_harmony:
+        print(f"[INFO] Detected GPT-OSS model: {args.model}")
+        print(f"[INFO] Using Harmony format with reasoning_effort={args.reasoning_effort}")
+        
+        encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+        tokenizer_or_encoding = encoding
+        
+        # Get stop token IDs from encoding
+        # Use stop_tokens_for_assistant_actions() which returns only <|return|> and <|call|>
+        # Do NOT use stop_tokens() which includes <|end|> - that marks the end of ONE message,
+        # but the model outputs multiple messages (analysis channel -> final channel)
+        stop_token_ids = encoding.stop_tokens_for_assistant_actions()
+        
+        sampling_params = tinker_types.SamplingParams(
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            stop_token_ids=stop_token_ids,
+        )
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        tokenizer_or_encoding = tokenizer
+        
+        sampling_params = tinker_types.SamplingParams(
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+        )
     
     dataset_name = DATASET_MAP[args.difficulty]
     print(f"Using dataset: {dataset_name} (difficulty: {args.difficulty})")
@@ -551,17 +778,32 @@ async def main_tinker(args):
     
     # Run RSA
     show_raw = args.show_raw_outputs and not args.no_raw_outputs
-    candidates = await run_rsa_tinker(
-        question=obs,
-        tokenizer=tokenizer,
-        client=client,
-        sampling_params=sampling_params,
-        population=args.population,
-        k=args.k,
-        steps=args.steps,
-        verbose=True,
-        show_raw_outputs=show_raw,
-    )
+    
+    if use_harmony:
+        candidates = await run_rsa_tinker_harmony(
+            question=obs,
+            encoding=tokenizer_or_encoding,
+            client=client,
+            sampling_params=sampling_params,
+            population=args.population,
+            k=args.k,
+            steps=args.steps,
+            verbose=True,
+            show_raw_outputs=show_raw,
+            reasoning_effort=args.reasoning_effort,
+        )
+    else:
+        candidates = await run_rsa_tinker(
+            question=obs,
+            tokenizer=tokenizer_or_encoding,
+            client=client,
+            sampling_params=sampling_params,
+            population=args.population,
+            k=args.k,
+            steps=args.steps,
+            verbose=True,
+            show_raw_outputs=show_raw,
+        )
     
     # Evaluate candidates
     print("\n[Evaluating candidates...]")
@@ -693,7 +935,7 @@ def main():
                         help="Max tokens for generation")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="Sampling temperature (paper uses 1.0)")
-    parser.add_argument("--top_p", type=float, default=1.0,
+    parser.add_argument("--top-p", type=float, default=1.0, dest="top_p",
                         help="Top-p sampling (paper uses 1.0)")
     
     # Problem selection
@@ -713,6 +955,11 @@ def main():
     parser.add_argument("--no_raw_outputs", action="store_true",
                         help="Disable showing raw outputs at every step")
     
+    # Harmony-specific arguments (for GPT-OSS models)
+    parser.add_argument("--reasoning-effort", type=str, default="medium",
+                        choices=["none", "low", "medium", "high"],
+                        help="Reasoning effort level for Harmony models (default: medium)")
+    
     args = parser.parse_args()
     
     # Validate K <= N
@@ -728,6 +975,13 @@ def main():
     print(f"RSA params: N={args.population}, K={args.k}, T={args.steps}")
     print("=" * 60)
     print()
+    
+    # Check if GPT-OSS model requires tinker backend
+    if is_gpt_oss_model(args.model) and args.backend == "vllm":
+        raise ValueError(
+            f"GPT-OSS model '{args.model}' requires Harmony format, which is only supported "
+            "with the tinker backend. Please use --backend tinker."
+        )
     
     if args.backend == "tinker":
         if not TINKER_AVAILABLE:

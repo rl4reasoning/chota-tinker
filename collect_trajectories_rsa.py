@@ -679,6 +679,7 @@ def main(args):
             "steps": args.steps,
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
+            "top_p": args.top_p,
         }
     )
     
@@ -809,6 +810,7 @@ def main(args):
         "steps": args.steps,
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
+        "top_p": args.top_p,
         "timestamp": datetime.now().isoformat(),
         "splits": list(splits_dict.keys()),
         "metrics_per_step": metrics_per_step,
