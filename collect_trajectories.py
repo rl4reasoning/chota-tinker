@@ -1187,7 +1187,8 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="bicycleman15/intellect_3_code_easy_medium",
                         choices=["bicycleman15/intellect_3_code_easy_medium", "bicycleman15/intellect_3_code_hard",
                                  "bicycleman15/intellect_3_code_very_hard", "PrimeIntellect/INTELLECT-3-RL", 
-                                 "anirudhb11/lcb_v6_feb_may_2025_formatted", "anirudhb11/lcb_v6_feb_may_2025_formatted_hardest_to_easiest", "anirudhb11/intellect_3_code_very_hard_top_400_hardest", "anirudhb11/qwen3_4b_instruct_top_400_hardest_interations_10_turns"])
+                                 "anirudhb11/lcb_v6_feb_may_2025_formatted", "anirudhb11/lcb_v6_feb_may_2025_formatted_hardest_to_easiest", "anirudhb11/intellect_3_code_very_hard_top_400_hardest", "anirudhb11/qwen3_4b_instruct_top_400_hardest_interations_10_turns", 
+                                 "anirudhb11/lcbv6-st-160x8k-solves-mt-32x4kx10-not-solve"])
     parser.add_argument("--start-problem", type=int, default=0,
                         help="Starting problem index for dataset slicing (default: 0)")
     parser.add_argument("--num-problems", type=int, default=20)
