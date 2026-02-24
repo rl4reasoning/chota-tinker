@@ -220,6 +220,7 @@ SOLUTION STRESS TEST (CRITICAL)
   • A concrete counterexample where your approach disagrees with the oracle.
 - If a counterexample is found, you MUST revise your approach and repeat the oracle test.
 
+Do not overfit to the examples provided in the prompt. 
 Testing only the examples provided in the prompt does NOT count as validation or falsification.
 
 ────────────────────────
@@ -243,6 +244,7 @@ FINAL CODE REQUIREMENTS
 - The final code MUST read inputs from stdin and MUST NOT hardcode inputs.
 - The final answer MUST clearly depend on interaction-generated evidence.
 - Do NOT include <interact></interact> blocks after the final code.
+- Make sure that the final code runs efficiently for the problem sizes described in the question.
 """
 
 FINAL_PROMPT = """STOP. Do NOT use <interact> anymore. Your interaction budget is exhausted.
