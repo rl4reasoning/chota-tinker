@@ -220,7 +220,7 @@ SOLUTION STRESS TEST (CRITICAL)
   • A concrete counterexample where your approach disagrees with the oracle.
 - If a counterexample is found, you MUST revise your approach and repeat the oracle test.
 
-Do not overfit to the examples provided in the prompt. 
+DO NOT overfit to the examples provided in the prompt. 
 Testing only the examples provided in the prompt does NOT count as validation or falsification.
 
 ────────────────────────
