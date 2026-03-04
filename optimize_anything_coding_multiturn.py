@@ -1,37 +1,22 @@
-"""
-Use GEPA's optimize_anything framework to optimize a system prompt that boosts
-an LLM's multi-turn coding accuracy across LCB problems.
+"""GEPA optimize_anything: optimize a system prompt for multi-turn LCB coding.
 
-Like optimize_anything_coding.py but uses IntellectCodeEnv for multi-turn
-<interact></interact>-based code execution trajectories.
-
-The candidate is a system prompt.  For each problem the evaluator:
-  1. Resets IntellectCodeEnv for that problem.
-  2. Runs a multi-turn loop (up to --max-turns steps):
-     a. Calls the solver LLM with stop=["</interact>"].
-     b. Postprocesses the response (closes unclosed <interact> tags).
-     c. Calls env.step(response).
-     d. On the last turn, appends FINAL_PROMPT to force final code output.
-  3. Returns the final reward from the env (0-1 fraction of test cases passed).
-  4. Logs turn count, interact count, reward, and code preview as ASI.
-
-GEPA then iterates, proposing improved system prompts based on what went wrong.
+Each evaluator runs a multi-turn loop with IntellectCodeEnv: solver LLM uses
+<interact></interact> blocks for code execution, then submits a final ```python solution.
 
 Usage:
   python optimize_anything_coding_multiturn.py \
-    --model Qwen/Qwen3-4B-Instruct-2507 \
-    --n-problems 8 --max-turns 5 \
-    --reflection-minibatch-size 4 \
+    --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+    --n-problems 8 --max-turns 5 --reflection-minibatch-size 4 \
     --proposer-model anthropic/claude-sonnet-4-6 \
-    --output-dir ./run_multiturn_003 \
-    --max-metric-calls 80
+    --output-dir ./run_multiturn_003 --max-metric-calls 80
 
-Prerequisites:
-  pip install litellm           # GEPA uses litellm for its internal proposer LLM
-
-  # Set the API key matching your --proposer-model:
-  export ANTHROPIC_API_KEY=sk-ant-...       # for anthropic/claude-sonnet-4-6, etc.
-  export OPENAI_API_KEY=sk-...              # for openai/gpt-4o, openai/gpt-4o-mini, etc.
+  # Fair comparison run (30B model, multi-turn):
+  python optimize_anything_coding_multiturn.py \
+    --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+    --n-problems 12 --max-turns 5 --reflection-minibatch-size 4 \
+    --max-tokens 4096 \
+    --proposer-model anthropic/claude-sonnet-4-6 \
+    --output-dir ./run_multiturn_30b --max-metric-calls 240
 """
 
 from __future__ import annotations
@@ -40,9 +25,12 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sys
 import threading
 from typing import Any
+
+import hashlib
 
 import litellm
 import requests
@@ -60,9 +48,76 @@ from utils.vllm_multi_gpu import (
     wait_for_vllm_servers,
 )
 
-# --------------------------------------------------------------------------- #
-# Defaults
-# --------------------------------------------------------------------------- #
+
+class BudgetLogger:
+    """Sequential log (budget_log.txt) showing how the evaluation budget is used.
+
+    Lines in arrival order:
+      >> NEW SEED / CANDIDATE   — first time a candidate hash is seen
+      METRIC N/max              — each evaluator call (problem, score, turns)
+      PROPOSER #N               — each proposer call (tokens, budget, problems shown)
+    """
+
+    def __init__(self, log_path: str, max_metric_calls: int, n_problems: int, append: bool = False) -> None:
+        self._path = log_path
+        self._max = max_metric_calls
+        self._lock = threading.Lock()
+        self._metric_count = 0
+        self._proposer_count = 0
+        implied = max_metric_calls // n_problems if n_problems else "?"
+        if append:
+            with open(log_path, "a") as f:
+                f.write(f"\n{'='*70}\n")
+                f.write(f"RESUMED at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"  max_metric_calls : {max_metric_calls}\n")
+                f.write(f"{'='*70}\n\n")
+        else:
+            with open(log_path, "w") as f:
+                f.write("BUDGET LOG\n")
+                f.write(f"  max_metric_calls : {max_metric_calls}\n")
+                f.write(f"  n_problems       : {n_problems}\n")
+                f.write(f"  implies          : ~{implied} candidate evaluations\n")
+                f.write("=" * 70 + "\n\n")
+
+    @staticmethod
+    def _ts() -> str:
+        return datetime.datetime.now().strftime("%H:%M:%S")
+
+    def _append(self, line: str) -> None:
+        with self._lock:
+            with open(self._path, "a") as f:
+                f.write(line + "\n")
+
+    def log_new_candidate(self, candidate_id: int, cand_hash: str) -> None:
+        label = "SEED" if candidate_id == 1 else f"CANDIDATE #{candidate_id}"
+        self._append(f"[{self._ts()}]  >> NEW {label} ({cand_hash})")
+
+    def log_metric(self, cand_hash: str, candidate_id: int, prob_idx: Any, score: float, extra: str = "") -> int:
+        """Log one evaluator call. Returns the 1-based call number."""
+        with self._lock:
+            self._metric_count += 1
+            call_num = self._metric_count
+        label = "seed" if candidate_id == 1 else f"cand#{candidate_id}"
+        self._append(
+            f"[{self._ts()}]  METRIC  {call_num:4d}/{self._max}"
+            f"  {label}({cand_hash})  prob={prob_idx}  score={score:.4f}{extra}"
+        )
+        return call_num
+
+    def log_proposer(self, in_tokens: int | None, out_tokens: int | None, prob_indices: list[int]) -> None:
+        with self._lock:
+            self._proposer_count += 1
+            call_num = self._proposer_count
+            current_evals = self._metric_count
+        remaining = self._max - current_evals
+        tok_str = f"in={in_tokens}tok  out={out_tokens}tok" if in_tokens is not None else "tokens=unknown"
+        idx_str = str(sorted(prob_indices)) if prob_indices else "unknown"
+        self._append(
+            f"[{self._ts()}]  PROPOSER #{call_num}  {tok_str}"
+            f"  [budget: {current_evals}/{self._max}  ({remaining} remaining)]"
+            f"  shown_probs={idx_str}"
+        )
+
 
 DEFAULT_DATASET = "bicycleman15/intellect_3_code_very_hard"
 DEFAULT_MAX_TURNS = 5
@@ -70,10 +125,8 @@ DEFAULT_INTERACT_TIMEOUT_S = 10.0
 DEFAULT_EVAL_TIMEOUT_S = 5.0
 DEFAULT_PROPOSER_MODEL = "openai/gpt-4o-mini"
 DEFAULT_N_PROBLEMS = 10
-DEFAULT_MAX_METRIC_CALLS = None  # None → auto: n_problems * 10
+DEFAULT_MAX_METRIC_CALLS = None  # auto: n_problems * 10
 
-# Seed system prompt — the full multi-turn system prompt from collect_trajectories.py.
-# GEPA will iteratively improve it based on failures.
 SEED_SYSTEM_PROMPT = """You are a helpful coding assistant.
 
 You have access to a Python interpreter.
@@ -170,18 +223,8 @@ Based on all the information and debugging you have done so far, write your best
 Output ONLY the final ```python``` code block. No more <interact> blocks allowed."""
 
 
-# --------------------------------------------------------------------------- #
-# Proposer query logger
-# --------------------------------------------------------------------------- #
-
-def install_proposer_logger(output_dir: str) -> None:
-    """Monkey-patch litellm.completion to log every proposer query.
-
-    Appends one JSON object per line to <output_dir>/proposer_queries.jsonl:
-      {"call": N, "timestamp": "...", "model": "...", "messages": [...]}
-
-    Safe to call from multi-threaded GEPA (all writes are serialized via a lock).
-    """
+def install_proposer_logger(output_dir: str, budget_logger: "BudgetLogger | None" = None) -> None:
+    """Log proposer queries to proposer_queries.jsonl; optionally update budget_log.txt."""
     os.makedirs(output_dir, exist_ok=True)
     log_path = os.path.join(output_dir, "proposer_queries.jsonl")
     _lock = threading.Lock()
@@ -196,96 +239,72 @@ def install_proposer_logger(output_dir: str) -> None:
         completion = _orig(model=model, messages=messages, **kwargs)
 
         usage = getattr(completion, "usage", None)
-        entry = {
-            "call": idx,
-            "timestamp": datetime.datetime.now().isoformat(),
-            "model": model,
-            "input_tokens": getattr(usage, "prompt_tokens", None),
-            "output_tokens": getattr(usage, "completion_tokens", None),
-            "messages": messages,
-        }
+        in_tokens = getattr(usage, "prompt_tokens", None)
+        out_tokens = getattr(usage, "completion_tokens", None)
         with _lock:
             with open(log_path, "a") as f:
-                f.write(json.dumps(entry) + "\n")
+                f.write(json.dumps({
+                    "call": idx,
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "model": model,
+                    "input_tokens": in_tokens,
+                    "output_tokens": out_tokens,
+                    "messages": messages,
+                }) + "\n")
+
+        if budget_logger is not None:
+            full_text = "\n".join(m.get("content", "") or "" for m in messages if isinstance(m, dict))
+            prob_indices = [int(x) for x in re.findall(r"PROBLEM_INDEX:\s*(-?\d+)", full_text) if int(x) >= 0]
+            budget_logger.log_proposer(in_tokens, out_tokens, prob_indices)
+
         return completion
 
     litellm.completion = _logged
-    print(f"[proposer logger] Proposer queries will be logged to: {log_path}")
+    print(f"[proposer logger] → {log_path}")
 
-
-# --------------------------------------------------------------------------- #
-# Response postprocessing
-# --------------------------------------------------------------------------- #
 
 def postprocess_response(response: str) -> str:
-    """Close unclosed <interact> tags (the stop sequence cuts off the closing tag)."""
+    """Close unclosed <interact> tags cut off by the stop sequence."""
     if "<interact>" in response and "</interact>" not in response:
         response += "</interact>"
     return response
 
 
-# --------------------------------------------------------------------------- #
-# vLLM engine  (same helpers as optimize_anything_coding.py)
-# --------------------------------------------------------------------------- #
-
 def launch_vllm_engine(args) -> tuple[str, str]:
-    """Launch a vLLM server subprocess and return (openai_base_url, model_name)."""
     gpu_ids = resolve_vllm_gpu_ids(args)
     server_urls = build_vllm_server_urls(args, gpu_ids)
-
-    print(f"Launching vLLM server: {args.model}")
-    print(f"  GPUs : {', '.join(gpu_ids)}")
-    print(f"  URL(s): {', '.join(server_urls)}")
-
+    print(f"Launching vLLM: {args.model}  GPUs={','.join(gpu_ids)}")
     processes = launch_vllm_servers(args, gpu_ids)
     register_vllm_shutdown(processes)
-
-    print(f"Waiting for vLLM to be ready (timeout: {args.vllm_startup_timeout_s}s) ...")
+    print(f"Waiting for vLLM (timeout={args.vllm_startup_timeout_s}s) ...")
     wait_for_vllm_servers(server_urls, args.vllm_startup_timeout_s)
-    print("vLLM server is ready.\n")
-
-    openai_base_url = server_urls[0].rstrip("/") + "/v1"
-    return openai_base_url, args.model
+    print("vLLM ready.\n")
+    return server_urls[0].rstrip("/") + "/v1", args.model
 
 
 def connect_vllm_server(vllm_url: str, solver_model: str | None) -> tuple[str, str]:
-    """Connect to an already-running vLLM server and return (openai_base_url, model_name)."""
     openai_base_url = vllm_url.rstrip("/") + "/v1"
     if solver_model:
         return openai_base_url, solver_model
-
-    url = openai_base_url + "/models"
     try:
-        resp = requests.get(url, timeout=5)
+        resp = requests.get(openai_base_url + "/models", timeout=5)
         resp.raise_for_status()
         models = resp.json().get("data", [])
         if not models:
             raise RuntimeError("/v1/models returned an empty list")
-        model_name = models[0]["id"]
+        return openai_base_url, models[0]["id"]
     except Exception as e:
         raise RuntimeError(
-            f"Could not fetch model list from {url}: {e}\n"
+            f"Could not fetch model from {openai_base_url}: {e}\n"
             "Is the vLLM server running? Pass --solver-model to skip auto-detection."
         ) from e
 
-    return openai_base_url, model_name
-
-
-# --------------------------------------------------------------------------- #
-# Dataset loading
-# --------------------------------------------------------------------------- #
 
 def load_problems_multiturn(
     dataset_name: str,
     start: int = 0,
     end: int | None = None,
 ) -> tuple[Any, list[dict[str, Any]]]:
-    """Load dataset slice.
-
-    Returns (hf_dataset_slice, problems) where problems is a list of
-    {"question": ..., "_index": i} dicts and _index is the 0-based index
-    within the returned slice (used to initialize IntellectCodeEnv).
-    """
     if dataset_name.startswith("bicycleman15/") or dataset_name.startswith("anirudhb11/intellect_"):
         full_ds = load_dataset(dataset_name, split="train")
     elif "lcb" in dataset_name:
@@ -299,10 +318,6 @@ def load_problems_multiturn(
     problems = [{"question": sliced[i]["question"], "_index": i} for i in range(len(sliced))]
     return sliced, problems
 
-
-# --------------------------------------------------------------------------- #
-# Prompt optimization
-# --------------------------------------------------------------------------- #
 
 def run_prompt_optimization(
     hf_dataset: Any,
@@ -319,20 +334,36 @@ def run_prompt_optimization(
     api_key: str,
     reflection_minibatch_size: int | None = None,
     max_metric_calls: int | None = DEFAULT_MAX_METRIC_CALLS,
+    budget_logger: "BudgetLogger | None" = None,
+    output_dir: str | None = None,
 ) -> Any:
-    """Optimize a system prompt across N problems using multi-turn trajectories."""
     client = OpenAI(api_key=api_key, base_url=base_url)
+    _cand_lock = threading.Lock()
+    _state = {"candidates": {}, "cand_id": 0}
 
     def evaluator(system_prompt: str, example: dict[str, Any]) -> float:
+        cand_hash = hashlib.md5(system_prompt.encode()).hexdigest()[:8]
+        with _cand_lock:
+            is_new = cand_hash not in _state["candidates"]
+            if is_new:
+                _state["cand_id"] += 1
+                _state["candidates"][cand_hash] = _state["cand_id"]
+            candidate_id = _state["candidates"][cand_hash]
+
+        if is_new and budget_logger is not None:
+            budget_logger.log_new_candidate(candidate_id, cand_hash)
+
+        prob_idx = example.get("_index", "?")
+
         env = IntellectCodeEnv(
-            system_prompt="",         # system prompt lives in messages history
+            system_prompt="",
             dataset_name=dataset_name,
             problem_index=example["_index"],
             max_turns=max_turns,
             dataset=hf_dataset,
             interaction_timeout_s=interact_timeout_s,
             eval_timeout_s=eval_timeout_s,
-            interaction_mode=False,   # system prompt already contains interaction rules
+            interaction_mode=False,
         )
         try:
             obs, _ = env.reset()
@@ -345,11 +376,13 @@ def run_prompt_optimization(
         interact_count = 0
         tle_count = 0
         all_assistant_responses: list[str] = []
+        all_obs: list[str] = []
+        terminated = False
 
         for turn in range(max_turns):
-            # On the last turn append FINAL_PROMPT to force final code submission.
             is_last_turn = (turn == max_turns - 1)
             user_content = f"{obs}\n\n{FINAL_PROMPT}" if is_last_turn else obs
+            all_obs.append(user_content)
             messages.append({"role": "user", "content": user_content})
 
             try:
@@ -382,23 +415,45 @@ def run_prompt_optimization(
             if terminated or truncated:
                 break
 
-        # Compute passed count from reward and total test cases.
         n_tests = len(env.tests.get("inputs", []))
         passed = round(total_reward * n_tests)
 
-        # Log diagnostic info as ASI so GEPA can read it when proposing improvements.
-        full_conversation = "\n\n---\n\n".join(
-            f"[Turn {i + 1}]\n{r}" for i, r in enumerate(all_assistant_responses)
-        )
-        asi_parts = [
-            f"Turns used: {env.current_turn}/{max_turns}",
-            f"Interact blocks: {interact_count}",
-            f"Test results: {passed}/{n_tests} passed. TLE: {tle_count}.",
-            f"\nQuestion:\n{example['question']}",
-            f"\nFull LLM responses:\n{full_conversation}",
-        ]
-        oa.log("\n".join(asi_parts))
+        # Build conversation log: interleave assistant responses with interpreter outputs.
+        turn_parts = []
+        for i, assistant_resp in enumerate(all_assistant_responses):
+            turn_parts.append(f"[Turn {i + 1} - Assistant]\n{assistant_resp}")
+            if i < len(all_obs) - 1:
+                turn_parts.append(f"[Turn {i + 1} - Interpreter output]\n{all_obs[i + 1]}")
+        full_conversation = "\n\n---\n\n".join(turn_parts)
 
+        # Log diagnostic info as ASI. Plain-text delimiters avoid breaking the proposer's ``` fence.
+        sep = "=" * 40
+        oa.log("\n".join([
+            sep,
+            f"RESULT: {passed}/{n_tests} tests passed | TLE: {tle_count} | Turns: {env.current_turn}/{max_turns} | Interacts: {interact_count} | PROBLEM_INDEX: {prob_idx}",
+            sep,
+            "",
+            "QUESTION:",
+            example["question"],
+            "",
+            "FULL CONVERSATION:",
+            full_conversation,
+        ]))
+
+        turns_used = env.current_turn
+        early_stop = terminated and turns_used < max_turns
+        cand_type = "seed" if candidate_id == 1 else f"cand#{candidate_id}"
+        extra = (
+            f"  turns={turns_used}/{max_turns}  interacts={interact_count}  TLE={tle_count}"
+            + (" [early-stop]" if early_stop else "")
+        )
+
+        call_num = budget_logger.log_metric(cand_hash, candidate_id, prob_idx, total_reward, extra) if budget_logger else "?"
+        print(
+            f"[metric #{call_num}] {cand_type}({cand_hash}) prob={prob_idx} → "
+            f"score={total_reward:.4f} ({passed}/{n_tests}) turns={turns_used}/{max_turns} "
+            f"interacts={interact_count} TLE={tle_count}" + (" [early-stop]" if early_stop else "")
+        )
         return total_reward
 
     gepa_config = GEPAConfig(
@@ -406,13 +461,13 @@ def run_prompt_optimization(
             max_metric_calls=max_metric_calls,
             parallel=True,
             max_workers=len(problems),
+            run_dir=output_dir,
         ),
         reflection=ReflectionConfig(
             reflection_lm=proposer_model,
             reflection_minibatch_size=reflection_minibatch_size,
         ),
     )
-
     return oa.optimize_anything(
         seed_candidate=SEED_SYSTEM_PROMPT,
         evaluator=evaluator,
@@ -433,183 +488,121 @@ def run_prompt_optimization(
     )
 
 
-# --------------------------------------------------------------------------- #
-# Evolution dump
-# --------------------------------------------------------------------------- #
-
 def dump_evolution(result: Any, output_dir: str) -> None:
-    """Write candidate evolution to output_dir after optimization completes."""
     os.makedirs(output_dir, exist_ok=True)
 
-    json_path = os.path.join(output_dir, "evolution.json")
-    with open(json_path, "w") as f:
+    with open(os.path.join(output_dir, "evolution.json"), "w") as f:
         json.dump(result.to_dict(), f, indent=2)
-    print(f"Evolution JSON written to {json_path}")
 
     key = result._str_candidate_key
-
     def _get_text(cand_dict: dict) -> str:
-        if key and key in cand_dict:
-            return cand_dict[key]
-        return json.dumps(cand_dict, indent=2)
+        return cand_dict[key] if key and key in cand_dict else json.dumps(cand_dict, indent=2)
 
     indices = sorted(range(result.num_candidates), key=lambda i: result.discovery_eval_counts[i])
 
-    lines = []
-    lines.append(f"{'='*70}")
-    lines.append(f"CANDIDATE EVOLUTION  ({result.num_candidates} candidates)")
-    lines.append(f"Total metric calls: {result.total_metric_calls}")
-    lines.append(
-        f"Best candidate idx: {result.best_idx}  "
-        f"(score={result.val_aggregate_scores[result.best_idx]:.4f})"
-    )
-    lines.append(f"{'='*70}")
-
+    lines = [
+        "=" * 70,
+        f"CANDIDATE EVOLUTION  ({result.num_candidates} candidates)",
+        f"Total metric calls: {result.total_metric_calls}",
+        f"Best candidate idx: {result.best_idx}  (score={result.val_aggregate_scores[result.best_idx]:.4f})",
+        "=" * 70,
+    ]
     for idx in indices:
         score = result.val_aggregate_scores[idx]
-        eval_count = result.discovery_eval_counts[idx]
-        parents = result.parents[idx]
-        parent_str = ", ".join(str(p) for p in parents if p is not None) or "seed"
+        parent_str = ", ".join(str(p) for p in result.parents[idx] if p is not None) or "seed"
         is_best = "  *** BEST ***" if idx == result.best_idx else ""
         text = _get_text(result.candidates[idx])
         preview = text[:600] + ("\n[... truncated ...]" if len(text) > 600 else "")
-
-        lines.append(f"\n--- Candidate #{idx}  (found at eval_call={eval_count}){is_best}")
-        lines.append(f"    Score : {score:.4f}")
-        lines.append(f"    Parent: {parent_str}")
-        lines.append(f"    Text  :\n{preview}")
-
+        lines += [
+            f"\n--- Candidate #{idx}  (found at eval_call={result.discovery_eval_counts[idx]}){is_best}",
+            f"    Score : {score:.4f}",
+            f"    Parent: {parent_str}",
+            f"    Text  :\n{preview}",
+        ]
     lines.append(f"\n{'='*70}")
 
-    txt_path = os.path.join(output_dir, "evolution.txt")
-    with open(txt_path, "w") as f:
+    with open(os.path.join(output_dir, "evolution.txt"), "w") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"Evolution report written to {txt_path}")
 
-    # ---- JSONL per-candidate dump (full text, machine-readable) --------------
-    jsonl_path = os.path.join(output_dir, "candidates_scores.jsonl")
-    with open(jsonl_path, "w") as f:
+    with open(os.path.join(output_dir, "candidates_scores.jsonl"), "w") as f:
         for idx in indices:
-            entry = {
+            f.write(json.dumps({
                 "idx": idx,
                 "score": result.val_aggregate_scores[idx],
                 "discovery_eval_count": result.discovery_eval_counts[idx],
                 "parents": result.parents[idx],
                 "is_best": idx == result.best_idx,
                 "candidate": _get_text(result.candidates[idx]),
-            }
-            f.write(json.dumps(entry) + "\n")
-    print(f"Candidates JSONL written to {jsonl_path}")
+            }) + "\n")
 
+    print(f"Evolution saved to {output_dir}/")
 
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="GEPA optimize_anything: find the best multi-turn system prompt for LCB coding",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
     )
-    parser.add_argument("--dataset", default=DEFAULT_DATASET,
-                        help="HuggingFace dataset (default: %(default)s)")
+    parser.add_argument("--dataset", default=DEFAULT_DATASET)
 
-    # ---- vLLM engine --------------------------------------------------------
     vllm_group = parser.add_mutually_exclusive_group(required=True)
-    vllm_group.add_argument("--model",
-                            help="HuggingFace model to load and serve via vLLM "
-                                 "(launches a vLLM subprocess)")
-    vllm_group.add_argument("--vllm-url",
-                            help="Connect to an already-running vLLM server "
-                                 "(e.g. http://localhost:8000)")
+    vllm_group.add_argument("--model", help="HuggingFace model to serve via vLLM")
+    vllm_group.add_argument("--vllm-url", help="URL of a running vLLM server")
 
-    # vLLM server settings — only relevant when --model is used
-    parser.add_argument("--vllm-port", type=int, default=8000,
-                        dest="vllm_server_base_port",
-                        help="Port for the vLLM server (default: 8000)")
-    parser.add_argument("--vllm-host", default="127.0.0.1",
-                        dest="vllm_server_host",
-                        help="Host to bind the vLLM server (default: 127.0.0.1)")
-    parser.add_argument("--gpu-ids", default=None,
-                        dest="vllm_gpu_ids",
-                        help="Comma-separated GPU IDs for vLLM (default: all visible GPUs)")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
-                        help="vLLM GPU memory utilization (default: 0.9)")
-    parser.add_argument("--max-model-len", type=int, default=None,
-                        help="vLLM max sequence length (default: model default)")
-    parser.add_argument("--startup-timeout", type=float, default=300.0,
-                        dest="vllm_startup_timeout_s",
-                        help="Seconds to wait for vLLM to be ready (default: 300)")
-
-    # ---- solver / proposer --------------------------------------------------
-    parser.add_argument("--solver-model", default=None,
-                        help="Override solver model name (auto-detected from vLLM if not set)")
-    parser.add_argument("--proposer-model", default=DEFAULT_PROPOSER_MODEL,
-                        help="litellm model string for GEPA's internal proposer "
-                             "(default: %(default)s)")
-    parser.add_argument("--api-key", default="token",
-                        help="API key for the solver server (default: 'token', fine for vLLM)")
-    parser.add_argument("--max-tokens", type=int, default=4096,
-                        help="Max tokens per LLM call per turn (default: %(default)s)")
-
-    # ---- task ---------------------------------------------------------------
-    parser.add_argument("--n-problems", type=int, default=DEFAULT_N_PROBLEMS,
-                        help="Number of problems to evaluate per candidate (default: %(default)s)")
-    parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS,
-                        help="Max interaction turns per problem per evaluation (default: %(default)s)")
-    parser.add_argument("--interact-timeout", type=float, default=DEFAULT_INTERACT_TIMEOUT_S,
-                        dest="interact_timeout_s",
-                        help="Timeout in seconds for each <interact> code execution (default: %(default)s)")
-    parser.add_argument("--eval-timeout", type=float, default=DEFAULT_EVAL_TIMEOUT_S,
-                        dest="eval_timeout_s",
-                        help="Per-test-case timeout for final evaluation (default: %(default)s)")
-    parser.add_argument("--objective", default=None,
-                        help="Override the optimization objective text")
-    parser.add_argument("--max-metric-calls", type=int, default=None,
-                        dest="max_metric_calls",
-                        help="Total evaluator calls budget (stopping condition). "
-                             "With N problems this gives max_metric_calls/N candidate evaluations. "
-                             "Default: n_problems * 10 (i.e. ~10 candidate evaluations).")
-    parser.add_argument("--reflection-minibatch-size", type=int, default=None,
-                        dest="reflection_minibatch_size",
-                        help="Problems shown to proposer per reflection step "
-                             "(default: 3). Lower = faster; higher = richer feedback.")
-    parser.add_argument("--output-dir", default=None,
-                        help="If set, dump evolution.json and evolution.txt here after optimization")
+    parser.add_argument("--vllm-port", type=int, default=8000, dest="vllm_server_base_port")
+    parser.add_argument("--vllm-host", default="127.0.0.1", dest="vllm_server_host")
+    parser.add_argument("--gpu-ids", default=None, dest="vllm_gpu_ids")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--max-model-len", type=int, default=None)
+    parser.add_argument("--startup-timeout", type=float, default=300.0, dest="vllm_startup_timeout_s")
+    parser.add_argument("--solver-model", default=None)
+    parser.add_argument("--proposer-model", default=DEFAULT_PROPOSER_MODEL)
+    parser.add_argument("--api-key", default="token")
+    parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--n-problems", type=int, default=DEFAULT_N_PROBLEMS)
+    parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
+    parser.add_argument("--interact-timeout", type=float, default=DEFAULT_INTERACT_TIMEOUT_S, dest="interact_timeout_s")
+    parser.add_argument("--eval-timeout", type=float, default=DEFAULT_EVAL_TIMEOUT_S, dest="eval_timeout_s")
+    parser.add_argument("--objective", default=None)
+    parser.add_argument("--max-metric-calls", type=int, default=None, dest="max_metric_calls",
+                        help="Total evaluator calls budget; default = n_problems * 10")
+    parser.add_argument("--reflection-minibatch-size", type=int, default=None, dest="reflection_minibatch_size",
+                        help="Problems shown to proposer per reflection step (default: 3)")
+    parser.add_argument("--output-dir", default=None)
 
     args = parser.parse_args()
 
-    # Auto-scale max_metric_calls if not explicitly set.
     if args.max_metric_calls is None:
         args.max_metric_calls = args.n_problems * 10
-        print(f"[auto] max-metric-calls = {args.max_metric_calls} ({args.n_problems} problems × 10)")
+        print(f"[auto] max-metric-calls = {args.max_metric_calls}")
 
-    # ---- Resolve solver endpoint -------------------------------------------
     if args.model:
         base_url, solver_model = launch_vllm_engine(args)
     else:
         base_url, solver_model = connect_vllm_server(args.vllm_url, args.solver_model)
-
     print(f"Solver: {solver_model}  ({base_url})\n")
 
-    # ---- Install proposer logger (if output dir specified) -----------------
+    budget_logger = None
     if args.output_dir:
-        install_proposer_logger(args.output_dir)
+        os.makedirs(args.output_dir, exist_ok=True)
+        gepa_state_path = os.path.join(args.output_dir, "gepa_state.bin")
+        is_resuming = os.path.exists(gepa_state_path)
+        if is_resuming:
+            print(f"[resume] Checkpoint found in {args.output_dir!r} — resuming optimization.")
+        else:
+            with open(os.path.join(args.output_dir, "args.json"), "w") as f:
+                json.dump(vars(args), f, indent=2)
+        budget_log_path = os.path.join(args.output_dir, "budget_log.txt")
+        budget_logger = BudgetLogger(budget_log_path, args.max_metric_calls, args.n_problems, append=is_resuming)
+        print(f"[budget logger] → {budget_log_path}")
+        install_proposer_logger(args.output_dir, budget_logger)
 
-    # ---- Load dataset -------------------------------------------------------
-    print(f"Loading {args.n_problems} problem(s) from {args.dataset} ...")
+    print(f"Loading {args.n_problems} problems from {args.dataset} ...")
     hf_dataset, problems = load_problems_multiturn(args.dataset, start=0, end=args.n_problems)
     if not problems:
         print("ERROR: no problems loaded", file=sys.stderr)
         sys.exit(1)
-    print(f"Loaded {len(problems)} problems.")
-    print(f"Max turns per trajectory: {args.max_turns}")
-    print(f"\nSeed system prompt (first 200 chars):\n{'-'*50}")
-    print(SEED_SYSTEM_PROMPT[:200] + "...")
-    print(f"{'-'*50}\n")
+    print(f"Loaded {len(problems)} problems.  Max turns: {args.max_turns}\n")
 
-    # ---- Run optimization --------------------------------------------------
     result = run_prompt_optimization(
         hf_dataset=hf_dataset,
         problems=problems,
@@ -625,41 +618,19 @@ def main() -> None:
         api_key=args.api_key,
         reflection_minibatch_size=args.reflection_minibatch_size,
         max_metric_calls=args.max_metric_calls,
+        budget_logger=budget_logger,
+        output_dir=args.output_dir,
     )
 
-    print("\n" + "=" * 70)
-    print("OPTIMIZATION COMPLETE")
-    print("=" * 70)
     best_score = result.val_aggregate_scores[result.best_idx]
-    print(f"Candidates explored : {result.num_candidates}")
-    print(f"Total metric calls  : {result.total_metric_calls}")
-    print(f"Best candidate idx  : {result.best_idx}")
-    print(f"Best score          : {best_score:.4f}")
-
-    print(f"\n{'─' * 70}")
-    print("FINAL SYSTEM PROMPT")
-    print(f"{'─' * 70}")
+    print(f"\n{'='*70}")
+    print(f"DONE  candidates={result.num_candidates}  metric_calls={result.total_metric_calls}"
+          f"  best_idx={result.best_idx}  score={best_score:.4f}")
+    print(f"{'='*70}\n")
+    print("BEST SYSTEM PROMPT")
+    print("─" * 70)
     print(result.best_candidate)
-    print(f"{'─' * 70}")
-
-    # ---- Print all candidates summary to stdout ----------------------------
-    key = result._str_candidate_key
-    indices = sorted(range(result.num_candidates),
-                     key=lambda i: result.discovery_eval_counts[i])
-    print(f"\n{'─' * 70}")
-    print(f"ALL CANDIDATES  ({result.num_candidates} total, sorted by discovery order)")
-    print(f"{'─' * 70}")
-    for idx in indices:
-        score = result.val_aggregate_scores[idx]
-        parents = result.parents[idx]
-        parent_str = ", ".join(str(p) for p in parents if p is not None) or "seed"
-        is_best = "  ★ BEST" if idx == result.best_idx else ""
-        cand = result.candidates[idx]
-        text = cand[key] if key and key in cand else json.dumps(cand)
-        preview = text[:120].replace("\n", " ↵ ")
-        print(f"  #{idx:<2d}  score={score:.4f}  parent={parent_str:<6s}{is_best}")
-        print(f"       {preview}...")
-    print(f"{'─' * 70}")
+    print("─" * 70)
 
     if args.output_dir:
         dump_evolution(result, args.output_dir)
