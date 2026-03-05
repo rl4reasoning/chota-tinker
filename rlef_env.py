@@ -16,11 +16,237 @@ Usage:
     obs, reward, terminated, truncated, info = env.step(action)
 """
 
+import json as _json
 from typing import Any, Optional, Tuple
 
 from intellect_env import IntellectCodeEnv
 from utils.fast_eval import _exec_code_subprocess, _evaluate_code, _normalize_io
 from code_env.code_env.utils.deepcoder_utils import BASE_IMPORTS, process_input_output
+
+
+# ======================================================================
+# Standalone functions for batched public test execution.
+# These are module-level (picklable) so they can run in a ProcessPoolExecutor.
+# ======================================================================
+
+def _build_public_test_harness(
+    code: str,
+    inputs: list[str],
+    outputs: list[str],
+    fn_name: Optional[str],
+    timeout_s: Optional[float],
+) -> str:
+    """Build a harness that runs code against multiple public tests in one process.
+
+    Returns a Python script that outputs a JSON array of per-test results:
+    ``[{"passed": bool, "actual": str|null, "error": str|null}, ...]``
+    """
+    code_with_imports = BASE_IMPORTS + "\n" + code
+    safe_timeout = timeout_s if timeout_s and timeout_s > 0 else 10.0
+    return f"""
+import contextlib
+import io
+import json
+import os
+import signal
+import sys
+
+_code = {repr(code_with_imports)}
+_inputs = {repr(inputs)}
+_expected = {repr(outputs)}
+_fn_name = {repr(fn_name)}
+_timeout_s = {repr(safe_timeout)}
+
+_original_os_exit = os._exit
+def _safe_os_exit(code=0):
+    raise SystemExit(code)
+os._exit = _safe_os_exit
+
+class _TimeoutException(Exception):
+    pass
+
+def _handler(signum, frame):
+    raise _TimeoutException("Time Limit Exceeded")
+
+_results = []
+
+if _fn_name:
+    # fn_name mode: extract Solution class once, call method per test
+    _ns = {{}}
+    _class_ok = True
+    try:
+        exec(_code, _ns)
+    except Exception as _e:
+        for _ in _inputs:
+            _results.append({{"passed": False, "actual": None, "error": f"{{type(_e).__name__}}: {{_e}}"}})
+        _class_ok = False
+
+    if _class_ok:
+        _sol_class = _ns.get("Solution")
+        _fn = getattr(_sol_class, _fn_name, None) if _sol_class else None
+        if not _sol_class:
+            for _ in _inputs:
+                _results.append({{"passed": False, "actual": None, "error": "No Solution class found"}})
+        elif not _fn:
+            for _ in _inputs:
+                _results.append({{"passed": False, "actual": None, "error": f"Method '{{_fn_name}}' not found"}})
+        else:
+            _sol = _sol_class()
+            for _inp, _exp in zip(_inputs, _expected):
+                _r = {{"passed": False, "actual": None, "error": None}}
+                try:
+                    _old_h = signal.signal(signal.SIGALRM, _handler)
+                    signal.setitimer(signal.ITIMER_REAL, _timeout_s)
+                    _args = list(map(eval, _inp.split("\\n"))) if _inp.strip() else []
+                    _actual = getattr(_sol, _fn_name)(*_args)
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                    signal.signal(signal.SIGALRM, _old_h)
+                    _actual_str = str(_actual)
+                    _r["actual"] = _actual_str
+                    try:
+                        _ev = json.loads(_exp)
+                        _cmp = list(_actual) if isinstance(_actual, tuple) else _actual
+                        _passed = _cmp == _ev
+                        if not _passed and isinstance(_ev, list) and len(_ev) > 0:
+                            _passed = _cmp == _ev[0]
+                    except (json.JSONDecodeError, TypeError):
+                        _passed = _actual_str.strip() == _exp.strip()
+                    _r["passed"] = _passed
+                except _TimeoutException:
+                    _r["error"] = "Time Limit Exceeded"
+                except SystemExit as _se:
+                    if _se.code not in (None, 0):
+                        _r["error"] = f"SystemExit: {{_se}}"
+                except Exception as _e:
+                    _r["error"] = f"{{type(_e).__name__}}: {{_e}}"
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                    try:
+                        signal.signal(signal.SIGALRM, _old_h)
+                    except Exception:
+                        pass
+                _results.append(_r)
+else:
+    # stdin mode: exec code per test with redirected I/O
+    _compiled = compile(_code, "<solution>", "exec")
+    for _inp, _exp in zip(_inputs, _expected):
+        _r = {{"passed": False, "actual": None, "error": None}}
+        _stdout_buf = io.StringIO()
+        try:
+            _old_h = signal.signal(signal.SIGALRM, _handler)
+            signal.setitimer(signal.ITIMER_REAL, _timeout_s)
+            _old_stdin = sys.stdin
+            sys.stdin = io.StringIO(_inp)
+            try:
+                with contextlib.redirect_stdout(_stdout_buf):
+                    exec(_compiled, {{"__name__": "__main__"}})
+            finally:
+                sys.stdin = _old_stdin
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, _old_h)
+            _actual = _stdout_buf.getvalue()
+            _r["actual"] = _actual.strip()
+            _exp_clean = _exp.strip()
+            if _exp_clean.startswith('"') and _exp_clean.endswith('"'):
+                _exp_clean = _exp_clean[1:-1]
+            _passed = _actual.strip() == _exp_clean
+            if not _passed:
+                _a_lines = [l.strip() for l in _actual.strip().splitlines() if l.strip()]
+                _e_lines = [l.strip() for l in _exp_clean.splitlines() if l.strip()]
+                _passed = _a_lines == _e_lines
+            _r["passed"] = _passed
+        except _TimeoutException:
+            _r["error"] = "Time Limit Exceeded"
+        except SystemExit as _se:
+            if _se.code in (None, 0):
+                _actual = _stdout_buf.getvalue()
+                _r["actual"] = _actual.strip()
+                _exp_clean = _exp.strip()
+                if _exp_clean.startswith('"') and _exp_clean.endswith('"'):
+                    _exp_clean = _exp_clean[1:-1]
+                _r["passed"] = _actual.strip() == _exp_clean
+            else:
+                _r["error"] = f"SystemExit: {{_se}}"
+        except Exception as _e:
+            _r["error"] = f"{{type(_e).__name__}}: {{_e}}"
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            try:
+                signal.signal(signal.SIGALRM, _old_h)
+            except Exception:
+                pass
+        _results.append(_r)
+
+os._exit = _original_os_exit
+print(json.dumps(_results))
+"""
+
+
+def run_public_tests(
+    code: str, public_tests: dict[str, Any], eval_timeout_s: float
+) -> list[dict[str, Any]]:
+    """Run code against public tests in a single subprocess.
+
+    This is a module-level function so it can be submitted to a
+    ``ProcessPoolExecutor``.  Returns a list of per-test result dicts with
+    keys: index, passed, actual, error, input_display, expected_display.
+    """
+    fn_name = public_tests.get("fn_name", None)
+    raw_inputs = list(public_tests.get("inputs", []))
+    raw_outputs = list(public_tests.get("outputs", []))
+
+    norm_inputs: list[str] = []
+    norm_outputs: list[str] = []
+    display_inputs: list[str] = []
+    display_outputs: list[str] = []
+
+    for raw_inp, raw_out in zip(raw_inputs, raw_outputs):
+        inp, out = process_input_output(raw_inp, raw_out)
+        inp_str = str(_normalize_io(inp)) if inp is not None else ""
+        out_str = str(_normalize_io(out)) if out is not None else ""
+        norm_inputs.append(inp_str)
+        norm_outputs.append(out_str)
+        display_inputs.append(inp_str)
+        display_outputs.append(out_str)
+
+    harness = _build_public_test_harness(
+        code, norm_inputs, norm_outputs, fn_name, eval_timeout_s,
+    )
+    num_tests = len(norm_inputs)
+    overall_timeout = (eval_timeout_s or 10.0) * num_tests + 5.0
+    success, stdout, stderr = _exec_code_subprocess(harness, None, overall_timeout)
+
+    if not success:
+        error_msg = stderr.strip() if stderr else "Unknown execution error"
+        if "timed out" in error_msg.lower():
+            error_msg = "Time Limit Exceeded"
+        return [
+            {"index": i + 1, "passed": False, "actual": None, "error": error_msg,
+             "input_display": display_inputs[i], "expected_display": display_outputs[i]}
+            for i in range(num_tests)
+        ]
+
+    try:
+        payload = _json.loads(stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError, _json.JSONDecodeError):
+        return [
+            {"index": i + 1, "passed": False, "actual": None,
+             "error": "Could not parse test output",
+             "input_display": display_inputs[i], "expected_display": display_outputs[i]}
+            for i in range(num_tests)
+        ]
+
+    results: list[dict[str, Any]] = []
+    for i, item in enumerate(payload):
+        results.append({
+            "index": i + 1,
+            "passed": item.get("passed", False),
+            "actual": item.get("actual"),
+            "error": item.get("error"),
+            "input_display": display_inputs[i],
+            "expected_display": display_outputs[i],
+        })
+    return results
 
 
 class RLEFCodeEnv(IntellectCodeEnv):
@@ -142,160 +368,8 @@ class RLEFCodeEnv(IntellectCodeEnv):
     # ------------------------------------------------------------------
 
     def _run_public_tests(self, code: str) -> list[dict[str, Any]]:
-        fn_name = self.public_tests.get("fn_name", None)
-        results: list[dict[str, Any]] = []
-
-        for i, (raw_inp, raw_out) in enumerate(
-            zip(self.public_tests["inputs"], self.public_tests["outputs"])
-        ):
-            inp, out = process_input_output(raw_inp, raw_out)
-            inp_str = str(_normalize_io(inp)) if inp is not None else ""
-            out_str = str(_normalize_io(out)) if out is not None else ""
-
-            result = self._run_single_test(code, inp_str, out_str, fn_name)
-            result["index"] = i + 1
-            result["input_display"] = inp_str
-            result["expected_display"] = out_str
-            results.append(result)
-
-        return results
-
-    def _run_single_test(
-        self, code: str, inp: str, expected: str, fn_name: Optional[str]
-    ) -> dict[str, Any]:
-        harness = self._build_single_test_harness(code, inp, expected, fn_name)
-        timeout = self.eval_timeout_s or 10.0
-        overall_timeout = timeout + 5.0
-        success, stdout, stderr = _exec_code_subprocess(harness, None, overall_timeout)
-
-        if not success:
-            error_msg = stderr.strip() if stderr else "Unknown execution error"
-            if "timed out" in error_msg.lower():
-                return {"passed": False, "error": "Time Limit Exceeded", "actual": None}
-            return {"passed": False, "error": error_msg, "actual": None}
-
-        import json as _json
-        try:
-            payload = _json.loads(stdout.strip().splitlines()[-1])
-        except (ValueError, IndexError, _json.JSONDecodeError):
-            return {"passed": False, "error": "Could not parse test output", "actual": None}
-
-        return {
-            "passed": payload.get("passed", False),
-            "actual": payload.get("actual"),
-            "error": payload.get("error"),
-        }
-
-    @staticmethod
-    def _build_single_test_harness(
-        code: str, inp: str, expected: str, fn_name: Optional[str]
-    ) -> str:
-        code_with_imports = BASE_IMPORTS + "\n" + code
-        safe_timeout = 10.0
-        return f"""
-import contextlib
-import io
-import json
-import os
-import signal
-import sys
-
-_code = {repr(code_with_imports)}
-_input = {repr(inp)}
-_expected = {repr(expected)}
-_fn_name = {repr(fn_name)}
-_timeout_s = {repr(safe_timeout)}
-
-_original_os_exit = os._exit
-def _safe_os_exit(code=0):
-    raise SystemExit(code)
-os._exit = _safe_os_exit
-
-class _TimeoutException(Exception):
-    pass
-
-def _handler(signum, frame):
-    raise _TimeoutException("Time Limit Exceeded")
-
-def _run():
-    result = {{"passed": False, "actual": None, "error": None}}
-    try:
-        old_handler = signal.signal(signal.SIGALRM, _handler)
-        signal.setitimer(signal.ITIMER_REAL, _timeout_s)
-
-        if _fn_name:
-            ns = {{}}
-            exec(_code, ns)
-            sol_class = ns.get("Solution")
-            if not sol_class:
-                result["error"] = "No Solution class found"
-                return result
-            sol = sol_class()
-            fn = getattr(sol, _fn_name, None)
-            if not fn:
-                result["error"] = f"Method '{{_fn_name}}' not found on Solution"
-                return result
-            args = list(map(eval, _input.split("\\n"))) if _input.strip() else []
-            actual = fn(*args)
-            actual_str = str(actual)
-            try:
-                expected_val = json.loads(_expected)
-                if isinstance(actual, tuple):
-                    actual = list(actual)
-                passed = actual == expected_val
-                if not passed and isinstance(expected_val, list) and len(expected_val) > 0:
-                    passed = actual == expected_val[0]
-            except (json.JSONDecodeError, TypeError):
-                passed = actual_str.strip() == _expected.strip()
-            result["passed"] = passed
-            result["actual"] = actual_str
-        else:
-            stdin_buf = io.StringIO(_input)
-            stdout_buf = io.StringIO()
-            old_stdin = sys.stdin
-            sys.stdin = stdin_buf
-            try:
-                with contextlib.redirect_stdout(stdout_buf):
-                    exec(_code, {{"__name__": "__main__"}})
-            finally:
-                sys.stdin = old_stdin
-            actual = stdout_buf.getvalue()
-            result["actual"] = actual.strip()
-            expected_clean = _expected.strip()
-            if expected_clean.startswith('"') and expected_clean.endswith('"'):
-                expected_clean = expected_clean[1:-1]
-            passed = actual.strip() == expected_clean
-            if not passed:
-                a_lines = [l.strip() for l in actual.strip().splitlines() if l.strip()]
-                e_lines = [l.strip() for l in expected_clean.splitlines() if l.strip()]
-                passed = a_lines == e_lines
-            result["passed"] = passed
-    except _TimeoutException:
-        result["error"] = "Time Limit Exceeded"
-    except SystemExit as exc:
-        if exc.code in (None, 0):
-            actual = stdout_buf.getvalue() if 'stdout_buf' in dir() else ""
-            result["actual"] = actual.strip()
-            expected_clean = _expected.strip()
-            if expected_clean.startswith('"') and expected_clean.endswith('"'):
-                expected_clean = expected_clean[1:-1]
-            result["passed"] = actual.strip() == expected_clean
-        else:
-            result["error"] = f"SystemExit: {{exc}}"
-    except Exception as exc:
-        result["error"] = f"{{type(exc).__name__}}: {{exc}}"
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        try:
-            signal.signal(signal.SIGALRM, old_handler)
-        except Exception:
-            pass
-    return result
-
-r = _run()
-os._exit = _original_os_exit
-print(json.dumps(r))
-"""
+        """Run code against public tests using the module-level function."""
+        return run_public_tests(code, self.public_tests, self.eval_timeout_s or 10.0)
 
     # ------------------------------------------------------------------
     # Feedback formatting

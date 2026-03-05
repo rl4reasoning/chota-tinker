@@ -61,7 +61,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
 import asyncio
 import json
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, date
 from typing import Any, Optional
@@ -85,7 +85,7 @@ from utils.harmony_utils import (
 )
 
 from checkpoint import CheckpointManager, get_checkpoint_dir
-from rlef_env import RLEFCodeEnv
+from rlef_env import RLEFCodeEnv, run_public_tests
 from utils.fast_eval import EvalTask, evaluate_task, evaluate_tasks
 from utils.gpu_keepalive import GPUKeepAlive
 from utils.pass_at_k import compute_pass_at_k
@@ -450,29 +450,114 @@ def sample_batch_vllm_harmony(client, prompts: list[list[int]], sampling_params,
 
 
 # =============================================================================
-# PARALLEL ENV STEPPING
+# BATCHED RLEF STEPPING (public tests + final eval via process pools)
 # =============================================================================
 
 def step_rlef_batch(
     envs: list[RLEFCodeEnv],
     actions: list[str],
-    max_workers: int = 16,
+    eval_workers: int = 16,
+    eval_batch_size: int = 8,
+    eval_timeout_s: float = 10.0,
+    show_progress: bool = False,
 ) -> list[tuple[str, float, bool, bool, dict[str, Any]]]:
-    """Step multiple RLEF environments in parallel using threads.
+    """Batch-step RLEF environments with pooled public test + final evaluation.
 
-    Each env.step() runs public tests in subprocesses which release the GIL,
-    so thread-based parallelism is effective here.
+    Phase 1: Extract code from all actions (cheap, no subprocess).
+    Phase 2: Batch all public test evaluations via ProcessPoolExecutor
+             (one subprocess per rollout, all tests in one harness).
+    Phase 3: Process results — format feedback or mark for final eval.
+    Phase 4: Batch all final evaluations via evaluate_tasks (persistent pool).
     """
-    if len(envs) == 1:
-        return [envs[0].step(actions[0])]
+    n = len(envs)
+    results: list[Optional[tuple[str, float, bool, bool, dict[str, Any]]]] = [None] * n
 
-    def _step(pair):
-        env, action = pair
-        return env.step(action)
+    # Phase 1 — extract code, handle no-code cases
+    public_test_tasks: list[tuple[int, str]] = []
+    for i, (env, action) in enumerate(zip(envs, actions)):
+        env.current_turn += 1
+        code = env._extract_answer_code(action)
+        if not code:
+            results[i] = env._handle_no_code()
+            continue
+        env._last_valid_code = code
+        public_test_tasks.append((i, code))
 
-    with ThreadPoolExecutor(max_workers=min(max_workers, len(envs))) as executor:
-        results = list(executor.map(_step, zip(envs, actions)))
+    # Phase 2 — batch public test evaluation
+    if public_test_tasks:
+        pool_args = [
+            (code, envs[i].public_tests, envs[i].eval_timeout_s or eval_timeout_s)
+            for i, code in public_test_tasks
+        ]
+        with ProcessPoolExecutor(max_workers=min(eval_workers, len(pool_args))) as pool:
+            public_results_list = list(
+                tqdm(
+                    pool.map(
+                        _run_public_tests_star, pool_args,
+                        chunksize=max(1, len(pool_args) // (eval_workers * 2)),
+                    ),
+                    total=len(pool_args),
+                    desc="Public tests",
+                    disable=not show_progress,
+                )
+            )
+
+        # Phase 3 — process public test results
+        for (idx, code), test_results in zip(public_test_tasks, public_results_list):
+            env = envs[idx]
+            all_passed = all(r["passed"] for r in test_results)
+
+            if all_passed:
+                results[idx] = ("", 0.0, True, False, {
+                    "final": True, "public_all_passed": True,
+                    "needs_eval": True, "code": code,
+                })
+            elif env.current_turn >= env.max_turns:
+                results[idx] = ("", 0.0, True, False, {
+                    "final": True, "public_all_passed": False,
+                    "needs_eval": True, "code": code,
+                })
+            else:
+                feedback = env._format_feedback(test_results)
+                results[idx] = (feedback, 0.0, False, False, {"public_all_passed": False})
+
+    # Phase 4 — batch final evaluations
+    eval_tasks: list[EvalTask] = []
+    eval_indices: list[int] = []
+    for i, result in enumerate(results):
+        if result is None:
+            raise RuntimeError(f"Missing step result for index {i}")
+        _, _, _, _, info = result
+        if info.get("needs_eval") and info.get("code"):
+            eval_tasks.append(EvalTask(
+                response=f"```python\n{info['code']}\n```",
+                tests=envs[i].private_tests,
+                max_tests=envs[i].max_tests,
+                timeout_s=eval_timeout_s,
+                require_solution_class=True,
+            ))
+            eval_indices.append(i)
+
+    if eval_tasks:
+        if len(eval_tasks) == 1:
+            eval_results_list = [evaluate_task(eval_tasks[0])]
+        else:
+            eval_results_list = evaluate_tasks(
+                eval_tasks,
+                max_workers=eval_workers,
+                batch_size=eval_batch_size,
+                show_progress=show_progress or len(eval_tasks) > 4,
+            )
+        for idx, eval_result in zip(eval_indices, eval_results_list):
+            obs, _, terminated, truncated, info = results[idx]
+            results[idx] = (obs, eval_result.reward, terminated, truncated, info)
+
     return results
+
+
+def _run_public_tests_star(args: tuple) -> list[dict[str, Any]]:
+    """Unpack tuple for ProcessPoolExecutor.map()."""
+    return run_public_tests(*args)
 
 
 # =============================================================================
@@ -696,50 +781,18 @@ def run_batched_rollouts(
 
         still_active = []
 
-        # Phase 1: Step all envs (public test feedback only, no final eval)
         with GPUKeepAlive():
             step_results = step_rlef_batch(
                 [s.env for s in active_states],
                 processed_responses,
-                max_workers=args.eval_workers,
+                eval_workers=args.eval_workers,
+                eval_batch_size=args.eval_batch_size,
+                eval_timeout_s=args.eval_timeout_s,
+                show_progress=True,
             )
 
-        # Phase 2: Collect final evaluations and batch them
-        eval_tasks: list[EvalTask] = []
-        eval_indices: list[int] = []
-        step_results_list = list(step_results)
-
-        for i, (obs, reward, terminated, truncated, info) in enumerate(step_results_list):
-            if info.get("needs_eval") and info.get("code"):
-                code = info["code"]
-                private_tests = active_states[i].env.private_tests
-                eval_tasks.append(EvalTask(
-                    response=f"```python\n{code}\n```",
-                    tests=private_tests,
-                    max_tests=active_states[i].env.max_tests,
-                    timeout_s=args.eval_timeout_s,
-                    require_solution_class=True,
-                ))
-                eval_indices.append(i)
-
-        if eval_tasks:
-            with GPUKeepAlive():
-                if len(eval_tasks) == 1:
-                    eval_results = [evaluate_task(eval_tasks[0])]
-                else:
-                    eval_results = evaluate_tasks(
-                        eval_tasks,
-                        max_workers=args.eval_workers,
-                        batch_size=args.eval_batch_size,
-                        show_progress=len(eval_tasks) > 4,
-                    )
-            for idx, eval_result in zip(eval_indices, eval_results):
-                obs, _, terminated, truncated, info = step_results_list[idx]
-                step_results_list[idx] = (obs, eval_result.reward, terminated, truncated, info)
-
-        # Phase 3: Process results
         for state, _response, (obs, reward, terminated, truncated, info) in zip(
-            active_states, processed_responses, step_results_list
+            active_states, processed_responses, step_results
         ):
             state.total_reward += reward
             state.terminated = terminated
