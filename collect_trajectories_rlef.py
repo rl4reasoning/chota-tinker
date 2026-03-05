@@ -86,6 +86,7 @@ from utils.harmony_utils import (
 
 from checkpoint import CheckpointManager, get_checkpoint_dir
 from rlef_env import RLEFCodeEnv
+from utils.fast_eval import EvalTask, evaluate_task, evaluate_tasks
 from utils.gpu_keepalive import GPUKeepAlive
 from utils.pass_at_k import compute_pass_at_k
 from utils.vllm_multi_gpu import (
@@ -695,6 +696,7 @@ def run_batched_rollouts(
 
         still_active = []
 
+        # Phase 1: Step all envs (public test feedback only, no final eval)
         with GPUKeepAlive():
             step_results = step_rlef_batch(
                 [s.env for s in active_states],
@@ -702,8 +704,42 @@ def run_batched_rollouts(
                 max_workers=args.eval_workers,
             )
 
+        # Phase 2: Collect final evaluations and batch them
+        eval_tasks: list[EvalTask] = []
+        eval_indices: list[int] = []
+        step_results_list = list(step_results)
+
+        for i, (obs, reward, terminated, truncated, info) in enumerate(step_results_list):
+            if info.get("needs_eval") and info.get("code"):
+                code = info["code"]
+                private_tests = active_states[i].env.private_tests
+                eval_tasks.append(EvalTask(
+                    response=f"```python\n{code}\n```",
+                    tests=private_tests,
+                    max_tests=active_states[i].env.max_tests,
+                    timeout_s=args.eval_timeout_s,
+                    require_solution_class=True,
+                ))
+                eval_indices.append(i)
+
+        if eval_tasks:
+            with GPUKeepAlive():
+                if len(eval_tasks) == 1:
+                    eval_results = [evaluate_task(eval_tasks[0])]
+                else:
+                    eval_results = evaluate_tasks(
+                        eval_tasks,
+                        max_workers=args.eval_workers,
+                        batch_size=args.eval_batch_size,
+                        show_progress=len(eval_tasks) > 4,
+                    )
+            for idx, eval_result in zip(eval_indices, eval_results):
+                obs, _, terminated, truncated, info = step_results_list[idx]
+                step_results_list[idx] = (obs, eval_result.reward, terminated, truncated, info)
+
+        # Phase 3: Process results
         for state, _response, (obs, reward, terminated, truncated, info) in zip(
-            active_states, processed_responses, step_results
+            active_states, processed_responses, step_results_list
         ):
             state.total_reward += reward
             state.terminated = terminated
@@ -952,6 +988,8 @@ if __name__ == "__main__":
                         help="Number of public test cases for execution feedback (default: 3)")
     parser.add_argument("--eval-timeout-s", type=float, default=10.0,
                         help="Per-test timeout in seconds for code execution (default: 10.0)")
+    parser.add_argument("--eval-batch-size", type=int, default=8,
+                        help="Number of evaluations per worker batch for final eval (default: 8)")
 
     # Checkpointing
     parser.add_argument("--resume-from", type=str, default=None,

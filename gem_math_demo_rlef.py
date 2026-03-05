@@ -325,6 +325,11 @@ async def run_episode(
 
         # --- Step the RLEF environment ---
         obs, reward, terminated, truncated, info = env.step(action)
+
+        # If episode ended, run final evaluation on private tests
+        if info.get("needs_eval") and info.get("code"):
+            reward = env.evaluate_final(info["code"])
+
         total_reward += reward
 
         if obs:

@@ -59,6 +59,17 @@ class RLEFCodeEnv(IntellectCodeEnv):
         return obs, info
 
     def step(self, action: str) -> Tuple[str, float, bool, bool, dict[str, Any]]:
+        """Run one turn of the RLEF loop.
+
+        When the episode ends (public tests all pass or turn limit reached),
+        final evaluation is NOT performed here. Instead ``info["needs_eval"]``
+        is set to ``True`` and ``info["code"]`` contains the solution to
+        evaluate. The caller (e.g. ``collect_trajectories_rlef.py``) is
+        responsible for batching final evaluations efficiently.
+
+        For convenience in the demo script, call ``evaluate_final()`` to get
+        the reward for a completed episode.
+        """
         self.current_turn += 1
 
         code = self._extract_answer_code(action)
@@ -70,22 +81,31 @@ class RLEFCodeEnv(IntellectCodeEnv):
         all_passed = all(r["passed"] for r in test_results)
 
         if all_passed:
-            reward = self._evaluate_all_tests(code)
-            return "", reward, True, False, {
+            return "", 0.0, True, False, {
                 "final": True,
                 "public_all_passed": True,
+                "needs_eval": True,
+                "code": code,
             }
 
         at_turn_limit = self.current_turn >= self.max_turns
         if at_turn_limit:
-            reward = self._evaluate_all_tests(code)
-            return "", reward, True, False, {
+            return "", 0.0, True, False, {
                 "final": True,
                 "public_all_passed": False,
+                "needs_eval": True,
+                "code": code,
             }
 
         feedback = self._format_feedback(test_results)
         return feedback, 0.0, False, False, {"public_all_passed": False}
+
+    def evaluate_final(self, code: str) -> float:
+        """Convenience method: evaluate code against private tests and return reward.
+
+        Useful in the demo script where batched evaluation is not needed.
+        """
+        return self._evaluate_all_tests(code)
 
     # ------------------------------------------------------------------
     # Test splitting
@@ -305,13 +325,17 @@ print(json.dumps(r))
     # ------------------------------------------------------------------
 
     def _evaluate_all_tests(self, code: str) -> float:
-        """Evaluate against ALL tests (public + private) for final reward.
+        """Evaluate against private tests only for final reward.
 
-        Returns the fraction of tests passed (0.0 to 1.0).
+        Returns the fraction of private tests passed (0.0 to 1.0).
+        Public tests are excluded since the model already received feedback
+        on them during the conversation.
         """
+        if not self.private_tests.get("inputs"):
+            return 0.0
         reward, _, _ = _evaluate_code(
             code=code,
-            tests=self.tests,
+            tests=self.private_tests,
             max_tests=self.max_tests,
             timeout_s=self.eval_timeout_s,
             timeout_record_limit=0,
@@ -328,7 +352,11 @@ print(json.dumps(r))
         at_turn_limit = self.current_turn >= self.max_turns
         if at_turn_limit:
             if self._last_valid_code:
-                reward = self._evaluate_all_tests(self._last_valid_code)
-                return "", reward, True, False, {"final": True, "no_code_this_turn": True}
+                return "", 0.0, True, False, {
+                    "final": True,
+                    "no_code_this_turn": True,
+                    "needs_eval": True,
+                    "code": self._last_valid_code,
+                }
             return "", 0.0, True, False, {"final": True, "no_code_ever": True}
         return obs, 0.0, False, False, {}
