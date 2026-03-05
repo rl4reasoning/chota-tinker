@@ -337,10 +337,23 @@ class RLEFCodeEnv(IntellectCodeEnv):
     # Test splitting
     # ------------------------------------------------------------------
 
+    MAX_PUBLIC_TEST_CHARS = 8000
+    MIN_TESTS_FOR_PUBLIC = 15
+
     def _split_tests(self) -> None:
         inputs = list(self.tests.get("inputs", []))
         outputs = list(self.tests.get("outputs", []))
         n = min(self.num_public_tests, len(inputs))
+
+        if len(inputs) < self.MIN_TESTS_FOR_PUBLIC:
+            n = 0
+        else:
+            candidate_chars = (
+                sum(len(str(x)) for x in inputs[:n])
+                + sum(len(str(x)) for x in outputs[:n])
+            )
+            if candidate_chars > self.MAX_PUBLIC_TEST_CHARS:
+                n = 0
 
         base = {"fn_name": self.tests.get("fn_name", None)}
         self.public_tests = {**base, "inputs": inputs[:n], "outputs": outputs[:n]}
