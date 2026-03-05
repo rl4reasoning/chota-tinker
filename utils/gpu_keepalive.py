@@ -25,11 +25,11 @@ class GPUKeepAlive:
     Uses negligible GPU memory (~2MB) and minimal GPU compute (~1-5% utilization).
     """
     
-    def __init__(self, device: int = 0, size: int = 512):
+    def __init__(self, device: int = 0, size: int = 2048):
         """
         Args:
             device: CUDA device index (default: 0)
-            size: Matrix size for matmuls (default: 512, uses ~2MB GPU memory)
+            size: Matrix size for matmuls (default: 2048, uses ~10MB GPU memory)
         """
         self.device = device
         self.size = size
